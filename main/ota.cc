@@ -97,6 +97,18 @@ bool Ota::CheckVersion() {
     }
 
     auto status_code = http->GetStatusCode();
+    if (status_code != 200 && method == "POST") {
+        // 静态托管（jsDelivr 等）不接受 POST，退回 GET 重试一次
+        ESP_LOGW(TAG, "POST rejected (%d), retrying with GET", status_code);
+        http->Close();
+        http = SetupHttp();
+        http->SetContent(std::string());
+        if (!http->Open("GET", url)) {
+            ESP_LOGE(TAG, "Failed to open HTTP connection");
+            return false;
+        }
+        status_code = http->GetStatusCode();
+    }
     if (status_code != 200) {
         ESP_LOGE(TAG, "Failed to check version, status code: %d", status_code);
         return false;
