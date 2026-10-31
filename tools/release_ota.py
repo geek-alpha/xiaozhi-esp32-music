@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""发版：把 build/xiaozhi.bin 挂到 OTA 清单上，并清 jsDelivr 缓存。
+"""发版：把 build/xiaozhi.bin 挂到 OTA 清单上。
 
 用法：
-    py -3 tools/release_ota.py            # 只生成清单与 bin
-    py -3 tools/release_ota.py --purge    # 生成后再清 CDN 缓存
+    py -3 tools/release_ota.py            # 生成清单与本地留档 bin
+
+清单里的 url 指向 GitHub Release 资产（经 ghproxy 加速），所以要先手工建好
+对应 tag 的 release 并上传同名 bin，否则设备会 404。
 
 版本号取自 CMakeLists.txt 的 PROJECT_VER，必须与 bin 内固件版本一致，
 否则设备会把它当成「永远有新版」反复刷机。
@@ -18,8 +20,7 @@ import sys
 import urllib.request
 
 REPO = "geek-alpha/xiaozhi-esp32-music"
-BRANCH = "main"
-CDN = "https://cdn.jsdelivr.net/gh/%s@%s/" % (REPO, BRANCH)
+RELEASE_BASE = "https://ghproxy.net/https://github.com/%s/releases/download" % REPO
 MANIFEST = "ota/xiaozhi-music-ota.json"
 
 
@@ -38,7 +39,7 @@ def main() -> int:
         raise SystemExit("缺少 %s，先跑 idf.py build" % build_bin)
 
     digest = hashlib.sha256(open(build_bin, "rb").read()).hexdigest()[:8]
-    name = "xiaozhi-music-app-ota-%s-%s.bin" % (version, digest)
+    name = "xiaozhi-music-v%s-app-ota.bin" % version
     dst = os.path.join("ota", name)
     shutil.copyfile(build_bin, dst)
 
@@ -47,19 +48,14 @@ def main() -> int:
             os.remove(os.path.join("ota", old))
             print("清理旧包 %s" % old)
 
-    manifest = {"firmware": {"version": version, "url": CDN + dst.replace("\\", "/"), "force": 0}}
+    manifest = {"firmware": {"version": version,
+                            "url": "%s/v%s/%s" % (RELEASE_BASE, version, name),
+                            "force": 0}}
     io.open(MANIFEST, "w", encoding="utf-8", newline="\n").write(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-    print("版本 %s -> %s (%d 字节)" % (version, dst, os.path.getsize(dst)))
+    print("版本 %s -> %s (sha256[:8]=%s, %d 字节)" % (version, dst, digest, os.path.getsize(dst)))
     print("清单 %s" % MANIFEST)
-
-    if "--purge" in sys.argv:
-        url = "https://purge.jsdelivr.net/gh/%s@%s/%s" % (REPO, BRANCH, MANIFEST)
-        try:
-            with urllib.request.urlopen(url, timeout=30) as r:
-                print("purge %s -> %s" % (MANIFEST, r.status))
-        except Exception as e:
-            print("purge 失败（清单可能仍有 12h 缓存）: %s" % e)
+    print("上传资产名应为 %s（release tag v%s）" % (name, version))
     return 0
 
 
