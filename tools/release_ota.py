@@ -20,7 +20,7 @@ import sys
 import urllib.request
 
 REPO = "geek-alpha/xiaozhi-esp32-music"
-RELEASE_BASE = "https://ghproxy.net/https://github.com/%s/releases/download" % REPO
+RELEASE_BASE = "https://gh-proxy.com/https://github.com/%s/releases/download" % REPO
 MANIFEST = "ota/xiaozhi-music-ota.json"
 
 
