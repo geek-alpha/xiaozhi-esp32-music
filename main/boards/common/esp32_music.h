@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <vector>
@@ -69,6 +70,16 @@ private:
     MP3FrameInfo mp3_frame_info_;
     bool mp3_decoder_initialized_;
     
+    // 闹钟借播放器出声时挂上的上下文：到点上报给 AI 的是「哪件事、几点到点」，
+    // 报「《xx》放完了」AI 只知道有歌放过，接不上提醒本身。
+    std::string reminder_label_;
+    std::string reminder_at_;
+    // 这次触发还会响几次（先念再响铃=2）：只在最后一声收尾时上报，早报会撞上后面那条音频
+    int reminder_remaining_ = 0;
+    std::mutex reminder_mutex_;
+    // 0=普通播放；1=该上报完整提醒事件（最后一次收尾）；2=后面还有声，先静默
+    int NextReminderStage(std::string& label, std::string& at);
+
     // 私有方法
     void DownloadAudioStream(const std::string& music_url);
     void PlayAudioStream();
@@ -77,8 +88,35 @@ private:
     void CleanupMp3Decoder();
     void ResetSampleRate();  // 重置采样率到原始值
     
+    // 直链+歌词地址都已确定后的统一开播路径（Download 自查、PlayDirect 下发都走它）
+    bool PlayResolved(const std::string& audio_url, const std::string& lyric_url, const std::string& song_name);
+
+    // 设备侧播放队列：MCP 一次下发整张歌单，自然播完一首就接下一首，
+    // 不依赖服务端轮询（官方云不认自定义 MCP 通知，轮询也拿不到播放进度）。
+    struct QueueItem {
+        std::string audio_url;
+        std::string lyric_url;
+        std::string lyric_text;
+        std::string title;
+        std::string artist;
+    };
+    std::deque<QueueItem> play_queue_;
+    std::mutex queue_mutex_;
+    std::atomic<bool> queue_active_;
+    std::atomic<int> queue_total_;
+
+    bool PlayQueueItem(const QueueItem& item);
+    // 播完一首后调用：队列里还有下一首就取出来播，返回 true 表示已续播
+    bool PlayNextFromQueue();
+    void ClearQueue();
+
+    // 内置曲源：设备自己按歌名联网解析出直链（不经过任何自建服务）
+    bool PlayByBuiltinLookup(const std::string& song_name, const std::string& artist_name);
+
     // 歌词相关私有方法
     bool DownloadLyrics(const std::string& lyric_url);
+    // 歌词正文随消息下发时的入口：直接解析，不走 HTTP
+    bool StartLyricsWithContent(const std::string& lrc);
     bool ParseLyrics(const std::string& lyric_content);
     void LyricDisplayThread();
     void UpdateLyricDisplay(int64_t current_time_ms);
@@ -98,9 +136,23 @@ public:
     
     // 新增方法
     virtual bool StartStreaming(const std::string& music_url) override;
+
+    // MCP 接入点直发：直链/歌词/歌名/歌手由服务端一次给全，设备不查任何服务器地址。
+    // lyric_text 是随消息一起下发的 LRC 正文 —— 跨公网播时设备连不到服务端的局域网 lyric_url。
+    bool PlayDirect(const std::string& audio_url, const std::string& lyric_url,
+                    const std::string& lyric_text, const std::string& title,
+                    const std::string& artist);
+
+    // songs_json: [{"audio_url":..,"lyric_text":..,"title":..,"artist":..}, ...]
+    // 整张歌单一次下发，设备自己按顺序连播；手动停下/换歌即清队列。
+    bool PlayQueue(const std::string& songs_json);
     virtual bool StopStreaming() override;  // 停止流式播放
     virtual size_t GetBufferSize() const override { return buffer_size_; }
     virtual bool IsDownloading() const override { return is_downloading_; }
+    // 闹钟要「先说事情再放铃声」：靠它判断那段提醒语音播完了没有
+    bool IsPlaying() const { return is_playing_.load(); }
+    // plays=这次触发会响几次（只念=1，先念后铃=2），最后一次收尾时才上报事件
+    void SetReminderContext(const std::string& label, const std::string& at, int plays);
     virtual int16_t* GetAudioData() override { return final_pcm_data_fft; }
     
     // 显示模式控制方法

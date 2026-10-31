@@ -7,6 +7,16 @@ config OTA_URL
         The application will access this URL to check for new firmwares and server address.
 
 
+config XZ_MUSIC_API_BASE
+    string "Music API base URL (dabai)"
+    default "http://192.168.31.144:8090"
+    help
+        音乐播放接口的基地址，指向局域网里的大白。设备会请求
+        <base>/api/music/xz/song?song=<歌名>&artist=<歌手>，拿到
+        audio_url / lyric_url 两个直链后自己拉流解码。
+        必须用明文 http：本固件没有配 CA 证书包，大白主服务的 8008 是自签 HTTPS。
+
+
 choice
     prompt "Default Language"
     default LANGUAGE_ZH_CN

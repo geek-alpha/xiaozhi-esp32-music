@@ -9,16 +9,56 @@
  #include <algorithm>
  #include <cstring>
  #include <cctype>
+ #include <cstdlib>
+ #include <cstdio>
  #include <esp_pthread.h>
  
  #include "application.h"
  #include "display.h"
  #include "board.h"
  #include "boards/common/esp32_music.h"
+ #include "alarm.h"
+#include "weather.h"
  
  #define TAG "MCP"
  
- #define DEFAULT_TOOLCALL_STACK_SIZE 6144
+  #define DEFAULT_TOOLCALL_STACK_SIZE 6144
+  
+  // 「工作日」「周末」「1,3,5」→ 星期位掩码（bit0=周日，对齐 tm_wday）；说不清就返回 -1
+  static int ParseWeekdays(const std::string& text) {
+      if (text.empty()) {
+          return 0;
+      }
+      if (text == "daily" || text == "everyday" || text == "all" || text == "每天") {
+          return 0x7F;
+      }
+      if (text == "workday" || text == "weekday" || text == "工作日" || text == "平时") {
+          return 0x3E;
+      }
+      if (text == "weekend" || text == "周末") {
+          return 0x41;
+      }
+      if (text == "once" || text == "一次" || text == "0") {
+          return 0;
+      }
+      int mask = 0;
+      bool any = false;
+      const char* p = text.c_str();
+      while (*p) {
+          while (*p == ',' || *p == ' ' || *p == '/') {
+              ++p;
+          }
+          if (*p < '0' || *p > '6') {
+              return -1;
+          }
+          mask |= 1 << (*p - '0');
+          any = true;
+          while (*p >= '0' && *p <= '6') {
+              ++p;
+          }
+      }
+      return any ? mask : -1;
+  }
  
  McpServer::McpServer() {
  }
@@ -72,9 +112,9 @@
              });
      }
  
-     auto display = board.GetDisplay();
-     if (display && !display->GetTheme().empty()) {
-         AddTool("self.screen.set_theme",
+    auto display = board.GetDisplay();
+    if (display && !display->GetTheme().empty()) {
+        AddTool("self.screen.set_theme",
              "Set the theme of the screen. The theme can be `light` or `dark`.",
              PropertyList({
                  Property("theme", kPropertyTypeString)
@@ -84,6 +124,51 @@
                  return true;
              });
      }
+
+    if (display) {
+        AddTool("self.appearance.set_hair_color",
+            "换屏幕上那个头像的头发颜色。用户说「头发换成粉色」「染成金色」时用它。\n"
+            "参数:\n"
+            "  `color`: 颜色，可以给中文/英文色名（粉/金/银/黑/白/紫/绿/红/棕/蓝），也可以给 #RRGGBB。\n"
+            "返回 success 表示屏幕上已经是新发色，照着说就行。",
+            PropertyList({
+                Property("color", kPropertyTypeString)
+            }),
+            [display](const PropertyList& properties) -> ReturnValue {
+                std::string name = properties["color"].value<std::string>();
+                static const struct { const char* key; uint32_t rgb; } kColors[] = {
+                    {"粉", 0xFF8FB8}, {"pink", 0xFF8FB8}, {"粉色", 0xFF8FB8},
+                    {"金", 0xFFD76B}, {"gold", 0xFFD76B}, {"金色", 0xFFD76B},
+                    {"银", 0xE0E6F0}, {"silver", 0xE0E6F0}, {"银灰", 0xE0E6F0},
+                    {"白", 0xF2F6FF}, {"white", 0xF2F6FF},
+                    {"黑", 0x2A2A38}, {"black", 0x2A2A38},
+                    {"紫", 0xB48CFF}, {"purple", 0xB48CFF},
+                    {"绿", 0x8CF0B4}, {"green", 0x8CF0B4},
+                    {"红", 0xFF6B6B}, {"red", 0xFF6B6B},
+                    {"棕", 0xB07A50}, {"brown", 0xB07A50},
+                    {"蓝", 0x76A6FF}, {"blue", 0x76A6FF},
+                };
+                uint32_t rgb = 0;
+                if (!name.empty() && name[0] == '#') {
+                    rgb = (uint32_t)strtoul(name.c_str() + 1, nullptr, 16);
+                } else {
+                    for (size_t i = 0; i < sizeof(kColors) / sizeof(kColors[0]); i++) {
+                        if (name == kColors[i].key) {
+                            rgb = kColors[i].rgb;
+                            break;
+                        }
+                    }
+                }
+                if (rgb == 0) {
+                    return std::string("{\"success\": false, \"message\": \"认不出这个颜色，给色名（粉/金/银/黑/白/紫/绿/红/棕/蓝）或 #RRGGBB\"}");
+                }
+                display->SetHairColor(rgb);
+                char buf[80];
+                snprintf(buf, sizeof(buf), "{\"success\": true, \"message\": \"头发已换成 #%06X\"}", (unsigned)rgb);
+                return std::string(buf);
+            });
+    }
+
  
      auto camera = board.GetCamera();
      if (camera) {
@@ -107,29 +192,73 @@
  
      auto music = board.GetMusic();
      if (music) {
-         AddTool("self.music.play_song",
-             "播放指定的歌曲。当用户要求播放音乐时使用此工具，会自动获取歌曲详情并开始流式播放。\n"
+        AddTool("self.music.play_song",
+            "播放歌曲。有 `audio_url` 就直推直链；没直链只传 `song_name` 也行 —— 设备自己联网解析。\n"
+            "参数:\n"
+            "  `audio_url`: 可直连的音频直链（有就传，最快）。\n"
+            "  `lyric_text`: LRC 歌词正文（强烈建议传）—— 设备本地解析，不必访问任何地址。\n"
+            "  `lyric_url`: LRC 歌词地址（可选，仅当服务端和设备同在局域网时才连得上）。\n"
+            "  `title`: 歌名（可选，屏幕显示与歌词同步用）。\n"
+            "  `artist`: 歌手（可选）。\n"
+            "  `song_name`: 歌名（没传 audio_url 时必填，设备自己搜曲拿直链）。\n"
+            "返回:\n"
+            "  播放状态信息，不需确认，立刻播放歌曲。",
+            PropertyList({
+                Property("audio_url", kPropertyTypeString, ""),
+                Property("lyric_text", kPropertyTypeString, ""),
+                Property("lyric_url", kPropertyTypeString, ""),
+                Property("title", kPropertyTypeString, ""),
+                Property("artist", kPropertyTypeString, ""),
+                Property("song_name", kPropertyTypeString, "")
+            }),
+            [music](const PropertyList& properties) -> ReturnValue {
+                auto audio_url = properties["audio_url"].value<std::string>();
+                auto lyric_text = properties["lyric_text"].value<std::string>();
+                auto lyric_url = properties["lyric_url"].value<std::string>();
+                auto title = properties["title"].value<std::string>();
+                auto artist = properties["artist"].value<std::string>();
+                auto song_name = properties["song_name"].value<std::string>();
+
+                if (!audio_url.empty()) {
+                    auto esp32_music = static_cast<Esp32Music*>(music);
+                    if (!esp32_music->PlayDirect(audio_url, lyric_url, lyric_text, title, artist)) {
+                        return "{\"success\": false, \"message\": \"直链播放失败\"}";
+                    }
+                    return "{\"success\": true, \"message\": \"音乐开始播放\"}";
+                }
+
+                // 没给直链：设备自己按歌名联网解析
+                std::string want = song_name.empty() ? title : song_name;
+                if (want.empty()) {
+                    return "{\"success\": false, \"message\": \"缺少 audio_url 或 song_name\"}";
+                }
+                if (!music->Download(want, artist)) {
+                    return "{\"success\": false, \"message\": \"获取音乐资源失败\"}";
+                }
+                auto download_result = music->GetDownloadResult();
+                ESP_LOGI(TAG, "Music details result: %s", download_result.c_str());
+                return "{\"success\": true, \"message\": \"音乐开始播放\"}";
+            });
+ 
+         AddTool("self.music.play_queue",
+             "整张歌单连播。songs 传 JSON 数组，设备自己按顺序一首接一首播，播完自动接下一首，中间不插话。\n"
              "参数:\n"
-             "  `song_name`: 要播放的歌曲名称（必需）。\n"
-             "  `artist_name`: 要播放的歌曲艺术家名称（可选，默认为空字符串）。\n"
+             "  `songs`: JSON 数组字符串，每项 {audio_url, lyric_text, title, artist}，audio_url 必填。\n"
              "返回:\n"
-             "  播放状态信息，不需确认，立刻播放歌曲。",
+             "  入队与开播结果。用户说“播放整个歌单/这张歌单/接着放”就用它，不要自己一首一首下发。",
              PropertyList({
-                 Property("song_name", kPropertyTypeString),//歌曲名称（必需）
-                 Property("artist_name", kPropertyTypeString, "")//艺术家名称（可选，默认为空字符串）
+                 Property("songs", kPropertyTypeString)
              }),
              [music](const PropertyList& properties) -> ReturnValue {
-                 auto song_name = properties["song_name"].value<std::string>();
-                 auto artist_name = properties["artist_name"].value<std::string>();
-                 
-                 if (!music->Download(song_name, artist_name)) {
-                     return "{\"success\": false, \"message\": \"获取音乐资源失败\"}";
+                 auto songs = properties["songs"].value<std::string>();
+                 auto esp32_music = static_cast<Esp32Music*>(music);
+                 if (!esp32_music->PlayQueue(songs)) {
+                     return "{\"success\": false, \"message\": \"歌单播放失败\"}";
                  }
-                 auto download_result = music->GetDownloadResult();
-                 ESP_LOGI(TAG, "Music details result: %s", download_result.c_str());
-                 return "{\"success\": true, \"message\": \"音乐开始播放\"}";
+                 return "{\"success\": true, \"message\": \"歌单已开始连播\"}";
              });
  
+
          AddTool("self.music.set_display_mode",
              "设置音乐播放时的显示模式。可以选择显示频谱或歌词，比如用户说‘打开频谱’或者‘显示频谱’，‘打开歌词’或者‘显示歌词’就设置对应的显示模式。\n"
              "参数:\n"
@@ -163,6 +292,127 @@
              });
      }
  
+     // 闹钟：到点由板子自己定时并播放，服务端下线或断网也挡不住（不依赖 WS 连接）
+     // 上次开机存的闹钟与铃声先补回来；时间未同步它会自己跳过，下次调用再试
+     Alarm::GetInstance().Restore();
+
+     AddTool("self.alarm.set",
+          "设闹钟、定时任务或倒计时。到点设备自己响，本地定时，不依赖服务端在线。\n"
+         "参数（`clock` 和 `seconds` 二选一）：\n"
+         "  `clock`: 绝对时刻，格式 \"HH:MM\" 24 小时制，如 \"07:00\"。\n"
+         "  `seconds`: 倒计时秒数（1-86400）。\n"
+          "  `weekdays`: clock 模式下什么时候响——“workday”（工作日）/“weekend”（周末）/“daily”（每天）/“1,3,5”（周一三五，0=周日）；不传则只响一次。\n"
+          "  `daily`: 老参数，等同一个星期都响；给了 weekdays 就以 weekdays 为准。\n"
+           "  `label`: 到点要提醒的那件事本身，如“吃降压药”“接孩子”“开周会”——用户说“提醒我几点做什么”时必须把“做什么”原话放进来。\n"
+           "  `audio_url`: 响铃播放的音频直链（有就传，最快）。\n"
+           "  `song_name`/`artist`: 按歌名让设备自己搜曲播放，到点放这首歌。\n"
+           "  到点一定出声：先念 label 那件事，再放铃声。没点名放什么就用默认铃声《好运来》（祖海）——别把自己的默认说成用户点的。\n"
+         "返回:\n"
+          "  编号与下次响铃时间。用户说“明早七点叫我”用 clock（不传 weekdays）；说“每天早上/工作日上午七点”用 clock+weekdays；说“十分钟后提醒我”用 seconds。",
+         PropertyList({
+             Property("clock", kPropertyTypeString, ""),
+             Property("seconds", kPropertyTypeInteger, 0, 0, 86400),
+              Property("daily", kPropertyTypeBoolean, false),
+              Property("weekdays", kPropertyTypeString, ""),
+             Property("label", kPropertyTypeString, ""),
+             Property("audio_url", kPropertyTypeString, ""),
+             Property("song_name", kPropertyTypeString, ""),
+             Property("artist", kPropertyTypeString, "")
+         }),
+         [](const PropertyList& properties) -> ReturnValue {
+             Alarm::GetInstance().Restore();
+             auto clock = properties["clock"].value<std::string>();
+             auto seconds = properties["seconds"].value<int>();
+             auto daily = properties["daily"].value<bool>();
+             auto audio_url = properties["audio_url"].value<std::string>();
+             auto song_name = properties["song_name"].value<std::string>();
+             auto artist = properties["artist"].value<std::string>();
+              auto label = properties["label"].value<std::string>();
+
+              int mask = ParseWeekdays(properties["weekdays"].value<std::string>());
+              if (mask < 0) {
+                  return std::string(
+                      "{\"success\": false, \"message\": \"weekdays 只认 daily/workday/weekend 或 0-6 的逗号列表（0=周日，1=周一）\"}");
+              }
+              if (daily) {
+                  mask = 0x7F;
+              }
+
+              if (!clock.empty()) {
+                  int hour = -1, minute = -1;
+                  if (sscanf(clock.c_str(), "%d:%d", &hour, &minute) != 2) {
+                      return std::string("{\"success\": false, \"message\": \"clock 格式要 HH:MM\"}");
+                  }
+                  return Alarm::GetInstance().SetClock(hour, minute, mask, audio_url, song_name, artist,
+                                                       label);
+              }
+             if (seconds > 0) {
+                 return Alarm::GetInstance().SetTimer(seconds, audio_url, song_name, artist, label);
+             }
+             return std::string("{\"success\": false, \"message\": \"clock 和 seconds 都没给\"}");
+         });
+
+     AddTool("self.alarm.list",
+         "列出所有闹钟，并带上次到点的提醒 last_fired（哪件事、几点到点）。用户问“我设了哪些闹钟”，或者提到刚才响过的提醒/闹钟时用它——先看 last_fired 再说话，别猜。",
+         PropertyList(),
+         [](const PropertyList& properties) -> ReturnValue {
+             return std::string("{\"last_fired\": ") + Alarm::GetInstance().LastFiredJson() +
+                    ", \"alarms\": " + Alarm::GetInstance().List() + "}";
+         });
+
+     AddTool("self.alarm.cancel",
+         "取消闹钟。`id` 传编号只取消那一个；不传或传 0 取消全部。",
+         PropertyList({
+             Property("id", kPropertyTypeInteger, 0, 0, 9999)
+         }),
+         [](const PropertyList& properties) -> ReturnValue {
+             return Alarm::GetInstance().Cancel(properties["id"].value<int>());
+         });
+
+     AddTool("self.alarm.ring",
+         "改闹钟响铃放什么，响铃时间不变（不用取消重建）。\n"
+         "  `id`: 闹钟编号，传了就只改那一个；不传或传 0 改的是**默认铃声**，"
+         "以后新建的闹钟都放它。\n"
+         "  `song_name`/`artist`: 换成的歌，设备自己搜曲播放。\n"
+         "  `audio_url`: 有直链就传，比按歌名搜更快更准。\n"
+         "用户说“闹钟铃声换成《稻香》”“以后默认用晴天叫我”都用它。",
+         PropertyList({
+             Property("id", kPropertyTypeInteger, 0, 0, 9999),
+             Property("song_name", kPropertyTypeString, ""),
+             Property("artist", kPropertyTypeString, ""),
+             Property("audio_url", kPropertyTypeString, "")
+         }),
+         [](const PropertyList& properties) -> ReturnValue {
+             return Alarm::GetInstance().SetRing(
+                 properties["id"].value<int>(),
+                 properties["audio_url"].value<std::string>(),
+                 properties["song_name"].value<std::string>(),
+                 properties["artist"].value<std::string>());
+         });
+
+     // 待机屏那行天气：数据由固件自己拉，AI 只负责换城市和读现成的
+     AddTool("self.weather.set_city",
+         "换待机屏天气显示的城市。用户说“天气改成杭州”“我在上海”时用它。\n"
+         "  `city`: 中文地名，如“杭州”“承德”，只写地名不要带省。\n"
+         "返回 success 时 now 就是换好之后屏幕上的那行字，照着说就行；失败说明地名没查到。",
+         PropertyList({
+             Property("city", kPropertyTypeString, "")
+         }),
+         [](const PropertyList& properties) -> ReturnValue {
+             return Weather::GetInstance().SetCity(properties["city"].value<std::string>());
+         });
+
+     AddTool("self.weather.get",
+         "读待机屏现在显示的天气。用户问“今天天气怎么样”“外面冷不冷”时用它，别自己编。",
+         PropertyList(),
+         [](const PropertyList&) -> ReturnValue {
+             auto text = Weather::GetInstance().Text();
+             if (text.empty()) {
+                 return std::string("{\"success\": false, \"message\": \"天气还没拉到（可能没联网）\"}");
+             }
+             return std::string("{\"success\": true, \"now\": \"") + text + "\"}";
+         });
+
      // Restore the original tools list to the end of the tools list
      tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
  }
@@ -407,21 +657,35 @@
          return;
      }
  
-     // Start a task to receive data with stack size
-     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    // AI 说「设好了」但其实没调工具，是这套东西最难查的故障：工具调用是唯一
+    // 能证伪的入口，参数和返回都在这里留痕。
+    if (cJSON_IsObject(tool_arguments)) {
+        char* dump = cJSON_PrintUnformatted(tool_arguments);
+        ESP_LOGI(TAG, "tools/call %s args: %.220s", tool_name.c_str(), dump ? dump : "{}");
+        if (dump) {
+            cJSON_free(dump);
+        }
+    } else {
+        ESP_LOGI(TAG, "tools/call %s args: (none)", tool_name.c_str());
+    }
+
+    // Start a task to receive data with stack size
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
      cfg.thread_name = "tool_call";
      cfg.stack_size = stack_size;
      cfg.prio = 1;
      esp_pthread_set_cfg(&cfg);
  
      // Use a thread to call the tool to avoid blocking the main thread
-     tool_call_thread_ = std::thread([this, id, tool_iter, arguments = std::move(arguments)]() {
-         try {
-             ReplyResult(id, (*tool_iter)->Call(arguments));
-         } catch (const std::exception& e) {
-             ESP_LOGE(TAG, "tools/call: %s", e.what());
-             ReplyError(id, e.what());
-         }
-     });
+    tool_call_thread_ = std::thread([this, id, tool_iter, tool_name, arguments = std::move(arguments)]() {
+        try {
+            std::string result = (*tool_iter)->Call(arguments);
+            ESP_LOGI(TAG, "tools/call %s -> %.220s", tool_name.c_str(), result.c_str());
+            ReplyResult(id, result);
+        } catch (const std::exception& e) {
+            ESP_LOGE(TAG, "tools/call: %s", e.what());
+            ReplyError(id, e.what());
+        }
+    });
      tool_call_thread_.detach();
  }

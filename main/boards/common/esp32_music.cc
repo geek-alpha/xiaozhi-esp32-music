@@ -20,8 +20,16 @@
 #include <thread> // 为线程ID比较
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <sdkconfig.h>
 
 #define TAG "Esp32Music"
+
+// 自查接口基地址：默认留空 —— 设备不再绑任何服务器 IP，播歌靠 MCP 接入点下发直链。
+// 菜单里手动填了 XZ_MUSIC_API_BASE 才会启用旧的自查路径（保留给离线调试）。
+// 注意：设备侧没有 CA 证书包，大白主服务的 8008 是自签 HTTPS，进不了 TLS，所以真要填就填明文端口。
+#ifndef CONFIG_XZ_MUSIC_API_BASE
+#define CONFIG_XZ_MUSIC_API_BASE ""
+#endif
 
 // ========== 简单的ESP32认证函数 ==========
 
@@ -139,48 +147,126 @@ static std::string url_encode(const std::string &str)
     return encoded;
 }
 
-// 在文件开头添加一个辅助函数，统一处理URL构建
-static std::string buildUrlWithParams(const std::string &base_url, const std::string &path, const std::string &query)
+// ========== 内置曲源（酷我公开接口）==========
+// MCP 接入点不给直链时，设备自己把歌名换成可播直链，全程只依赖公网 http。
+// 搜索接口返回的是 GBK 编码的单引号伪 JSON，设备端没有码表做转码 ——
+// 歌名歌手只用调用方传来的 UTF-8，返回里只抽数字字段（rid/时长），这是能塞进单片机的关键。
+static std::string http_get_text(const std::string &url)
 {
-    std::string result_url = base_url + path + "?";
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (!http)
+    {
+        return "";
+    }
+    http->SetHeader("User-Agent", "Mozilla/5.0");
+    http->SetHeader("Accept", "*/*");
+    if (!http->Open("GET", url))
+    {
+        return "";
+    }
+    if (http->GetStatusCode() != 200)
+    {
+        http->Close();
+        return "";
+    }
+    std::string body = http->ReadAll();
+    http->Close();
+    return body;
+}
+
+static bool all_digits(const std::string &s)
+{
+    if (s.empty())
+    {
+        return false;
+    }
+    for (char c : s)
+    {
+        if (c < '0' || c > '9')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::string &artist_name)
+{
+    (void)artist_name; // 只用歌名搜：带上歌手名反而把原唱挤下去
+    if (song_name.empty())
+    {
+        return false;
+    }
+
+    std::string search_url = "http://search.kuwo.cn/r.s?all=" + url_encode(song_name) +
+                             "&ft=music&itemset=web_2013&client=kt&pn=0&rn=8&rformat=json";
+    ESP_LOGI(TAG, "Builtin lookup search: %s", search_url.c_str());
+
+    std::string body = http_get_text(search_url);
+    if (body.empty())
+    {
+        ESP_LOGE(TAG, "Builtin lookup: search returned nothing");
+        return false;
+    }
+
+    // 同名翻唱、十几秒的抖音切片经常排在搜索结果前面，一次取 8 条挑时长最长的那条
+    std::string best_rid;
+    int best_duration = 0;
     size_t pos = 0;
-    size_t amp_pos = 0;
-
-    while ((amp_pos = query.find("&", pos)) != std::string::npos)
+    while ((pos = body.find("'DC_TARGETID':'", pos)) != std::string::npos)
     {
-        std::string param = query.substr(pos, amp_pos - pos);
-        size_t eq_pos = param.find("=");
-
-        if (eq_pos != std::string::npos)
+        size_t start = pos + 15;
+        size_t end = body.find('\'', start);
+        if (end == std::string::npos)
         {
-            std::string key = param.substr(0, eq_pos);
-            std::string value = param.substr(eq_pos + 1);
-            result_url += key + "=" + url_encode(value) + "&";
+            break;
         }
-        else
+        std::string rid = body.substr(start, end - start);
+
+        int duration = 0;
+        size_t dpos = body.find("'DURATION':'", end);
+        if (dpos != std::string::npos && dpos - end < 4096)
         {
-            result_url += param + "&";
+            size_t dstart = dpos + 12;
+            size_t dend = body.find('\'', dstart);
+            if (dend != std::string::npos && dend > dstart && dend - dstart <= 5)
+            {
+                duration = atoi(body.substr(dstart, dend - dstart).c_str());
+            }
         }
 
-        pos = amp_pos + 1;
+        if (all_digits(rid) && duration > best_duration && duration <= 600)
+        {
+            best_rid = rid;
+            best_duration = duration;
+        }
+        pos = end;
     }
 
-    // 处理最后一个参数
-    std::string last_param = query.substr(pos);
-    size_t eq_pos = last_param.find("=");
-
-    if (eq_pos != std::string::npos)
+    if (best_rid.empty())
     {
-        std::string key = last_param.substr(0, eq_pos);
-        std::string value = last_param.substr(eq_pos + 1);
-        result_url += key + "=" + url_encode(value);
-    }
-    else
-    {
-        result_url += last_param;
+        ESP_LOGE(TAG, "Builtin lookup: no usable track for '%s'", song_name.c_str());
+        return false;
     }
 
-    return result_url;
+    std::string audio_url = http_get_text(
+        "http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_" + best_rid);
+    while (!audio_url.empty() &&
+           (audio_url.back() == '\r' || audio_url.back() == '\n' || audio_url.back() == ' '))
+    {
+        audio_url.pop_back();
+    }
+    if (audio_url.rfind("http", 0) != 0)
+    {
+        ESP_LOGE(TAG, "Builtin lookup: no direct url for rid %s", best_rid.c_str());
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Builtin lookup: %s -> rid %s, %ds, %s",
+             song_name.c_str(), best_rid.c_str(), best_duration, audio_url.c_str());
+    last_downloaded_data_ = audio_url;
+    return PlayResolved(audio_url, "", song_name);
 }
 
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
@@ -189,7 +275,7 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
                            display_mode_(DISPLAY_MODE_LYRICS), is_playing_(false), is_downloading_(false),
                            play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(),
                            buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(),
-                           mp3_decoder_initialized_(false)
+                           mp3_decoder_initialized_(false), queue_active_(false), queue_total_(0)
 {
     ESP_LOGI(TAG, "Music player initialized with default spectrum display mode");
     InitializeMp3Decoder();
@@ -329,9 +415,15 @@ bool Esp32Music::Download(const std::string &song_name, const std::string &artis
     // 保存歌名用于后续显示
     current_song_name_ = song_name;
 
-    // 第一步：请求stream_pcm接口获取音频信息
-    std::string base_url = "http://110.42.59.54:2233";
-    std::string full_url = base_url + "/stream_pcm?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
+    // 第一步：向大白的兼容接口要曲目信息（返回 artist/title/audio_url/lyric_url）
+    std::string base_url = CONFIG_XZ_MUSIC_API_BASE;
+    if (base_url.empty())
+    {
+        // 没配自查地址：设备自己走内置曲源解析，不依赖任何自建服务
+        ESP_LOGW(TAG, "No self-lookup base configured, falling back to builtin music source");
+        return PlayByBuiltinLookup(song_name, artist_name);
+    }
+    std::string full_url = base_url + "/api/music/xz/song?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
 
     ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
 
@@ -402,57 +494,15 @@ bool Esp32Music::Download(const std::string &song_name, const std::string &artis
             {
                 ESP_LOGI(TAG, "Audio URL path: %s", audio_url->valuestring);
 
-                // 第二步：设置音频URL
-                std::string audio_path = audio_url->valuestring;
-
-                current_music_url_ = audio_path;
-
-                ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
-                ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
-                song_name_displayed_ = false; // 重置歌名显示标志
-                StartStreaming(current_music_url_);
-
-                // 处理歌词URL - 只有在歌词显示模式下才启动歌词
-                if (cJSON_IsString(lyric_url) && lyric_url->valuestring && strlen(lyric_url->valuestring) > 0)
+                std::string lyric_path;
+                if (cJSON_IsString(lyric_url) && lyric_url->valuestring)
                 {
-                    // 设置歌词URL
-                    std::string lyric_path = lyric_url->valuestring;
-
-                    current_lyric_url_ = lyric_path;
-
-                    // 根据显示模式决定是否启动歌词
-                    if (display_mode_ == DISPLAY_MODE_LYRICS)
-                    {
-                        ESP_LOGI(TAG, "Loading lyrics for: %s (lyrics display mode)", song_name.c_str());
-
-                        // 启动歌词下载和显示
-                        if (is_lyric_running_)
-                        {
-                            is_lyric_running_ = false;
-                            if (lyric_thread_.joinable())
-                            {
-                                lyric_thread_.join();
-                            }
-                        }
-
-                        is_lyric_running_ = true;
-                        current_lyric_index_ = -1;
-                        lyrics_.clear();
-
-                        lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
-                    }
-                    else
-                    {
-                        ESP_LOGI(TAG, "Lyric URL found but spectrum display mode is active, skipping lyrics");
-                    }
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "No lyric URL found for this song");
+                    lyric_path = lyric_url->valuestring;
                 }
 
+                bool played = PlayResolved(audio_url->valuestring, lyric_path, song_name);
                 cJSON_Delete(response_json);
-                return true;
+                return played;
             }
             else
             {
@@ -479,6 +529,255 @@ bool Esp32Music::Download(const std::string &song_name, const std::string &artis
 std::string Esp32Music::GetDownloadResult()
 {
     return last_downloaded_data_;
+}
+
+bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &lyric_url, const std::string &song_name)
+{
+    if (audio_url.empty())
+    {
+        ESP_LOGE(TAG, "Audio URL not found or empty for song: %s", song_name.c_str());
+        return false;
+    }
+
+    current_music_url_ = audio_url;
+    ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
+    ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
+    song_name_displayed_ = false; // 重置歌名显示标志
+    StartStreaming(current_music_url_);
+
+    if (lyric_url.empty())
+    {
+        ESP_LOGW(TAG, "No lyric URL found for this song");
+        return true;
+    }
+
+    current_lyric_url_ = lyric_url;
+    if (display_mode_ != DISPLAY_MODE_LYRICS)
+    {
+        ESP_LOGI(TAG, "Lyric URL found but spectrum display mode is active, skipping lyrics");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Loading lyrics for: %s (lyrics display mode)", song_name.c_str());
+    if (is_lyric_running_)
+    {
+        is_lyric_running_ = false;
+        if (lyric_thread_.joinable())
+        {
+            lyric_thread_.join();
+        }
+    }
+
+    is_lyric_running_ = true;
+    current_lyric_index_ = -1;
+    lyrics_.clear();
+    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    return true;
+}
+
+void Esp32Music::SetReminderContext(const std::string &label, const std::string &at, int plays)
+{
+    std::lock_guard<std::mutex> lock(reminder_mutex_);
+    reminder_label_ = label;
+    reminder_at_ = at;
+    reminder_remaining_ = plays > 0 ? plays : 1;
+}
+
+int Esp32Music::NextReminderStage(std::string &label, std::string &at)
+{
+    std::lock_guard<std::mutex> lock(reminder_mutex_);
+    if (reminder_label_.empty() && reminder_at_.empty())
+    {
+        return 0;
+    }
+    if (--reminder_remaining_ > 0)
+    { // 后面还有铃声/歌要放，先不报：报了 AI 开口就会抢掉那条音频
+        return 2;
+    }
+    label = reminder_label_;
+    at = reminder_at_;
+    reminder_label_.clear();
+    reminder_at_.clear();
+    reminder_remaining_ = 0;
+    return 1;
+}
+
+bool Esp32Music::PlayDirect(const std::string &audio_url, const std::string &lyric_url,
+                            const std::string &lyric_text, const std::string &title,
+                            const std::string &artist)
+{
+    if (audio_url.empty())
+    {
+        ESP_LOGE(TAG, "PlayDirect called without audio_url");
+        return false;
+    }
+
+    // 单曲点播就打断当前歌单，不然后在队列里排着的歌把点播顶掉
+    ClearQueue();
+
+    std::string name = title.empty() ? current_song_name_ : title;
+    current_song_name_ = name;
+    last_downloaded_data_ = audio_url;
+    ESP_LOGI(TAG, "PlayDirect: %s - %s", name.c_str(), artist.c_str());
+
+    if (!lyric_text.empty())
+    {
+        bool started = PlayResolved(audio_url, "", name);
+        StartLyricsWithContent(lyric_text);
+        return started;
+    }
+    return PlayResolved(audio_url, lyric_url, name);
+}
+
+// 播放队列：一次下发整张歌单，设备自己按顺序连播
+bool Esp32Music::PlayQueueItem(const QueueItem &item)
+{
+    if (item.audio_url.empty())
+    {
+        ESP_LOGE(TAG, "Queue item without audio_url: %s", item.title.c_str());
+        return false;
+    }
+
+    std::string title = item.title.empty() ? item.artist : item.title;
+    current_song_name_ = title;
+    last_downloaded_data_ = item.audio_url;
+    ESP_LOGI(TAG, "Queue playing: %s (total queued %d)", title.c_str(), queue_total_.load());
+
+    if (!item.lyric_text.empty())
+    {
+        bool started = PlayResolved(item.audio_url, "", title);
+        StartLyricsWithContent(item.lyric_text);
+        return started;
+    }
+    return PlayResolved(item.audio_url, item.lyric_url, title);
+}
+
+bool Esp32Music::PlayQueue(const std::string &songs_json)
+{
+    if (songs_json.empty())
+    {
+        ESP_LOGE(TAG, "PlayQueue: empty songs json");
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(songs_json.c_str());
+    if (root == nullptr || !cJSON_IsArray(root))
+    {
+        ESP_LOGE(TAG, "PlayQueue: songs json is not an array");
+        if (root != nullptr)
+        {
+            cJSON_Delete(root);
+        }
+        return false;
+    }
+
+    auto read_field = [](cJSON *node, const char *key) -> std::string {
+        cJSON *field = cJSON_GetObjectItem(node, key);
+        if (field != nullptr && cJSON_IsString(field) && field->valuestring != nullptr)
+        {
+            return std::string(field->valuestring);
+        }
+        return std::string();
+    };
+
+    std::deque<QueueItem> items;
+    int total = cJSON_GetArraySize(root);
+    for (int i = 0; i < total; i++)
+    {
+        cJSON *node = cJSON_GetArrayItem(root, i);
+        if (node == nullptr || !cJSON_IsObject(node))
+        {
+            continue;
+        }
+
+        QueueItem item;
+        item.audio_url = read_field(node, "audio_url");
+        item.lyric_url = read_field(node, "lyric_url");
+        item.lyric_text = read_field(node, "lyric_text");
+        item.title = read_field(node, "title");
+        item.artist = read_field(node, "artist");
+        if (item.title.empty())
+        {
+            item.title = read_field(node, "song_name");
+        }
+        if (item.audio_url.empty())
+        {
+            ESP_LOGW(TAG, "PlayQueue: skip entry %d (no audio_url)", i);
+            continue;
+        }
+        items.push_back(item);
+    }
+    cJSON_Delete(root);
+
+    if (items.empty())
+    {
+        ESP_LOGE(TAG, "PlayQueue: none of %d entries is playable", total);
+        return false;
+    }
+
+    QueueItem first;
+    int queued = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        play_queue_.swap(items);
+        first = play_queue_.front();
+        play_queue_.pop_front();
+        queue_total_ = (int)play_queue_.size() + 1;
+        queue_active_ = true;
+        queued = (int)play_queue_.size();
+    }
+
+    ESP_LOGI(TAG, "PlayQueue: %d songs accepted, %d left after first", queue_total_.load(), queued);
+    return PlayQueueItem(first);
+}
+
+bool Esp32Music::PlayNextFromQueue()
+{
+    QueueItem next;
+    int left = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (play_queue_.empty())
+        {
+            queue_active_ = false;
+            queue_total_ = 0;
+            return false;
+        }
+        next = play_queue_.front();
+        play_queue_.pop_front();
+        left = (int)play_queue_.size();
+    }
+
+    ESP_LOGI(TAG, "Queue: continue with %s (%d left)", next.title.c_str(), left);
+
+    // 不能在播放线程里直接起下一首：StartStreaming 会 join play_thread_，那就是当前线程自己。
+    // 用独立线程接力，旧线程 return 后这次 join 立即返回。
+    std::thread([this, next]() {
+        vTaskDelay(pdMS_TO_TICKS(300));
+        if (!queue_active_.load())
+        {
+            ESP_LOGI(TAG, "Queue: cancelled before %s started", next.title.c_str());
+            return;
+        }
+        if (!PlayQueueItem(next))
+        {
+            ESP_LOGW(TAG, "Queue: failed to start %s", next.title.c_str());
+        }
+    }).detach();
+
+    return true;
+}
+
+void Esp32Music::ClearQueue()
+{
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (!play_queue_.empty())
+    {
+        ESP_LOGI(TAG, "Queue cleared: %d pending songs dropped", (int)play_queue_.size());
+    }
+    play_queue_.clear();
+    queue_active_ = false;
+    queue_total_ = 0;
 }
 
 // 开始流式播放
@@ -543,6 +842,9 @@ bool Esp32Music::StopStreaming()
     ESP_LOGI(TAG, "Stopping music streaming - current state: downloading=%d, playing=%d",
              is_downloading_.load(), is_playing_.load());
 
+    // 手动停止就是不要歌单了，否则下一首会在 300ms 后自己冒出来
+    ClearQueue();
+
     // 重置采样率到原始值
     ResetSampleRate();
 
@@ -563,6 +865,7 @@ bool Esp32Music::StopStreaming()
     if (display)
     {
         display->SetMusicInfo(""); // 清空歌名显示
+        display->SetChatMessage("lyric", ""); // 歌词是走 chat 通道画的，不清就留在屏幕上盖住待机画面
         ESP_LOGI(TAG, "Cleared song name display");
     }
 
@@ -808,9 +1111,9 @@ void Esp32Music::PlayAudioStream()
     total_frames_decoded_ = 0;
 
     auto codec = Board::GetInstance().GetAudioCodec();
-    if (!codec || !codec->output_enabled())
+    if (!codec)
     {
-        ESP_LOGE(TAG, "Audio codec not available or not enabled");
+        ESP_LOGE(TAG, "Audio codec not available");
         is_playing_ = false;
         return;
     }
@@ -836,6 +1139,9 @@ void Esp32Music::PlayAudioStream()
     uint8_t *mp3_input_buffer = nullptr;
     int bytes_left = 0;
     uint8_t *read_ptr = nullptr;
+    // 等 device 回 idle 的计时。会话续接、服务端握手都可能把它长时间占在非 idle，
+    // 闹钟不能被这件事卡死，所以等够就强制抢一次通道。
+    int state_wait_ticks = 0;
 
     // 分配MP3输入缓冲区
     mp3_input_buffer = (uint8_t *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
@@ -866,17 +1172,30 @@ void Esp32Music::PlayAudioStream()
             {
                 ESP_LOGI(TAG, "Device is in listening state, switching to idle state for music playback");
             }
-            // 切换状态
-            app.ToggleChatState(); // 变成待机状态
+            // 让出通道但不设 user_stopped_：这是播放要独占音频，不是用户按了待机
+            app.SuspendSessionForAudio();
             vTaskDelay(pdMS_TO_TICKS(300));
             continue;
         }
         else if (current_state != kDeviceStateIdle)
-        { // 不是待机状态，就一直卡在这里，不让播放音乐
+        { // 不是待机状态，先等一下；等够了就抢通道，别无限等
             ESP_LOGD(TAG, "Device state is %d, pausing music playback", current_state);
-            // 如果不是空闲状态，暂停播放
+            if (++state_wait_ticks > 120)
+            {
+                ESP_LOGW(TAG, "Device stuck in state %d, taking the channel for playback", current_state);
+                app.SuspendSessionForAudio();
+                state_wait_ticks = 0;
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
+        }
+        state_wait_ticks = 0;
+
+        // 输出通道会被 AudioService 的空闲省电逻辑关掉，进到这里先重新打开
+        if (!codec->output_enabled())
+        {
+            ESP_LOGI(TAG, "Re-enabling audio output for music playback");
+            codec->EnableOutput(true);
         }
 
         // 设备状态检查通过，显示当前播放的歌名
@@ -1134,21 +1453,98 @@ void Esp32Music::PlayAudioStream()
 
     // 停止播放标志
     is_playing_ = false;
+    is_lyric_running_ = false;
+
+    // 自然播完这条路上以前什么都没收：采样率留在音乐的 44.1k、屏幕停在「《歌名》播放中…」，
+    // 于是看起来整个卡死在播放态，下一句语音也变调。这三件事必须和 StopStreaming 做齐。
+    ResetSampleRate();
+
+    auto &finish_board = Board::GetInstance();
+    auto finish_display = finish_board.GetDisplay();
+    if (finish_display)
+    {
+        finish_display->SetMusicInfo("");
+        finish_display->SetChatMessage("lyric", "");
+    }
+    song_name_displayed_ = false;
 
     // 只在频谱显示模式下才停止FFT显示
     if (display_mode_ == DISPLAY_MODE_SPECTRUM)
     {
-        auto &board = Board::GetInstance();
-        auto display = board.GetDisplay();
-        if (display)
+        if (finish_display)
         {
-            display->stopFft();
+            finish_display->stopFft();
             ESP_LOGI(TAG, "Stopped FFT display from play thread (spectrum mode)");
         }
     }
     else
     {
         ESP_LOGI(TAG, "Not in spectrum mode, skipping FFT stop");
+    }
+
+    // 歌单连播：还有下一首就直接接上，且不上报 music_finished ——
+    // 一报 AI 就插话「《xx》放完了」，连播中间不该有人声。
+    if (queue_active_.load() && PlayNextFromQueue())
+    {
+        return;
+    }
+
+    // 上报给 AI 的必须是一次完整事件：哪件事、几点到点，而不是「《xx》放完了」。
+    // 只报歌名时 AI 只能客套一句「歌放完了」，它并不知道刚才提醒的是什么。
+    std::string reminder_label;
+    std::string reminder_at;
+    int reminder_stage = NextReminderStage(reminder_label, reminder_at);
+
+    auto json_escape = [](const std::string &in)
+    {
+        std::string out;
+        for (char c : in)
+        {
+            if (c == '"' || c == '\\')
+            {
+                out += '\\';
+            }
+            if ((unsigned char)c >= 0x20)
+            {
+                out += c;
+            }
+        }
+        return out;
+    };
+
+    if (reminder_stage == 1)
+    {
+        char payload[384];
+        snprintf(payload, sizeof(payload),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/alarm_fired\",\"params\":"
+                 "{\"event\":\"reminder_due\",\"label\":\"%s\",\"at\":\"%s\",\"sound\":\"%s\"}}",
+                 json_escape(reminder_label).c_str(), json_escape(reminder_at).c_str(),
+                 json_escape(current_song_name_).c_str());
+        Application::GetInstance().SendMcpMessage(payload);
+        ESP_LOGI(TAG, "Reported reminder_due: %s at %s", reminder_label.c_str(), reminder_at.c_str());
+
+        // 不能再用 detect 把这句话塞给 AI：服务端会直接回
+        // "detect is only for wake, don't send long texts"——按协议 detect 的 text 只能是唤醒词。
+        // 事情已经由本地 TTS 念出来了，AI 想知道细节就查 self.alarm.list 的 last_fired。
+    }
+    else if (reminder_stage == 0)
+    {
+        // 设备是 MCP server，AI 侧没有轮询设备的能力，只能靠上行通知告诉它这首放完了。
+        std::string title = json_escape(current_song_name_);
+        char payload[192];
+        snprintf(payload, sizeof(payload),
+                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/music_finished\",\"params\":{\"title\":\"%s\"}}",
+                 title.c_str());
+        Application::GetInstance().SendMcpMessage(payload);
+        ESP_LOGI(TAG, "Reported music_finished to server: %s", title.c_str());
+    }
+    // reminder_stage == 2：这次闹钟的铃声也放完了，事件已经报过，不再打扰 AI
+
+    // 真正播完了（stage 2 是“后面还有铃声”，得等它响完），把借出去的会话接回来
+    if (reminder_stage != 2)
+    {
+        Application::GetInstance().Schedule([]()
+                                            { Application::GetInstance().ResumeAfterAudio(); });
     }
 }
 
@@ -1535,12 +1931,52 @@ bool Esp32Music::ParseLyrics(const std::string &lyric_content)
     return !lyrics_.empty();
 }
 
+bool Esp32Music::StartLyricsWithContent(const std::string &lrc)
+{
+    if (lrc.empty())
+    {
+        return false;
+    }
+    if (display_mode_ != DISPLAY_MODE_LYRICS)
+    {
+        ESP_LOGI(TAG, "Inline lyrics given but spectrum display mode is active, skipping");
+        return true;
+    }
+
+    if (is_lyric_running_)
+    {
+        is_lyric_running_ = false;
+        if (lyric_thread_.joinable())
+        {
+            lyric_thread_.join();
+        }
+    }
+
+    if (!ParseLyrics(lrc))
+    {
+        ESP_LOGW(TAG, "Inline lyrics have no timestamped lines, ignored");
+        return false;
+    }
+
+    is_lyric_running_ = true;
+    current_lyric_index_ = -1;
+    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    return true;
+}
+
 // 歌词显示线程
 void Esp32Music::LyricDisplayThread()
 {
     ESP_LOGI(TAG, "Lyric display thread started");
 
-    if (!DownloadLyrics(current_lyric_url_))
+    // 歌词正文已随 MCP 消息下发并解析过（lyrics_ 非空）时不必再拉 URL —— 跨公网场景下
+    // current_lyric_url_ 是服务端的局域网地址，设备根本连不上。
+    bool need_download;
+    {
+        std::lock_guard<std::mutex> lock(lyrics_mutex_);
+        need_download = lyrics_.empty();
+    }
+    if (need_download && !DownloadLyrics(current_lyric_url_))
     {
         ESP_LOGE(TAG, "Failed to download or parse lyrics");
         is_lyric_running_ = false;

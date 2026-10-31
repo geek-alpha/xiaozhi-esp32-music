@@ -14,6 +14,9 @@
 #include <cmath>
 #include <math.h>
 #include "settings.h"
+#include "emoji_assets.h"
+#include "application.h"
+#include "device_state.h"
 
 #include "board.h"
 
@@ -22,6 +25,33 @@
 #endif
 
 #define TAG "LcdDisplay"
+
+// 竖直慢滚：回顶停 1 秒让人看清再走，滚到底停 1.5 秒再回来
+// 必须用线性路径：ease_in_out 每帧起步速度都是 0，动画一被打断重开就变成走走停停
+static const uint32_t kScrollMsPerPx = 32; // 实机调出来的速度，眼睛跟得上
+
+static void StartSlowVerticalScroll(lv_obj_t* inner, int over, int base_y = 0)
+{
+    const uint32_t kTopStopMs = 1000;
+    const uint32_t kBottomStopMs = 1500;
+    uint32_t ms = (uint32_t)over * kScrollMsPerPx;
+    lv_anim_del(inner, nullptr);
+    lv_obj_set_y(inner, base_y);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, inner);
+    lv_anim_set_exec_cb(&a, [](void* var, int32_t v)
+                        { lv_obj_set_y((lv_obj_t*)var, v); });
+    lv_anim_set_values(&a, base_y, base_y - over);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_delay(&a, kTopStopMs);
+    lv_anim_set_playback_delay(&a, kBottomStopMs);
+    lv_anim_set_playback_duration(&a, ms);
+    lv_anim_set_repeat_delay(&a, kTopStopMs);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_start(&a);
+}
 
 #define FFT_SIZE 512
 static int current_heights[40] = {0};
@@ -96,6 +126,8 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     // Load theme from settings
     Settings settings("display", false);
     current_theme_name_ = settings.GetString("theme", "light");
+    hair_color_ = (uint32_t)settings.GetInt("hair_color", (int32_t)hair_color_);
+    ESP_LOGI(TAG, "Hair color from NVS: #%06X", (unsigned)hair_color_);
 
     // Update the theme
     if (current_theme_name_ == "dark") {
@@ -478,6 +510,7 @@ void LcdDisplay::SetupUI() {
 #else
 #define  MAX_MESSAGES 20
 #endif
+
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
     if (content_ == nullptr) {
@@ -657,6 +690,18 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         lv_obj_scroll_to_view_recursive(msg_bubble, LV_ANIM_ON);
     }
     
+    // 长回复：气泡限高不撑破表情区，文字在里面慢速上下滚，一段话滚完也留着能重看
+    lv_obj_update_layout(msg_text);
+    const int kBubbleChrome = 18; // pad 8*2 + border 1*2
+    int chat_view_h = lv_obj_get_height(content_) - EMOJI_H - 10 - kBubbleChrome;
+    int text_h = lv_obj_get_height(msg_text);
+    if (chat_view_h > 0 && text_h > chat_view_h) {
+        lv_obj_set_height(msg_bubble, chat_view_h + kBubbleChrome);
+        lv_obj_set_pos(msg_text, 0, 0);
+        StartSlowVerticalScroll(msg_text, text_h - chat_view_h);
+        ESP_LOGI(TAG, "Chat bubble scroll on: text %dpx / view %dpx", text_h, chat_view_h);
+    }
+
     // Store reference to the latest message label
     chat_message_label_ = msg_text;
 }
@@ -798,25 +843,135 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(content_, current_theme_.chat_background, 0);
     lv_obj_set_style_border_color(content_, current_theme_.border, 0); // Border color for content
 
-    lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN); // 垂直布局（从上到下）
-    lv_obj_set_flex_align(content_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_SPACE_EVENLY); // 子对象居中对齐，等距分布
+    // content_ 不挂 flex 布局：表情、天气、对话视窗各自绝对定位（LayoutContentBlocks），
+    // 任何一方内容怎么变都不会挪动别人的坐标
 
     emotion_label_ = lv_label_create(content_);
     lv_obj_set_style_text_font(emotion_label_, &font_awesome_30_4, 0);
     lv_obj_set_style_text_color(emotion_label_, current_theme_.text, 0);
     lv_label_set_text(emotion_label_, FONT_AWESOME_AI_CHIP);
+    lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+
+    emotion_image_ = lv_image_create(content_);
+    lv_obj_set_size(emotion_image_, EMOJI_W, EMOJI_H);
+    lv_obj_set_style_pad_all(emotion_image_, 0, 0);
+    lv_image_set_src(emotion_image_, &emoji_neutral);
+
+    // 头发染色层：A8 遮罩当 mask，颜色走 recolor。挂成表情图的子对象，
+    // 表情图隐藏/挪位时它自动跟着走，不用每个调用点都补一遍
+    hair_image_ = lv_image_create(emotion_image_);
+    lv_obj_remove_style_all(hair_image_);
+    lv_obj_set_size(hair_image_, EMOJI_W, EMOJI_H);
+    lv_obj_set_pos(hair_image_, 0, 0);
+    lv_obj_set_style_image_recolor_opa(hair_image_, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(hair_color_), 0);
+    hair_img_ = &emoji_neutral_hair;
+    lv_image_set_src(hair_image_, hair_img_);
+
+    // 眨眼：只换眼睛那一块贴片，不需要为每个表情存一张闭眼全脸。
+    // 必须挂 emotion_image_ 名下：贴片本身带原图头发像素，挂在 content_ 上会盖到染色层之上，
+    // 一眨眼额头就闪回原来的蓝色
+    blink_image_ = lv_image_create(emotion_image_);
+    lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(blink_image_, 0, 0);
+
+    // 贴片会带出「睁眼时被眼球挡住的刘海」，那几块在原图染色遮罩里是空的，眨一下闪回原蓝。
+    // 挂成 blink_image_ 的子对象：跟着同步显隐/同步位置，且自然压在贴片之上
+    blink_hair_image_ = lv_image_create(blink_image_);
+    lv_obj_remove_style_all(blink_hair_image_);
+    lv_obj_set_size(blink_hair_image_, BLINK_W, BLINK_H);
+    lv_obj_set_pos(blink_hair_image_, 0, 0);
+    lv_obj_set_style_image_recolor_opa(blink_hair_image_, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(hair_color_), 0);
+
+    // 说话张嘴：只在脸上叠一小块嘴部贴片，不为 21 个表情各存一张全脸（省 900KB flash）
+    mouth_image_ = lv_image_create(emotion_image_);
+    lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(mouth_image_, 0, 0);
+    mouth_img_ = &emoji_neutral_mouth;
+    lv_image_set_src(mouth_image_, mouth_img_);
+    // 贴片排在染色层下面：头发遮罩透明的地方才露贴片，头发该染色的地方贴片被盖住
+    lv_obj_move_foreground(hair_image_);
 
     preview_image_ = lv_image_create(content_);
     lv_obj_set_size(preview_image_, width_ * 0.5, height_ * 0.5);
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
-    chat_message_label_ = lv_label_create(content_);
+    // 天气：外框是固定高度的视窗（撑不破表情区），里面竖排所有行，行数多就整体上下滚动。
+    int wx_line_h = fonts_.text_font->line_height;
+    int wx_view_lines = (LV_VER_RES - wx_line_h - 10 - EMOJI_H) / wx_line_h;
+    if (wx_view_lines < 1) {
+        wx_view_lines = 1;
+    }
+    if (wx_view_lines > 4) {
+        wx_view_lines = 4;
+    }
+    weather_box_ = lv_obj_create(content_);
+    lv_obj_set_size(weather_box_, LV_HOR_RES - 10, wx_view_lines * wx_line_h);
+    lv_obj_set_style_pad_all(weather_box_, 0, 0);
+    lv_obj_set_style_border_width(weather_box_, 0, 0);
+    lv_obj_set_style_radius(weather_box_, 0, 0);
+    lv_obj_set_style_bg_opa(weather_box_, LV_OPA_TRANSP, 0);
+    lv_obj_set_scrollbar_mode(weather_box_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(weather_box_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
+
+    // inner 靠动画改 y 来滚，所以外框不能设 flex 布局，否则布局会把手动坐标抹回去
+    weather_inner_ = lv_obj_create(weather_box_);
+    lv_obj_set_width(weather_inner_, LV_HOR_RES - 10);
+    lv_obj_set_height(weather_inner_, LV_SIZE_CONTENT);
+    lv_obj_set_pos(weather_inner_, 0, 0);
+    lv_obj_set_flex_flow(weather_inner_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(weather_inner_, 0, 0);
+    lv_obj_set_style_pad_row(weather_inner_, 0, 0);
+    lv_obj_set_style_border_width(weather_inner_, 0, 0);
+    lv_obj_set_style_radius(weather_inner_, 0, 0);
+    lv_obj_set_style_bg_opa(weather_inner_, LV_OPA_TRANSP, 0);
+
+    // 每行允许折行：屏宽只够 11 个汉字，长行折成两行再靠纵向滚动看全，比截断丢字好
+    for (lv_obj_t*& line : weather_lines_) {
+        line = lv_label_create(weather_inner_);
+        lv_label_set_text(line, "");
+        lv_obj_set_style_text_font(line, fonts_.text_font, 0);
+        lv_obj_set_style_text_color(line, current_theme_.text, 0);
+        lv_obj_set_width(line, LV_HOR_RES - 10);
+        lv_obj_set_height(line, LV_SIZE_CONTENT);
+        lv_label_set_long_mode(line, LV_LABEL_LONG_WRAP);
+        lv_obj_add_flag(line, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // 对话区：外框是固定高度的视窗（撑不破表情区），文字在里面靠 y 动画滚。
+    // 脱离 content_ 的 flex 流自己定位，表情居中就不会被文字宽度带偏
+    chat_view_ = lv_obj_create(content_);
+    lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_width(chat_view_, LV_HOR_RES - 20);
+    lv_obj_set_height(chat_view_, 0);
+    lv_obj_set_style_pad_all(chat_view_, 0, 0);
+    lv_obj_set_style_border_width(chat_view_, 0, 0);
+    lv_obj_set_style_radius(chat_view_, 0, 0);
+    lv_obj_set_style_bg_opa(chat_view_, LV_OPA_TRANSP, 0);
+    lv_obj_set_scrollbar_mode(chat_view_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+
+    // 视窗里不能设 flex 布局，否则每次布局都会把手动坐标抹回去
+    chat_message_label_ = lv_label_create(chat_view_);
     lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.9); // 限制宽度为屏幕宽度的 90%
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP); // 设置为自动换行模式
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0); // 设置文本居中对齐
+    lv_obj_set_width(chat_message_label_, LV_PCT(100));
+    lv_obj_set_pos(chat_message_label_, 0, 0);
+    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(chat_message_label_, current_theme_.text, 0);
+
+    // 建 UI 时 content_ 还没布局，宽度是 0：先强制算一次，表情才能落在真正的正中
+    lv_obj_update_layout(content_);
+    LayoutContentBlocks();
 
     /* Status bar */
     lv_obj_set_flex_flow(status_bar_, LV_FLEX_FLOW_ROW);
@@ -843,6 +998,8 @@ void LcdDisplay::SetupUI() {
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(status_label_, current_theme_.text, 0);
+    // 状态栏要显示“周五”这类中文，默认字体是 Montserrat（无汉字），换成板子的中文点阵
+    lv_obj_set_style_text_font(status_label_, fonts_.text_font, 0);
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     mute_label_ = lv_label_create(status_bar_);
     lv_label_set_text(mute_label_, "");
@@ -865,6 +1022,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+
+    // 眨眼/嘴动定时器：这块板不走 start()（全项目只有 music 板调 start），所以在这里起
+    lv_timer_create([](lv_timer_t* t) {
+        static_cast<LcdDisplay*>(lv_timer_get_user_data(t))->BlinkTick();
+    }, 100, this);
 }
 
 void LcdDisplay::SetPreviewImage(const lv_img_dsc_t* img_dsc) {
@@ -883,71 +1045,268 @@ void LcdDisplay::SetPreviewImage(const lv_img_dsc_t* img_dsc) {
         if (emotion_label_ != nullptr) {
             lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
         }
+        if (emotion_image_ != nullptr) {
+            lv_obj_add_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (blink_image_ != nullptr) {
+            lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
-        // 隐藏预览图片并显示emotion_label_
+        // 隐藏预览图片并恢复表情贴图
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-        if (emotion_label_ != nullptr) {
-            lv_obj_clear_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+        if (emotion_image_ != nullptr) {
+            lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
         }
     }
 }
 #endif
 
-void LcdDisplay::SetEmotion(const char* emotion) {
-    struct Emotion {
-        const char* icon;
-        const char* text;
-    };
+#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
 
-    static const std::vector<Emotion> emotions = {
-        {"😶", "neutral"},
-        {"🙂", "happy"},
-        {"😆", "laughing"},
-        {"😂", "funny"},
-        {"😔", "sad"},
-        {"😠", "angry"},
-        {"😭", "crying"},
-        {"😍", "loving"},
-        {"😳", "embarrassed"},
-        {"😯", "surprised"},
-        {"😱", "shocked"},
-        {"🤔", "thinking"},
-        {"😉", "winking"},
-        {"😎", "cool"},
-        {"😌", "relaxed"},
-        {"🤤", "delicious"},
-        {"😘", "kissy"},
-        {"😏", "confident"},
-        {"😴", "sleepy"},
-        {"😜", "silly"},
-        {"🙄", "confused"}
-    };
-    
-    // 查找匹配的表情
-    std::string_view emotion_view(emotion);
-    auto it = std::find_if(emotions.begin(), emotions.end(),
-        [&emotion_view](const Emotion& e) { return e.text == emotion_view; });
+// 表情永远固定在 content_ 顶部正中：不靠 flex 算，直接给坐标，文字多少都挪不动它
+void LcdDisplay::LayoutContentBlocks() {
+    if (content_ == nullptr) {
+        return;
+    }
+    int cw = lv_obj_get_content_width(content_);
+    int ex = (cw - EMOJI_H) / 2;
+    if (emotion_image_ != nullptr) {
+        lv_obj_set_pos(emotion_image_, ex < 0 ? 0 : ex, 0);
+    }
+    if (emotion_label_ != nullptr) {
+        lv_obj_align(emotion_label_, LV_ALIGN_TOP_MID, 0, 0);
+    }
+    if (weather_box_ != nullptr) {
+        int wx = (cw - lv_obj_get_width(weather_box_)) / 2;
+        lv_obj_set_pos(weather_box_, wx < 0 ? 0 : wx, EMOJI_H + 4);
+    }
+}
 
+
+// vh 由调用方传入：刚 set_height 后 lv_obj_get_height 读回的仍是旧 coords
+// （新建时是 0），底对齐算法拿到 0 会把视窗摆到屏幕外
+void LcdDisplay::PlaceChatView(int vh) {
+    if (chat_view_ == nullptr || content_ == nullptr) {
+        return;
+    }
+    LayoutContentBlocks();
+    int cw = lv_obj_get_content_width(content_);
+    int ch = lv_obj_get_content_height(content_);
+    int vw = lv_obj_get_width(chat_view_);
+    // 顶在表情（有天气就在天气）下方，文字从上往下排；底对齐会让短句落到看不见的底部
+    int y = EMOJI_H + 4;
+    if (weather_box_ != nullptr && !lv_obj_has_flag(weather_box_, LV_OBJ_FLAG_HIDDEN)) {
+        y = (int)lv_obj_get_y(weather_box_) + (int)lv_obj_get_height(weather_box_) + 4;
+    }
+    int x = (cw - vw) / 2;
+    lv_obj_set_pos(chat_view_, x < 0 ? 0 : x, y < 0 ? 0 : y);
+    // 每来一句回复都会走一次这里，串口打印本身就会拖住 LVGL：位置没变就别打
+    static int last_x = -9999, last_y = -9999, last_vh = -9999;
+    int nx = (int)lv_obj_get_x(chat_view_);
+    int ny = (int)lv_obj_get_y(chat_view_);
+    if (nx == last_x && ny == last_y && vh == last_vh) {
+        return;
+    }
+    last_x = nx;
+    last_y = ny;
+    last_vh = vh;
+    ESP_LOGI(TAG, "Chat view at %d,%d size %dx%d in %dx%d, emoji at %d,%d %dx%d",
+             nx, ny, vw, vh, cw, ch,
+             emotion_image_ == nullptr ? -1 : (int)lv_obj_get_x(emotion_image_),
+             emotion_image_ == nullptr ? -1 : (int)lv_obj_get_y(emotion_image_),
+             emotion_image_ == nullptr ? -1 : (int)lv_obj_get_width(emotion_image_),
+             emotion_image_ == nullptr ? -1 : (int)lv_obj_get_height(emotion_image_));
+}
+
+
+// 一句话一句话显示：屏幕上只留最新这一句，整句替换，不滚、不累加
+void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
-    if (emotion_label_ == nullptr) {
+    if (chat_message_label_ == nullptr || chat_view_ == nullptr) {
+        return;
+    }
+    const bool is_user = (role != nullptr && strcmp(role, "user") == 0);
+
+    if (is_user || content == nullptr || strlen(content) == 0) {
+        // 新一轮开口（或上位机清屏）：上一轮的回复不再留在屏幕上，用户输入也不显示
+        chat_text_.clear();
+        lv_anim_del(chat_message_label_, nullptr);
+        lv_obj_set_y(chat_message_label_, 0);
+        lv_label_set_text(chat_message_label_, "");
+        lv_obj_set_height(chat_view_, 0);
+        lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
-    // 如果找到匹配的表情就显示对应图标，否则显示默认的neutral表情
-    lv_obj_set_style_text_font(emotion_label_, fonts_.emoji_font, 0);
-    if (it != emotions.end()) {
-        lv_label_set_text(emotion_label_, it->icon);
-    } else {
-        lv_label_set_text(emotion_label_, "😶");
+    // system 之类（升级进度、告警）和 assistant 的每一句都一样：顶掉上一句直接显示
+    chat_text_ = content;
+    lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(chat_message_label_, chat_text_.c_str());
+    // 视窗里的文字永远贴在顶部，短句就不会在视窗里上下浮
+    lv_anim_del(chat_message_label_, nullptr);
+    lv_obj_set_y(chat_message_label_, 0);
+    lv_obj_update_layout(chat_message_label_);
+
+    // 去表情和天气之后剩下的高度就是视窗能占的高度，超出的一屏只显示开头
+    int top = EMOJI_H + 4;
+    if (weather_box_ != nullptr && !lv_obj_has_flag(weather_box_, LV_OBJ_FLAG_HIDDEN)) {
+        top += lv_obj_get_height(weather_box_) + 4;
+    }
+    int avail = lv_obj_get_height(content_) - top - 10; // 10 = 视窗上方那条 flex 间距
+    if (avail < 1) {
+        avail = 1;
+    }
+    int text_h = lv_obj_get_height(chat_message_label_);
+    int vh = text_h < avail ? text_h : avail;
+    lv_obj_set_height(chat_view_, vh);
+    PlaceChatView(vh);
+
+    // 一屏装不下就按天气那套慢滚：回顶停 1 秒让人看完开头，滚到底停 1.5 秒再回来。
+    // 只差几像素也滚会看着像抖，over 太小时直接裁掉
+    int over = text_h - vh;
+    if (over >= 4) {
+        StartSlowVerticalScroll(chat_message_label_, over);
+    }
+    ESP_LOGI(TAG, "Chat line: text %dpx / avail %dpx / view %dpx / line %dpx / scroll %dpx",
+             text_h, avail, vh, (int)lv_font_get_line_height(fonts_.text_font), over >= 4 ? over : 0);
+}
+
+#endif
+
+
+void LcdDisplay::SetWeatherText(const char* text) {
+    DisplayLockGuard lock(this);
+    if (weather_box_ == nullptr) {
+        return;
+    }
+    // 每秒都会被 OnClockTimer 调一次，文本没变就别动 LVGL：重设会把滚动进度打回起点
+    if (weather_text_ == (text == nullptr ? "" : text)) {
+        return;
+    }
+    weather_text_ = (text == nullptr ? "" : text);
+
+    lv_anim_del(weather_inner_, nullptr);
+    lv_obj_set_y(weather_inner_, 0);
+
+    int used = 0;
+    if (!weather_text_.empty()) {
+        size_t pos = 0;
+        while (used < kWeatherMaxLines) {
+            size_t nl = weather_text_.find('\n', pos);
+            if (nl == std::string::npos) {
+                nl = weather_text_.size();
+            }
+            lv_label_set_text(weather_lines_[used], weather_text_.substr(pos, nl - pos).c_str());
+            lv_obj_clear_flag(weather_lines_[used], LV_OBJ_FLAG_HIDDEN);
+            ++used;
+            if (nl >= weather_text_.size()) {
+                break;
+            }
+            pos = nl + 1;
+        }
+    }
+    for (int i = used; i < kWeatherMaxLines; ++i) {
+        lv_obj_add_flag(weather_lines_[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
-    // 显示emotion_label_，隐藏preview_image_
-    lv_obj_clear_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    if (used == 0) {
+        lv_obj_add_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Weather on screen: cleared");
+        return;
+    }
+    lv_obj_clear_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
+
+    // 折行后的真实高度要布局算完才知道，据此决定滚不滚、滚多远
+    lv_obj_update_layout(weather_inner_);
+    int inner_h = lv_obj_get_height(weather_inner_);
+    int view_h = lv_obj_get_height(weather_box_);
+    int over = inner_h - view_h;
+    if (over > 0) {
+        StartSlowVerticalScroll(weather_inner_, over);
+        ESP_LOGI(TAG, "Weather on screen: %d lines, content %dpx / view %dpx, scroll on, stop top 1000ms bottom 1500ms",
+                 used, inner_h, view_h);
+        return;
+    }
+    ESP_LOGI(TAG, "Weather on screen: %d lines, content %dpx / view %dpx, scroll %s",
+             used, inner_h, view_h, over > 0 ? "on" : "off");
+}
+
+void LcdDisplay::SetEmotion(const char* emotion) {
+    DisplayLockGuard lock(this);
+    if (emotion_image_ == nullptr) {
+        return;
+    }
+
+    const lv_image_dsc_t* img = &emoji_neutral;
+    const lv_image_dsc_t* mouth = &emoji_neutral_mouth;
+    const lv_image_dsc_t* blink = nullptr;
+    const lv_image_dsc_t* blink_hair = nullptr;
+    const lv_image_dsc_t* hair = &emoji_neutral_hair;
+    if (emotion != nullptr) {
+        for (int i = 0; i < emoji_table_count; i++) {
+            if (strcmp(emoji_table[i].name, emotion) == 0) {
+                img = emoji_table[i].img;
+                mouth = emoji_table[i].mouth;
+                blink = emoji_table[i].blink;
+                blink_hair = emoji_table[i].blink_hair;
+                hair = emoji_table[i].hair;
+                break;
+            }
+        }
+    }
+    lv_image_set_src(emotion_image_, img);
+    mouth_img_ = mouth;
+    blink_img_ = blink;
+    blink_hair_img_ = blink_hair;
+    if (blink_hair_image_ != nullptr && blink_hair_img_ != nullptr) {
+        lv_image_set_src(blink_hair_image_, blink_hair_img_);
+        lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(hair_color_), 0);
+    }
+    if (hair_image_ != nullptr) {
+        hair_img_ = hair;
+        lv_image_set_src(hair_image_, hair_img_);
+        // 颜色和换图分开管：任何一条换图路径都不该把染色带走
+        lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(hair_color_), 0);
+        lv_obj_move_foreground(hair_image_);
+    }
+    if (mouth_image_ != nullptr) {
+        lv_image_set_src(mouth_image_, mouth_img_);
+        lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (blink_image_ != nullptr) {
+        lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    blink_frames_ = 0;
+    mouth_tick_ = 0;
+    mouth_open_ = false;
+    mouth_active_ = false;
+
+    lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
+    if (emotion_label_ != nullptr) {
+        lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    }
     if (preview_image_ != nullptr) {
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     }
-#endif
+    LayoutContentBlocks();
+
+    ESP_LOGI(TAG, "Emotion asset: %s placed at %d,%d in %d", emotion == nullptr ? "neutral" : emotion,
+             (int)lv_obj_get_x(emotion_image_), (int)lv_obj_get_y(emotion_image_),
+             (int)lv_obj_get_content_width(content_));
+}
+
+void LcdDisplay::SetHairColor(uint32_t rgb) {
+    DisplayLockGuard lock(this);
+    hair_color_ = rgb;
+    if (hair_image_ != nullptr) {
+        lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(rgb), 0);
+    }
+    if (blink_hair_image_ != nullptr) {
+        lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(rgb), 0);
+    }
+    Settings settings("display", true);
+    settings.SetInt("hair_color", (int32_t)rgb);
+    ESP_LOGI(TAG, "Hair color -> #%06X (saved)", (unsigned)rgb);
 }
 
 void LcdDisplay::SetIcon(const char* icon) {
@@ -959,8 +1318,13 @@ void LcdDisplay::SetIcon(const char* icon) {
     lv_label_set_text(emotion_label_, icon);
 
 #if !CONFIG_USE_WECHAT_MESSAGE_STYLE
-    // 显示emotion_label_，隐藏preview_image_
     lv_obj_clear_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    if (emotion_image_ != nullptr) {
+        lv_obj_add_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (blink_image_ != nullptr) {
+        lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+    }
     if (preview_image_ != nullptr) {
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -982,10 +1346,24 @@ void LcdDisplay::SetMusicInfo(const char* song_name) {
         std::string music_text = "";
         music_text += song_name;
         lv_label_set_text(chat_message_label_, music_text.c_str());
-        
-        // 确保显示 emotion_label_ 和 chat_message_label_，隐藏 preview_image_
+        if (chat_view_ != nullptr) {
+            lv_anim_del(chat_message_label_, nullptr);
+            lv_obj_set_y(chat_message_label_, 0);
+            lv_obj_update_layout(chat_message_label_);
+            int lyric_h = lv_obj_get_height(chat_message_label_);
+            int lyric_max = lv_obj_get_content_height(content_) - EMOJI_H - 8;
+            int lyric_vh = lyric_h < lyric_max ? lyric_h : lyric_max;
+            lv_obj_set_height(chat_view_, lyric_vh < 1 ? 1 : lyric_vh);
+            lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+            PlaceChatView(lyric_vh);
+        }
+
+        // 确保显示 emotion_image_ 和 chat_message_label_，隐藏 preview_image_
+        if (emotion_image_ != nullptr) {
+            lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
+        }
         if (emotion_label_ != nullptr) {
-            lv_obj_clear_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
         }
         if (preview_image_ != nullptr) {
             lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
@@ -993,6 +1371,10 @@ void LcdDisplay::SetMusicInfo(const char* song_name) {
     } else {
         // 清空歌名显示
         lv_label_set_text(chat_message_label_, "");
+        if (chat_view_ != nullptr) {
+            lv_obj_set_height(chat_view_, 0);
+            lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 #endif
 }
@@ -1245,8 +1627,59 @@ void LcdDisplay::start(){
         1,                  // 优先级
         &fft_task_handle    // 保存到成员变量
     );
-    
-  
+}
+
+void LcdDisplay::BlinkTick() {
+    if (emotion_image_ == nullptr) {
+        return;
+    }
+    if (lv_obj_has_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN)) {
+        if (mouth_image_ != nullptr) {
+            lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (blink_image_ != nullptr) {
+            lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    // 说话中：嘴部贴片一显一隐，什么表情都能张嘴；眨眼照常跑（两者像素区不重叠）
+    if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+        if (mouth_image_ != nullptr && mouth_img_ != nullptr) {
+            mouth_active_ = true;
+            if (++mouth_tick_ % 2 == 0) {
+                mouth_open_ = !mouth_open_;
+            }
+            if (mouth_open_) {
+                lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
+                lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(hair_image_);
+            } else {
+                lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    } else if (mouth_active_) {
+        mouth_active_ = false;
+        mouth_open_ = false;
+        if (mouth_image_ != nullptr) {
+            lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (blink_frames_ > 0) {
+        if (--blink_frames_ == 0 && blink_image_ != nullptr) {
+            lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    // 表里没眨眼贴片的表情（本来闭眼/戴墨镜）跳过眨眼
+    if (blink_img_ != nullptr && blink_image_ != nullptr && ++blink_tick_ % 32 == 0) {
+        lv_image_set_src(blink_image_, blink_img_);
+        lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
+        lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(hair_image_);
+        blink_frames_ = 2;
+    }
 }
 
 void LcdDisplay::drawSpectrumIfReady() {

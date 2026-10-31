@@ -16,3 +16,19 @@ main/mmap_generate_emoji.h
 *.pyc
 *.bin
 mmap_generate_*.h
+
+# 本机调试产物：构建/烧写/串口日志、一次性探针脚本、编辑器备份
+*.log
+*_log*.txt
+*_queue.txt
+queue_live.txt
+verify_out.txt
+reset_log.txt
+*.bak-*
+_*
+_flash_q.bat
+_emoji_out/
+_emoji_preview/
+check_playlist*
+t_multi.mjs
+flash_xz.cmd

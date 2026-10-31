@@ -120,8 +120,10 @@ void Display::UpdateStatusBar(bool update_all) {
             struct tm* tm = localtime(&now);
             // Check if the we have already set the time
             if (tm->tm_year >= 2025 - 1900) {
-                char time_str[16];
-                strftime(time_str, sizeof(time_str), "%H:%M  ", tm);
+                static const char* kWday[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+                char time_str[32];
+                snprintf(time_str, sizeof(time_str), "%02d:%02d  %02d-%02d %s",
+                         tm->tm_hour, tm->tm_min, tm->tm_mon + 1, tm->tm_mday, kWday[tm->tm_wday % 7]);
                 SetStatus(time_str);
             } else {
                 ESP_LOGW(TAG, "System time is not set, tm_year: %d", tm->tm_year);

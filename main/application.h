@@ -11,6 +11,7 @@
 #include <deque>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -59,6 +60,11 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     
+    // 音乐/提醒要独占音频：先把会话让出来。这只是借用通道，不等于用户要待机
+    void SuspendSessionForAudio();
+    // 音频播完了：把刚才让出去的会话接回来
+    void ResumeAfterAudio();
+
     // 新增：接收外部音频数据（如音乐播放）
     void AddAudioData(AudioStreamPacket&& packet);
     void PlaySound(const std::string_view& sound);
@@ -82,6 +88,17 @@ private:
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;
+    // 只允许手动待机：服务端 goodbye 只算一轮收尾，断了就自动接回来；
+    // 接不上的重试进度也落在这里（resume_pending_ + 指数退避）
+    std::atomic<bool> resume_pending_{false};
+    std::atomic<int> resume_fail_count_{0};
+    std::atomic<int64_t> resume_due_us_{0};
+    std::atomic<int64_t> channel_opened_us_{0};
+    std::atomic<bool> user_stopped_{false};
+    // 为音频让路：closing 只拦紧接着那一次同步回调，wants_resume 记着播完该不该接回
+    std::atomic<bool> audio_suspend_closing_{false};
+    std::atomic<bool> audio_suspend_wants_resume_{false};
+    std::atomic<int64_t> last_activity_us_{0};
     TaskHandle_t check_new_version_task_handle_ = nullptr;
 
     void OnWakeWordDetected();
@@ -89,6 +106,7 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void OnClockTimer();
     void SetListeningMode(ListeningMode mode);
+    void ResumeSession();
 };
 
 #endif // _APPLICATION_H_

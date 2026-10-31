@@ -72,9 +72,16 @@ bool AfeWakeWord::Initialize(AudioCodec* codec) {
     afe_config->afe_perferred_core = 1;
     afe_config->afe_perferred_priority = 1;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
-    
+    // wakenet9 自带阈值 0.631，轻声/远场喊多次唤不醒；DET_MODE_95 走更激进的召回档
+    afe_config->wakenet_mode = DET_MODE_95;
+
+    afe_config_print(afe_config);
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
+
+    // 阈值再压一档 0.631 -> 0.5：近距离正常说话稳定触发，仍留抗误唤醒余量
+    int threshold_ret = afe_iface_->set_wakenet_threshold(afe_data_, 1, 0.5);
+    ESP_LOGI(TAG, "WakeNet det threshold -> 0.5, ret=%d", threshold_ret);
 
     xTaskCreate([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;

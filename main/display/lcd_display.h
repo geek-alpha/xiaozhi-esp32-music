@@ -6,6 +6,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <font_emoji.h>
+#include "emoji_assets.h"
 
 #include <atomic>
 #include <vector>
@@ -39,6 +40,34 @@ protected:
     lv_obj_t* container_ = nullptr;
     lv_obj_t* side_bar_ = nullptr;
     lv_obj_t* preview_image_ = nullptr;
+    lv_obj_t* emotion_image_ = nullptr;
+    // 头发染色层：挂在 emotion_image_ 下面当子对象，父图隐藏/挪位它自动跟着走
+    lv_obj_t* hair_image_ = nullptr;
+    const lv_image_dsc_t* hair_img_ = nullptr;
+    uint32_t hair_color_ = 0x76A6FF;  // 原发色，不染色时和旧版长得一模一样
+    lv_obj_t* mouth_image_ = nullptr;
+    lv_obj_t* blink_image_ = nullptr;
+    // 眨眼贴片上再压一层：贴片会带出「睁眼时被眼球挡住的刘海」，按发色把它染掉
+    lv_obj_t* blink_hair_image_ = nullptr;
+    const lv_image_dsc_t* mouth_img_ = nullptr;
+    const lv_image_dsc_t* blink_img_ = nullptr;
+    const lv_image_dsc_t* blink_hair_img_ = nullptr;
+    uint16_t blink_tick_ = 0;
+    uint8_t blink_frames_ = 0;
+    uint16_t mouth_tick_ = 0;
+    bool mouth_open_ = false;
+    bool mouth_active_ = false;
+    // 天气整块纵向滚动：视窗高度固定，行数多了（或长行折行后）靠上下滚动露出来
+    static constexpr int kWeatherMaxLines = 8;
+    lv_obj_t* weather_box_ = nullptr;
+    lv_obj_t* weather_inner_ = nullptr;
+    lv_obj_t* weather_lines_[kWeatherMaxLines] = {};
+    std::string weather_text_;
+    // 对话：屏幕上只留最新一句，超出一屏就从这句话的开头裁切
+    std::string chat_text_;
+    lv_obj_t* chat_view_ = nullptr;
+    void PlaceChatView(int vh);
+    void LayoutContentBlocks();
 
     DisplayFonts fonts_;
     ThemeColors current_theme_;
@@ -100,13 +129,14 @@ protected:
     
 public:
     ~LcdDisplay();
+    void BlinkTick();
     virtual void SetEmotion(const char* emotion) override;
+    virtual void SetHairColor(uint32_t rgb) override;
     virtual void SetIcon(const char* icon) override;
     virtual void SetMusicInfo(const char* song_name) override;
+    virtual void SetWeatherText(const char* text) override;
     virtual void SetPreviewImage(const lv_img_dsc_t* img_dsc) override;
-#if CONFIG_USE_WECHAT_MESSAGE_STYLE
-    virtual void SetChatMessage(const char* role, const char* content) override; 
-#endif  
+    virtual void SetChatMessage(const char* role, const char* content) override;  
 
     // Add theme switching function
     virtual void SetTheme(const std::string& theme_name) override;

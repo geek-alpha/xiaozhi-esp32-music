@@ -1,5 +1,38 @@
 # 小智开源音乐固件
 
+> **本仓库是什么**：这是 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 音乐固件的二次开发分支，目标硬件 **星智 Cube 1.54 (WiFi)**（`xingzhi-cube-1.54tft-wifi`）。在上游基础上加了二次元表情系统、提醒与天气、以及音乐播放时的会话让路逻辑。
+
+## 本分支新增（v1.0.0）
+
+- **表情系统**：`tools/gen_emoji_assets.py` 离屏绘制 21 张 120×120 表情，连同口型贴片、眨眼贴片、发色遮罩一起生成 C 数组编进固件（`main/display/emoji_assets.c`）。
+- **发色染色**：运行时按 NVS 里存的颜色给头发重新着色，遮罩和表情一起生成，头顶高光处不留白缝。
+- **表情保持**：表情切换后一直留到下一个情绪事件，说话结束不会立刻跳回中性脸。
+- **提醒与天气**：`main/alarm.cc`、`main/weather.cc`。
+- **音乐接口基地址**：`CONFIG_XZ_MUSIC_API_BASE`，默认指向局域网服务，改这一项就能接自己的音乐 API。
+
+## 编译与烧写
+
+需要 ESP-IDF v5.4，目标芯片 esp32s3。
+
+```bat
+idf.py set-target esp32s3
+build_xz.cmd            :: 只编译
+build_xz.cmd COM3       :: 编译 + 烧写 + 串口监视
+```
+
+Linux / macOS：
+
+```bash
+SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.xz-music.defaults" idf.py build
+```
+
+改了表情画法或发色遮罩后重新生成资产（需要 Pillow）：
+
+```bash
+python tools/gen_emoji_assets.py
+```
+
+
 （中文 | [English](README_en.md) | [日本語](README_ja.md)）
 
 ## 视频

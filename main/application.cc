@@ -8,6 +8,7 @@
 #include "font_awesome_symbols.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
+#include "weather.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -16,6 +17,24 @@
 #include <arpa/inet.h>
 
 #define TAG "Application"
+
+// 聆听状态静默这么久还没一句话，就是人走了：关麦回待机省电。
+// 必须明显早于服务端的静默告别阈值（实测约 67 秒就播「那我先不打扰你了，拜拜」），
+// 否则设备一直空转听着，服务端抢在固件前面开口，用户就听到那句尴尬的再见。
+#define LISTENING_IDLE_STANDBY_SEC 45
+
+// 续接退避：500ms 起翻倍，封顶 30 秒。服务端反复挂断时按这个节奏重连，
+// 不至于把重连打成攻击，也不至于让用户觉得已经待机了。
+static int64_t ResumeBackoffUs(int fails)
+{
+    if (fails <= 0)
+    {
+        return 200000;
+    }
+    int shift = fails > 6 ? 6 : fails;
+    int64_t us = (int64_t)500000 * (1LL << (shift - 1));
+    return us > 30000000 ? 30000000 : us;
+}
 
 static const char *const STATE_STRINGS[] = {
     "unknown",
@@ -299,8 +318,13 @@ void Application::ToggleChatState()
     }
     else if (device_state_ == kDeviceStateListening)
     {
+        // 手动待机：按键关掉会话后不再自动续接
         Schedule([this]()
-                 { protocol_->CloseAudioChannel(); });
+                 {
+            user_stopped_ = true;
+            resume_pending_ = false;
+            resume_fail_count_ = 0;
+            protocol_->CloseAudioChannel(); });
     }
 }
 
@@ -408,6 +432,9 @@ void Application::Start()
     /* Wait for the network to be ready */
     board.StartNetwork();
 
+    // 待机屏的天气：自己拉公网接口，不等服务端
+    Weather::GetInstance().Start();
+
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
@@ -447,6 +474,11 @@ void Application::Start()
     protocol_->OnAudioChannelOpened([this, codec, &board]()
                                     {
         board.SetPowerSaveMode(false);
+        // 新会话开始：解除上次手动待机的拦截
+        user_stopped_ = false;
+        resume_pending_ = false;
+        channel_opened_us_ = esp_timer_get_time();
+        last_activity_us_ = esp_timer_get_time();
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
@@ -454,15 +486,45 @@ void Application::Start()
     protocol_->OnAudioChannelClosed([this, &board]()
                                     {
         board.SetPowerSaveMode(true);
-        Schedule([this]() {
-            auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+        // 服务端 goodbye 只是它收尾这一轮，不等于用户要待机。
+        // user_stopped_ 要留到下个会话开始再清：手动待机时服务端会回一条 goodbye，
+        bool stopped = user_stopped_;
+        // 是音乐/提醒把通道借走了，不是会话真断：别当成断连去续接
+        bool for_audio = audio_suspend_closing_.exchange(false);
+        // 通道只活了几秒就被服务端收尾：算一次抖动，退避拉长，别把重连打成攻击
+        bool quick = (esp_timer_get_time() - channel_opened_us_) < 3000000;
+        Schedule([this, stopped, for_audio, quick]() {
+            if (for_audio) {
+                resume_pending_ = false;
+                return;
+            }
+            if (stopped) {
+                resume_pending_ = false;
+                resume_fail_count_ = 0;
+                auto display = Board::GetInstance().GetDisplay();
+                display->SetChatMessage("system", "");
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
+            if (quick) {
+                int fails = ++resume_fail_count_;
+                if (fails >= 8) {
+                    ESP_LOGW(TAG, "Server keeps hanging up (%d times), entering standby", fails);
+                    resume_pending_ = false;
+                    resume_fail_count_ = 0;
+                    SetDeviceState(kDeviceStateIdle);
+                    return;
+                }
+            }
+            resume_pending_ = true;
+            resume_due_us_ = esp_timer_get_time() + ResumeBackoffUs(resume_fail_count_);
         }); });
     protocol_->OnIncomingJson([this, display](const cJSON *root)
                               {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        // 服务端还在下发东西就算有活动，看门狗只管“真没人说话”
+        last_activity_us_ = esp_timer_get_time();
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
@@ -473,7 +535,9 @@ void Application::Start()
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                Schedule([this, display]() {
+                    // 服务器说这轮 tts 结束了：字幕从这里才开始回顶慢滚
+                    display->NotifySpeechFinished();
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -494,6 +558,7 @@ void Application::Start()
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
+                last_activity_us_ = esp_timer_get_time();
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
@@ -570,8 +635,52 @@ void Application::OnClockTimer()
 {
     clock_ticks_++;
 
+    // 取消了一切自动待机：会话断了（服务端 goodbye / 网络抖动）就自己接回来，
+    // 只有用户手动按键才算待机。接不上按指数退避重试，别把服务端打冒烟。
+    if (resume_pending_ && !user_stopped_)
+    {
+        int64_t now = esp_timer_get_time();
+        if (now >= resume_due_us_)
+        {
+            resume_due_us_ = now + 3000000;  // 单次重连卡住也不超过 3 秒
+            last_activity_us_ = now;
+            Schedule([this]()
+                     { ResumeSession(); });
+        }
+    }
+
+    // 聆听就是在等一句话，等满 45 秒一句没来就回待机（早于服务端告别，别让它先开口）。
+    // clock_ticks_ 在每次状态切换时归零，等于「在本状态待了多少秒」；
+    // 再加一道 last_activity_us_ 是为了把服务端刚下发过的内容算成活动，别掐在人说话中间。
+    if (device_state_ == kDeviceStateListening && clock_ticks_ >= LISTENING_IDLE_STANDBY_SEC &&
+        (esp_timer_get_time() - last_activity_us_) >= (int64_t)LISTENING_IDLE_STANDBY_SEC * 1000000)
+    {
+        ESP_LOGI(TAG, "Listening idle for %d seconds, entering standby to save power", LISTENING_IDLE_STANDBY_SEC);
+        // 走手动待机同一条路：user_stopped_ 不设的话，关通道的回调会把会话自动接回来，白切。
+        Schedule([this]()
+                 {
+            user_stopped_ = true;
+            resume_pending_ = false;
+            resume_fail_count_ = 0;
+            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                protocol_->CloseAudioChannel();
+            } else {
+                SetDeviceState(kDeviceStateIdle);
+            } });
+    }
+
     auto display = Board::GetInstance().GetDisplay();
     display->UpdateStatusBar();
+
+    // 天气只占待机屏：一进会话就把字幕位让给对话
+    if (device_state_ == kDeviceStateIdle)
+    {
+        display->SetWeatherText(Weather::GetInstance().Detail().c_str());
+    }
+    else
+    {
+        display->SetWeatherText("");
+    }
 
     // Print the debug info every 10 seconds
     if (clock_ticks_ % 10 == 0)
@@ -605,6 +714,12 @@ void Application::MainEventLoop()
         auto bits = xEventGroupWaitBits(event_group_, MAIN_EVENT_SCHEDULE | MAIN_EVENT_SEND_AUDIO | MAIN_EVENT_WAKE_WORD_DETECTED | MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_ERROR, pdTRUE, pdFALSE, portMAX_DELAY);
         if (bits & MAIN_EVENT_ERROR)
         {
+            // 网络报错不等于用户要待机：没手动按过就让它自己接回来
+            if (!user_stopped_)
+            {
+                resume_pending_ = true;
+                resume_due_us_ = esp_timer_get_time() + ResumeBackoffUs(resume_fail_count_);
+            }
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "sad", Lang::Sounds::P3_EXCLAMATION);
         }
@@ -656,8 +771,6 @@ void Application::OnWakeWordDetected()
 
     if (device_state_ == kDeviceStateIdle)
     {
-        audio_service_.EncodeWakeWord();
-
         if (!protocol_->IsAudioChannelOpened())
         {
             SetDeviceState(kDeviceStateConnecting);
@@ -670,20 +783,14 @@ void Application::OnWakeWordDetected()
 
         auto wake_word = audio_service_.GetLastWakeWord();
         ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-#if CONFIG_USE_AFE_WAKE_WORD || CONFIG_USE_CUSTOM_WAKE_WORD
-        // Encode and send the wake word data to the server
-        while (auto packet = audio_service_.PopWakeWordPacket())
-        {
-            protocol_->SendAudio(std::move(packet));
-        }
-        // Set the chat state to wake word detected
-        protocol_->SendWakeWordDetected(wake_word);
+        // 唤醒词只负责唤醒。上行唤醒词音频或 wake_word_detected 事件，都会让服务端
+        // 把「你好小智」当成用户说的第一句话去回答，所以这里只切状态进入聆听。
+        // 提示音必须排在 SetListeningMode 之后：切 listening 会 EnableVoiceProcessing(true)，
+        // 里面的 ResetDecoder() 把播放队列整个倒掉，先播的叮咚一声都出不来。
+        // 反过来的风险是开麦后播会被拾取——但 input 有 120ms warmup 不读麦克风，起始段盖得住。
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
-#else
-        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
-        // Play the pop up sound to indicate the wake word is detected
         audio_service_.PlaySound(Lang::Sounds::P3_POPUP);
-#endif
+        ESP_LOGI(TAG, "Popup sound queued (%d bytes)", (int)Lang::Sounds::P3_POPUP.size());
     }
     else if (device_state_ == kDeviceStateSpeaking)
     {
@@ -706,6 +813,83 @@ void Application::SetListeningMode(ListeningMode mode)
 {
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
+}
+
+// 音乐/提醒要独占音频通道，会话得先让出来。这只是借用，不是用户要待机——
+// 所以绝不设 user_stopped_，而且记下这笔账，播完原样接回。
+void Application::SuspendSessionForAudio()
+{
+    // 播放线程只认 idle 这一个状态：只要不落到 idle 它就一直等，闹钟就永远不出声。
+    // 所以这里不能因为 protocol_ 为空、或状态是 connecting 就少走一步。
+    bool was_alive = (device_state_ != kDeviceStateIdle);
+    audio_suspend_wants_resume_ = was_alive;
+    resume_pending_ = false;
+    ESP_LOGI(TAG, "Audio needs the channel, session suspended (resume after: %d)", was_alive);
+    if (protocol_)
+    {
+        // CloseAudioChannel 会同步回调 OnAudioChannelClosed，压这个标记让那一次别去续接
+        audio_suspend_closing_ = true;
+        protocol_->CloseAudioChannel();
+    }
+    SetDeviceState(kDeviceStateIdle);
+}
+
+void Application::ResumeAfterAudio()
+{
+    bool wanted = audio_suspend_wants_resume_;
+    audio_suspend_wants_resume_ = false;
+    audio_suspend_closing_ = false;
+    if (!wanted || user_stopped_)
+    {
+        return;
+    }
+    resume_pending_ = true;
+    resume_due_us_ = esp_timer_get_time() + 500000;
+    ESP_LOGI(TAG, "Audio finished, taking the session back");
+}
+
+// 服务端结束了这一轮会话，但用户没按待机：重开通道接着听，不用再喊唤醒词。
+// 失败就退避再试（1s/2s/4s/8s/16s），连试五轮都不行才老实待机——那时候唤醒词还能用。
+void Application::ResumeSession()
+{
+    if (!protocol_ || user_stopped_)
+    {
+        resume_pending_ = false;
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+
+    auto mode = aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+    listening_mode_ = mode;
+    SetDeviceState(kDeviceStateConnecting);
+    if (!protocol_->OpenAudioChannel())
+    {
+        int fails = ++resume_fail_count_;
+        if (fails >= 5)
+        {
+            ESP_LOGW(TAG, "Resume session failed %d times, giving up and going idle", fails);
+            resume_pending_ = false;
+            resume_fail_count_ = 0;
+            SetDeviceState(kDeviceStateIdle);
+            return;
+        }
+        int64_t backoff_us = ResumeBackoffUs(fails);
+        resume_due_us_ = esp_timer_get_time() + backoff_us;
+        ESP_LOGW(TAG, "Resume session failed (%d/%d), retry in %lld ms", fails, 4, (long long)(backoff_us / 1000));
+        SetDeviceState(kDeviceStateIdle);
+        return;
+    }
+
+    // 音频处理线程还在跑时 SetDeviceState 不会重发 listen start，这里补上
+    bool processor_running = audio_service_.IsAudioProcessorRunning();
+    audio_service_.EnableVoiceProcessing(true);
+    if (processor_running)
+    {
+        protocol_->SendStartListening(mode);
+    }
+    SetDeviceState(kDeviceStateListening);
+    last_activity_us_ = esp_timer_get_time();
+    ESP_LOGI(TAG, "Session resumed without wake word");
 }
 
 void Application::SetDeviceState(DeviceState state)
@@ -745,19 +929,16 @@ void Application::SetDeviceState(DeviceState state)
     case kDeviceStateUnknown:
     case kDeviceStateIdle:
         display->SetStatus(Lang::Strings::STANDBY);
-        display->SetEmotion("neutral");
+        // 表情不跟着状态回中性：一张表情要留到下一句情绪事件，说话完就切回来等于白演
         audio_service_.EnableVoiceProcessing(false);
         audio_service_.EnableWakeWordDetection(true);
         break;
     case kDeviceStateConnecting:
         display->SetStatus(Lang::Strings::CONNECTING);
-        display->SetEmotion("neutral");
         display->SetChatMessage("system", "");
         break;
     case kDeviceStateListening:
         display->SetStatus(Lang::Strings::LISTENING);
-        display->SetEmotion("neutral");
-
         // Make sure the audio processor is running
         if (!audio_service_.IsAudioProcessorRunning())
         {
@@ -814,6 +995,9 @@ void Application::WakeWordInvoke(const std::string &wake_word)
     {
         Schedule([this]()
                  {
+            user_stopped_ = true;
+            resume_pending_ = false;
+            resume_fail_count_ = 0;
             if (protocol_) {
                 protocol_->CloseAudioChannel();
             } });
@@ -881,7 +1065,7 @@ void Application::SetAecMode(AecMode mode)
 void Application::AddAudioData(AudioStreamPacket &&packet)
 {
     auto codec = Board::GetInstance().GetAudioCodec();
-    if (device_state_ == kDeviceStateIdle && codec->output_enabled())
+    if (device_state_ == kDeviceStateIdle)
     {
         // packet.payload包含的是原始PCM数据（int16_t）
         if (packet.payload.size() >= 2)

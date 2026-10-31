@@ -24,9 +24,15 @@ public:
     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
     virtual void ShowNotification(const std::string &notification, int duration_ms = 3000);
     virtual void SetEmotion(const char* emotion);
+    // 换头像头发颜色：A8 遮罩 + recolor，表情图本身不用重画。没实现的板子自然什么都不做
+    virtual void SetHairColor(uint32_t rgb) {}
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void SetMusicInfo(const char* song_name);
     virtual void SetIcon(const char* icon);
+    // 待机屏上的天气。默认空实现：没有字幕位的板子不受影响
+    virtual void SetWeatherText(const char* text) {}
+    // 服务器 tts stop：这一轮真的说完了。字幕要等这个信号才回顶重播，别拿句子间隔去猜
+    virtual void NotifySpeechFinished() {}
     virtual void SetPreviewImage(const lv_img_dsc_t* image);
     virtual void SetTheme(const std::string& theme_name);
     virtual std::string GetTheme() { return current_theme_name_; }
