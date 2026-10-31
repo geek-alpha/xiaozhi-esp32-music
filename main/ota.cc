@@ -299,8 +299,8 @@ bool Ota::Upgrade(const std::string& firmware_url) {
 
     size_t content_length = http->GetBodyLength();
     if (content_length == 0) {
-        ESP_LOGE(TAG, "Failed to get content length");
-        return false;
+        // jsDelivr 等 CDN 首次回源时会用 chunked，没有 Content-Length，靠连接关闭判定结束
+        ESP_LOGW(TAG, "No Content-Length, size unknown");
     }
 
     char buffer[512];
@@ -317,7 +317,7 @@ bool Ota::Upgrade(const std::string& firmware_url) {
         recent_read += ret;
         total_read += ret;
         if (esp_timer_get_time() - last_calc_time >= 1000000 || ret == 0) {
-            size_t progress = total_read * 100 / content_length;
+            size_t progress = content_length > 0 ? total_read * 100 / content_length : 0;
             ESP_LOGI(TAG, "Progress: %u%% (%u/%u), Speed: %uB/s", progress, total_read, content_length, recent_read);
             if (upgrade_callback_) {
                 upgrade_callback_(progress, recent_read);
