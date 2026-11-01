@@ -506,6 +506,7 @@ bool Weather::Refresh() {
         *out = v->valuedouble;
         return true;
     };
+    // 日落跟温度不同：是字符串，得单独取。取不到就留空，屏上显示「—」
     auto day_str0 = [](cJSON* obj, const char* key, std::string& out) {
         cJSON* arr = cJSON_GetObjectItem(obj, key);
         if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) < 1) {
@@ -518,7 +519,6 @@ bool Weather::Refresh() {
         out = v->valuestring;
         return true;
     };
-
     cJSON* cur = cJSON_GetObjectItem(root, "current");
     cJSON* daily = cJSON_GetObjectItem(root, "daily");
     double temp = 0;
@@ -563,6 +563,7 @@ bool Weather::Refresh() {
         sunset = sunset_iso.substr(t_pos + 1, 5);
     }
 
+
     RefreshAir(lat_text, lon_text);
     int aqi;
     {
@@ -584,8 +585,9 @@ bool Weather::Refresh() {
         text += buf;
     }
 
-    // 屏只有 240x240，20px 字体一行约 11 个汉字。三行是极限：再多一行就把
-    // 120px 的表情挤出屏幕。
+    // 屏只有 240x240（内容区 216），20px 字体一行约 11 个汉字，可用宽度 230px。
+    // HUD 起点 140 给 3 行 72px：城市/温区/提示不滚就看得到，剩下两行走慢滚
+
     std::string detail;
     snprintf(buf, sizeof(buf), "%s %s %d° 体感%d°", city.c_str(),
              desc[0] != '\0' ? desc : "—", temp_i, feels_i);
@@ -594,18 +596,23 @@ bool Weather::Refresh() {
              wind_level);
     detail += "\n";
     detail += buf;
-    // 有提示就占第三行——冷热、紫外、空气质量这些判断已经包在提示里了；
-    // 没有提示才把紫外和空气的数字摊开来
+    // 第 3 行：有提示就是那一句话——冷热、紫外、空气质量这些判断已经包在里面了
     const char* tip = MakeTip(desc, temp_i, high_i, low_i, humidity_i, wind_level, uv_i, aqi);
     if (tip[0] != '\0') {
         detail += "\n";
         detail += tip;
-    } else {
-        snprintf(buf, sizeof(buf), "紫外%d 空气%s 日落%s", uv_i, aqi > 0 ? AqiLevel(aqi) : "—",
-                 sunset.empty() ? "—" : sunset.c_str());
+    }
+    // 第 4/5 行：具体数字，提示没提到的也能查到。「紫外N 空气XX 日落HH:MM」实测
+    // 234px > 可用 230px，会被折成半行——拆开各占一行，交给视窗滚动，信息一条不丢
+    snprintf(buf, sizeof(buf), "紫外%d 空气%s", uv_i, aqi > 0 ? AqiLevel(aqi) : "—");
+    detail += "\n";
+    detail += buf;
+    if (!sunset.empty()) {
+        snprintf(buf, sizeof(buf), "日落 %s", sunset.c_str());
         detail += "\n";
         detail += buf;
     }
+
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -614,6 +621,8 @@ bool Weather::Refresh() {
     }
     ESP_LOGI(TAG, "Now: %s | raw temp=%.1f feels=%.1f code=%d wind=%.1fkm/h@%.0f uv=%.1f", text.c_str(),
              temp, feels, (int)lround(code), wind_speed, wind_deg, uv);
+    // 屏上每一行都得留在这条日志里：折行会让行数超标去滚动，出事时先看这里
+    ESP_LOGI(TAG, "HUD text: [%s]", detail.c_str());
     return true;
 }
 

@@ -30,6 +30,187 @@
 // 必须用线性路径：ease_in_out 每帧起步速度都是 0，动画一被打断重开就变成走走停停
 static const uint32_t kScrollMsPerPx = 32; // 实机调出来的速度，眼睛跟得上
 
+// HUD 起点：小人图形到 EMOJI_TOTAL_H=210，content 只有 216。脸画到 y≈93、脖子 93~130，
+// 身体 130~210。3 行 = 72px 是屏上信息量的最优解，起点定 140 正好给出 72px，
+// 只压身体不碰脸；内容超过 3 行的部分交给 RefitWeatherView 慢滚
+static constexpr int kHudTop = 140;
+
+static constexpr int kHudGap = 2;
+
+// 摆臂：手臂是单独一层的 3 帧预生成图，ping-pong 播（回程靠反向，不用再画回落帧）。
+// 之前让整只身体上下飘 3px——头和身体各动各的，脖子那一圈一眼就能看出是两张贴纸摞着，
+// 这就是「动作很怪」的根子。改成手在摆、身体不动，才是人真要动的地方。
+// 说话时手臂也不能快：原来 110ms/帧（一程 220ms）像在打拍子。
+// 人说话时手臂不会跟着字句抽动，跟着情绪才动
+static constexpr uint32_t kArmWaveTalkMs = 260;  // 说话：一程 520ms
+// 待机不循环摆了。真人在听人说话时手基本是静的，隔好几秒才轻动一下；
+// 一直摆不仅假，还把观众的注意力全吸到那两个手球上，脸反而不看了
+static constexpr uint32_t kArmSwingMs = 420;        // 一次轻摆的每帧时长，全程约 840ms
+static constexpr uint32_t kArmSwingMinTicks = 70;   // BlinkTick 100ms 一拍 → 7s
+static constexpr uint32_t kArmSwingSpanTicks = 60;  // 再随机 0~6s：等间隔照样看得出是机器
+
+static const lv_image_dsc_t* const kArmFrames[] = {&emoji_arm_0, &emoji_arm_1, &emoji_arm_2};
+static constexpr size_t kArmFrameCount = sizeof(kArmFrames) / sizeof(kArmFrames[0]);
+
+// ---- 聆听微表情 ---------------------------------------------------------
+// 真人听人说话，眼睛一直在对方脸上移动：每个落点停 0.6~1.4s，同一落点不会连着贴两遍。
+// 间隔 1.2~3.4s 两头都随机，固定间隔就是扫视机器
+static const lv_image_dsc_t* const kGazeFrames[GAZE_COUNT] = {&emoji_gaze_0, &emoji_gaze_1, &emoji_gaze_2};
+static constexpr uint8_t kGazeHoldMinTicks = 6;
+static constexpr uint8_t kGazeHoldSpanTicks = 9;
+static constexpr uint8_t kGazeWaitMinTicks = 12;
+static constexpr uint8_t kGazeWaitSpanTicks = 23;
+// 「嗯」：张 0.2~0.4s 就收，隔 6~14s 来一下。一直闭嘴听着像雕像，一直张着嘴像在说话
+static constexpr uint16_t kListenMouthMinTicks = 60;
+static constexpr uint16_t kListenMouthSpanTicks = 80;
+static constexpr uint8_t kListenMouthHoldMin = 2;
+static constexpr uint8_t kListenMouthHoldSpan = 3;
+// 换姿势：聆听时手不能像说话那样摆（边听边摆手不是听人说话的人），
+// 但完全不动是石膏。给一次 1.1s 的单程缓慢调整，间隔比待机轻摆长一倍
+static constexpr uint32_t kArmListenMs = 560;
+static constexpr uint16_t kArmListenMinTicks = 120;
+static constexpr uint16_t kArmListenSpanTicks = 150;
+
+static void StartArmWave(lv_obj_t* arms, uint32_t per_frame_ms, bool loop = true)
+{
+    if (arms == nullptr || kArmFrameCount < 2) {
+        return;
+    }
+    lv_anim_del(arms, nullptr);
+    lv_obj_set_user_data(arms, (void*)(intptr_t)-1);  // -1 = 还没画过任何一帧
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, arms);
+    lv_anim_set_exec_cb(&a, [](void* var, int32_t v)
+                        {
+        lv_obj_t* o = (lv_obj_t*)var;
+        if (v < 0) {
+            v = 0;
+        }
+        if ((size_t)v >= kArmFrameCount) {
+            v = (int32_t)kArmFrameCount - 1;
+        }
+        // linear 插值每帧都回调，帧号没变就 return：白 set_src 一次就是白重绘一遍手臂
+        if ((int32_t)(intptr_t)lv_obj_get_user_data(o) == v) {
+            return;
+        }
+        lv_obj_set_user_data(o, (void*)(intptr_t)v);
+        lv_image_set_src(o, kArmFrames[v]); });
+    lv_anim_set_values(&a, 0, (int32_t)kArmFrameCount - 1);
+    lv_anim_set_duration(&a, per_frame_ms * (uint32_t)(kArmFrameCount - 1));
+    lv_anim_set_playback_duration(&a, per_frame_ms * (uint32_t)(kArmFrameCount - 1));
+    // loop=false 只播一趟（正向+回程）就停：待机那一次轻摆用它，摆完手就静下来
+    lv_anim_set_repeat_count(&a, loop ? LV_ANIM_REPEAT_INFINITE : 0);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_start(&a);
+    ESP_LOGI(TAG, "Arm wave: %d frames x %dms%s", (int)kArmFrameCount, (int)per_frame_ms,
+             loop ? "" : " once");
+}
+
+// ---- 小人整体呼吸 ---------------------------------------------------------
+// 头/身/手三层必须同拍。上一版只让身体上下飘 3px、头钉死在原地，脖子那一圈一眼
+// 就是两层贴纸叠在一起——怪在「只有一层在动」，不在「动了」。所以这版整组一起浮。
+// 也不能给三层各起一条 lv_anim：分开 start 就有先后 tick，而且 arms 上还挂着换帧
+// 动画，lv_anim_del 会连它一起干掉。一个 timer 一次算完、一次设三层 y，天然同步。
+static constexpr int kFloatAmp = 2;             // 屏上 2px：4px 时整只小人在浮起来下沉，像浮漂
+// 待机半程 2.4s → 一个完整呼吸 4.8s，接近真人静息呼吸（4~5s）。
+// 原来 1300ms 半程 = 2.6s 一个呼吸，比真人快一倍，看着就在“喘”
+static constexpr uint32_t kFloatIdleMs = 2400;
+static constexpr uint32_t kFloatTalkMs = 950;   // 说话半程 950ms，略快但不是喘
+// 25fps 够顺。y 没变的 tick 直接 return，LVGL 那边也就不会置脏重绘
+static constexpr uint32_t kFloatTickMs = 40;
+// 听人说话时呼吸更慢更浅：一个完整呼吸 6.4s，像屏着气在听。
+// 降不下来就显出「在等对方说」，那是待机的节奏
+static constexpr uint32_t kFloatListenMs = 3200;
+
+// 聆听点头：整组同步快下、停一瞬、慢回，3px。曲线和呼吸不同（呼吸两头都慢），
+// 所以「在听」和「在呼吸」才分得开。只能整组动——只动头会跟身体错位，之前就翻过这车
+static constexpr int kNodAmp = 3;
+static constexpr uint32_t kNodDownMs = 140;
+static constexpr uint32_t kNodHoldMs = 120;
+static constexpr uint32_t kNodUpMs = 320;
+static constexpr uint32_t kNodTotalMs = kNodDownMs + kNodHoldMs + kNodUpMs;
+// 间隔 3~7s 且每次重抽：等间隔点头像打拍子
+static constexpr uint32_t kNodWaitMinMs = 3000;
+static constexpr uint32_t kNodWaitSpanMs = 4000;
+
+void LcdDisplay::ApplyAvatarY()
+{
+    // 只改 y，x 留给 LayoutContentBlocks：宽度变了靠它重算，浮动不该管横向
+    if (emotion_image_ != nullptr) {
+        lv_obj_set_y(emotion_image_, float_y_);
+    }
+    if (arms_image_ != nullptr) {
+        lv_obj_set_y(arms_image_, EMOJI_BODY_OY + float_y_);
+    }
+    if (body_image_ != nullptr) {
+        lv_obj_set_y(body_image_, EMOJI_BODY_OY + float_y_);
+    }
+    // 投影必须跟呼吸走：不跟着动，小人一浮就和自己的影子离婚
+    if (shadow_image_ != nullptr) {
+        lv_obj_set_y(shadow_image_, float_y_);
+    }
+}
+
+void LcdDisplay::AvatarFloatTick()
+{
+    const bool listening = Application::GetInstance().GetDeviceState() == kDeviceStateListening;
+    uint32_t half = float_talk_ ? kFloatTalkMs : kFloatIdleMs;
+    if (listening && !float_talk_) {
+        half = kFloatListenMs;
+    }
+    float_phase_ms_ = (float_phase_ms_ + kFloatTickMs) % (half * 2);
+    // 三角波再套 smoothstep：两端速度归零，看着是呼吸，匀速升降像升降机
+    float s = (float)float_phase_ms_ / (float)half;
+    if (s > 1.0f) {
+        s = 2.0f - s;
+    }
+    s = s * s * (3.0f - 2.0f * s);
+    int y = (int)(kFloatAmp * s + 0.5f);
+
+    // 点头只挂在聆听态上：待机/说话时这套状态一律清零，免得残留到下一次
+    if (listening) {
+        if (nod_phase_ms_ == 0) {
+            if (nod_wait_ms_ == 0) {
+                nod_wait_ms_ = kNodWaitMinMs + esp_random() % kNodWaitSpanMs;
+            }
+            if (nod_wait_ms_ <= kFloatTickMs) {
+                nod_phase_ms_ = kFloatTickMs;
+                nod_wait_ms_ = 0;
+            } else {
+                nod_wait_ms_ -= kFloatTickMs;
+            }
+        } else {
+            nod_phase_ms_ += kFloatTickMs;
+            if (nod_phase_ms_ >= kNodTotalMs) {
+                nod_phase_ms_ = 0;
+                nod_wait_ms_ = kNodWaitMinMs + esp_random() % kNodWaitSpanMs;
+            }
+        }
+        if (nod_phase_ms_ > 0) {
+            const uint32_t p = nod_phase_ms_;
+            float k;
+            if (p <= kNodDownMs) {
+                k = (float)p / (float)kNodDownMs;
+            } else if (p <= kNodDownMs + kNodHoldMs) {
+                k = 1.0f;
+            } else {
+                k = 1.0f - (float)(p - kNodDownMs - kNodHoldMs) / (float)kNodUpMs;
+            }
+            y += (int)(kNodAmp * k + 0.5f);
+        }
+    } else {
+        nod_phase_ms_ = 0;
+        nod_wait_ms_ = 0;
+    }
+
+    if (y == float_y_) {
+        return;
+    }
+    float_y_ = y;
+    ApplyAvatarY();
+}
+
 static void StartSlowVerticalScroll(lv_obj_t* inner, int over, int base_y = 0)
 {
     const uint32_t kTopStopMs = 1000;
@@ -700,7 +881,9 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     // 长回复：气泡限高不撑破表情区，文字在里面慢速上下滚，一段话滚完也留着能重看
     lv_obj_update_layout(msg_text);
     const int kBubbleChrome = 18; // pad 8*2 + border 1*2
-    int chat_view_h = lv_obj_get_height(content_) - EMOJI_H - 10 - kBubbleChrome;
+    // 气泡只能吃脸以下那段（kHudTop）。身体已经压在 HUD 区里，再按 EMOJI_TOTAL_H（210）
+    // 算就只剩 2px，气泡永远只剩一行
+    int chat_view_h = lv_obj_get_height(content_) - kHudTop - 10 - kBubbleChrome;
     int text_h = lv_obj_get_height(msg_text);
     if (chat_view_h > 0 && text_h > chat_view_h) {
         lv_obj_set_height(msg_bubble, chat_view_h + kBubbleChrome);
@@ -860,7 +1043,9 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_radius(content_, 0, 0);
     lv_obj_set_width(content_, LV_HOR_RES);
     lv_obj_set_flex_grow(content_, 1);
-    lv_obj_set_style_pad_all(content_, 5, 0);
+    // 上下 pad 归 0：这 10px 是纯粹白送的空间。有它时脸只能长到 128，
+    // 去掉后 162 的脸仍能给 HUD 留 50px（够 2 行天气不滚）
+    lv_obj_set_style_pad_all(content_, 0, 0);
     lv_obj_set_style_bg_color(content_, current_theme_.chat_background, 0);
     lv_obj_set_style_bg_opa(content_, LV_OPA_TRANSP, 0);   // 同上：透出底图
     lv_obj_set_style_border_width(content_, 0, 0);
@@ -874,10 +1059,40 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(emotion_label_, FONT_AWESOME_AI_CHIP);
     lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
 
+    // 投影：整只小人的模糊剪影垫在最底层。脸长到 162 几平顶满屏之后，
+    // 没它小人就是一张贴在科技底上的纸——投影是「浮出屏幕」最便宜的纵深线索
+    shadow_image_ = lv_image_create(content_);
+    lv_obj_set_size(shadow_image_, EMOJI_SHADOW_W, EMOJI_SHADOW_H);
+    lv_obj_set_style_pad_all(shadow_image_, 0, 0);
+    lv_obj_set_style_image_recolor(shadow_image_, lv_color_black(), 0);
+    lv_obj_set_style_image_recolor_opa(shadow_image_, LV_OPA_COVER, 0);
+    lv_image_set_src(shadow_image_, &emoji_shadow);
+
+    // 叠放顺序按创建顺序来：投影 → 手臂 → 身体 → 脸。手臂必须垫在最底下，
+    // 臂根才会被躯干盖住，摆到任何角度肩膀处都不会裂出一条缝
+    arms_image_ = lv_image_create(content_);
+    lv_obj_set_size(arms_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_style_pad_all(arms_image_, 0, 0);
+    lv_image_set_src(arms_image_, kArmFrames[0]);
+
+    body_image_ = lv_image_create(content_);
+    lv_obj_set_size(body_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_style_pad_all(body_image_, 0, 0);
+    lv_image_set_src(body_image_, &emoji_body);
+
     emotion_image_ = lv_image_create(content_);
     lv_obj_set_size(emotion_image_, EMOJI_W, EMOJI_H);
     lv_obj_set_style_pad_all(emotion_image_, 0, 0);
     lv_image_set_src(emotion_image_, &emoji_neutral);
+
+    // 表情补丁：底图（emoji_neutral）画完就再也不换，切表情只是把这块差异图换掉。
+    // 22 张脸各存一份全图在 162px 下要 1.86MB，直接超分区；只存差异块 640KB 拿下。
+    // 创建顺序就是层序：补丁必须在眼神/眨眼/嘴/头发下面，上面几层都是它的局部修正
+    patch_image_ = lv_image_create(emotion_image_);
+    lv_obj_add_flag(patch_image_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(patch_image_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(patch_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(patch_image_, 0, 0);
 
     // 头发染色层：A8 遮罩当 mask，颜色走 recolor。挂成表情图的子对象，
     // 表情图隐藏/挪位时它自动跟着走，不用每个调用点都补一遍
@@ -889,6 +1104,15 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(hair_color_), 0);
     hair_img_ = &emoji_neutral_hair;
     lv_image_set_src(hair_image_, hair_img_);
+
+    // 眼神贴片：和眨眼同一块眼区，挂在脸名下跟着走。
+    // 建在 blink_image_ 之前 = 压在它下面：闭眼时整块眼睛归闭眼贴片，眼神贴片不能露出来
+    gaze_image_ = lv_image_create(emotion_image_);
+    lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_pad_all(gaze_image_, 0, 0);
+    lv_image_set_src(gaze_image_, kGazeFrames[0]);
 
     // 眨眼：只换眼睛那一块贴片，不需要为每个表情存一张闭眼全脸。
     // 必须挂 emotion_image_ 名下：贴片本身带原图头发像素，挂在 content_ 上会盖到染色层之上，
@@ -930,21 +1154,19 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
-    // 天气：外框是固定高度的视窗（撑不破表情区），里面竖排所有行，行数多就整体上下滚动。
+    // 天气和对话共用小人下半身那块 HUD 信息区：只留 1 行，行数再多靠内部慢滚看全。
+    // 旧公式按 EMOJI_TOTAL_H 往下排 2 行，加身体后把对话整块挤到屏幕外（avail 只剩 30px）
     int wx_line_h = fonts_.text_font->line_height;
-    int wx_view_lines = (LV_VER_RES - wx_line_h - 10 - EMOJI_H) / wx_line_h;
-    if (wx_view_lines < 1) {
-        wx_view_lines = 1;
-    }
-    if (wx_view_lines > 4) {
-        wx_view_lines = 4;
-    }
     weather_box_ = lv_obj_create(content_);
-    lv_obj_set_size(weather_box_, LV_HOR_RES - 10, wx_view_lines * wx_line_h);
+    lv_obj_set_size(weather_box_, LV_HOR_RES - 6, wx_line_h);
     lv_obj_set_style_pad_all(weather_box_, 0, 0);
+    lv_obj_set_style_pad_left(weather_box_, 2, 0);
+    lv_obj_set_style_pad_right(weather_box_, 2, 0);
     lv_obj_set_style_border_width(weather_box_, 0, 0);
-    lv_obj_set_style_radius(weather_box_, 0, 0);
+    lv_obj_set_style_radius(weather_box_, 3, 0);
+    // 同上：inner 设了透明不算数，外框自己不透明照样盖出一块白
     lv_obj_set_style_bg_opa(weather_box_, LV_OPA_TRANSP, 0);
+    // 不加底衬：黑框压在科技底图上很脏，文字直接浮在画面里
     lv_obj_set_scrollbar_mode(weather_box_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(weather_box_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
@@ -978,12 +1200,18 @@ void LcdDisplay::SetupUI() {
     chat_view_ = lv_obj_create(content_);
     lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_FLOATING);
-    lv_obj_set_width(chat_view_, LV_HOR_RES - 20);
+    // 宽度和天气条对齐（LV_HOR_RES-6）：两条半透明底衬宽度不一致会看出错位
+    lv_obj_set_width(chat_view_, LV_HOR_RES - 6);
     lv_obj_set_height(chat_view_, 0);
-    lv_obj_set_style_pad_all(chat_view_, 0, 0);
+    lv_obj_set_style_pad_all(chat_view_, 2, 0);
+    lv_obj_set_style_pad_top(chat_view_, 0, 0);
+    lv_obj_set_style_pad_bottom(chat_view_, 0, 0);
     lv_obj_set_style_border_width(chat_view_, 0, 0);
-    lv_obj_set_style_radius(chat_view_, 0, 0);
+    lv_obj_set_style_radius(chat_view_, 3, 0);
+    // 必须显式设 TRANSP：lv_obj_create 的默认底是主题色不透明（浅色主题就是白底），
+    // 不写这行不是「没底衬」，是「一块白板压在底图上」——文字区看着发脏就是它
     lv_obj_set_style_bg_opa(chat_view_, LV_OPA_TRANSP, 0);
+    // 不加底衬：黑框压在科技底图上很脏，文字直接浮在画面里
     lv_obj_set_scrollbar_mode(chat_view_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
@@ -1000,6 +1228,11 @@ void LcdDisplay::SetupUI() {
     // 建 UI 时 content_ 还没布局，宽度是 0：先强制算一次，表情才能落在真正的正中
     lv_obj_update_layout(content_);
     LayoutContentBlocks();
+
+    // 布局预算打一次：「文字为什么只能显示这么点」这条直接给答案，省得下次再反推
+    ESP_LOGI(TAG, "HUD layout: %dx%d, content %d, char 0~%d, hud top %d, weather %d, chat avail %d",
+             (int)LV_HOR_RES, (int)LV_VER_RES, (int)lv_obj_get_content_height(content_), EMOJI_TOTAL_H,
+             kHudTop, (int)wx_line_h, (int)lv_obj_get_content_height(content_) - kHudTop - kHudGap * 2);
 
     /* Status bar */
     lv_obj_set_flex_flow(status_bar_, LV_FLEX_FLOW_ROW);
@@ -1078,6 +1311,12 @@ void LcdDisplay::SetPreviewImage(const lv_img_dsc_t* img_dsc) {
         if (emotion_label_ != nullptr) {
             lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
         }
+        if (arms_image_ != nullptr) {
+            lv_obj_add_flag(arms_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (body_image_ != nullptr) {
+            lv_obj_add_flag(body_image_, LV_OBJ_FLAG_HIDDEN);
+        }
         if (emotion_image_ != nullptr) {
             lv_obj_add_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
         }
@@ -1087,6 +1326,12 @@ void LcdDisplay::SetPreviewImage(const lv_img_dsc_t* img_dsc) {
     } else {
         // 隐藏预览图片并恢复表情贴图
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        if (arms_image_ != nullptr) {
+            lv_obj_clear_flag(arms_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (body_image_ != nullptr) {
+            lv_obj_clear_flag(body_image_, LV_OBJ_FLAG_HIDDEN);
+        }
         if (emotion_image_ != nullptr) {
             lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
         }
@@ -1102,19 +1347,102 @@ void LcdDisplay::LayoutContentBlocks() {
         return;
     }
     int cw = lv_obj_get_content_width(content_);
-    int ex = (cw - EMOJI_H) / 2;
+    // 按头像宽度算，不是高度：身体比脸宽，用错一个整体就偏
+    int ex = (cw - EMOJI_W) / 2;
+    if (ex < 0) {
+        ex = 0;
+    }
     if (emotion_image_ != nullptr) {
-        lv_obj_set_pos(emotion_image_, ex < 0 ? 0 : ex, 0);
+        lv_obj_set_pos(emotion_image_, ex, 0);
+    }
+    // 投影和脸同一个 x、同一起点：剪影图本身已经包含头+身，不需要分别对位
+    if (shadow_image_ != nullptr) {
+        lv_obj_set_pos(shadow_image_, ex, 0);
+    }
+    // 身体和手臂共用同一个 ex，只加一个相对偏移：屏幕宽度变了也不会错位
+    if (arms_image_ != nullptr) {
+        lv_obj_set_pos(arms_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+        // 不在这儿起摆臂动画了：待机的手是静的，轻摆由 BlinkTick 按 7~13s 的
+        // 不规则间隔偶发放一次。这里只管把它停在自然垂的那一帧
+        if (arm_wave_ms_ == 0) {
+            lv_obj_set_user_data(arms_image_, (void*)(intptr_t)0);
+            lv_image_set_src(arms_image_, kArmFrames[0]);
+        }
+    }
+    if (body_image_ != nullptr) {
+        lv_obj_set_pos(body_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
     }
     if (emotion_label_ != nullptr) {
         lv_obj_align(emotion_label_, LV_ALIGN_TOP_MID, 0, 0);
     }
     if (weather_box_ != nullptr) {
         int wx = (cw - lv_obj_get_width(weather_box_)) / 2;
-        lv_obj_set_pos(weather_box_, wx < 0 ? 0 : wx, EMOJI_H + 4);
+        lv_obj_set_pos(weather_box_, wx < 0 ? 0 : wx, kHudTop);
+    }
+    // 上面几个 set_pos 会把 y 抹回基准值，浮动当期值要重贴一次，否则一改布局就抖一帧
+    ApplyAvatarY();
+    // 浮动只起一次：LayoutContentBlocks 每次布局都会进来（窄屏重排/旋转），
+    // 每次都新建 timer 就是一堆 timer 抢同一个 float_y_
+    if (float_timer_ == nullptr && emotion_image_ != nullptr) {
+        float_timer_ = lv_timer_create([](lv_timer_t* t) {
+            static_cast<LcdDisplay*>(lv_timer_get_user_data(t))->AvatarFloatTick();
+        }, kFloatTickMs, this);
+        ESP_LOGI(TAG, "Avatar float: %dpx, idle %ums, talk %ums",
+                 kFloatAmp, (unsigned)kFloatIdleMs, (unsigned)kFloatTalkMs);
     }
 }
 
+
+// 天气视窗高度跟着内容自己撑：写死一行时 3 行天气全得靠内部滚动看，等于把信息藏起来。
+// 待机没人说话，整块 HUD 就是天气的；有回复时才缩回去给对话让位，但对话至少留 2 行
+// （只给 1 行等于每句话都得滚一遍才读完）。高度变了必须重置滚动——旧动画的目标
+// 位移是按旧 over 算的，不重起就会滚过头停在空白处
+void LcdDisplay::RefitWeatherView()
+{
+    if (weather_box_ == nullptr || weather_inner_ == nullptr || content_ == nullptr) {
+        return;
+    }
+    // 已被隐藏不直接 return：隐藏是本函数根据「对话在不在」决定的，
+    // 直接 return 的话对话收掉了也回不来。没内容才是真不该显示
+    if (weather_text_.empty()) {
+        return;
+    }
+    lv_obj_clear_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
+    // 长行折行后的真实高度要布局算完才知道
+    lv_obj_update_layout(weather_inner_);
+    int inner_h = lv_obj_get_height(weather_inner_);
+    int line_h = (int)lv_font_get_line_height(fonts_.text_font);
+    if (line_h < 1) {
+        line_h = 1;
+    }
+    int full = lv_obj_get_content_height(content_) - kHudTop - kHudGap * 2;
+    // 对话在的时候天气整块让位：脸从 120 长到 162 后脸底下只剩 50px，
+    // 给天气留 1 行的代价是对话永远只能显示 1 行。对话清空时（空内容分支）
+    // 会再调一次这里，天气自己就回来了
+    bool chat_on = chat_view_ != nullptr && !lv_obj_has_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+    int cap = full;
+    if (chat_on) {
+        lv_obj_add_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Weather fit: hidden for chat, %dpx goes to chat", full);
+        return;
+    }
+    if (cap < line_h) {
+        cap = line_h;
+    }
+    int h = inner_h < cap ? inner_h : cap;
+    if (h < line_h) {
+        h = line_h;
+    }
+    lv_obj_set_height(weather_box_, h);
+    lv_anim_del(weather_inner_, nullptr);
+    lv_obj_set_y(weather_inner_, 0);
+    int over = inner_h - h;
+    if (over >= 4) {
+        StartSlowVerticalScroll(weather_inner_, over);
+    }
+    ESP_LOGI(TAG, "Weather fit: content %dpx / view %dpx (cap %d, chat %s), scroll %s",
+             inner_h, h, cap, chat_on ? "on" : "off", over >= 4 ? "on" : "off");
+}
 
 // vh 由调用方传入：刚 set_height 后 lv_obj_get_height 读回的仍是旧 coords
 // （新建时是 0），底对齐算法拿到 0 会把视窗摆到屏幕外
@@ -1126,10 +1454,11 @@ void LcdDisplay::PlaceChatView(int vh) {
     int cw = lv_obj_get_content_width(content_);
     int ch = lv_obj_get_content_height(content_);
     int vw = lv_obj_get_width(chat_view_);
-    // 顶在表情（有天气就在天气）下方，文字从上往下排；底对齐会让短句落到看不见的底部
-    int y = EMOJI_H + 4;
+    // 从脸底那条线往下排：压在小人身上是取舍结果，底衬负责可读性。
+    // 有天气就先让天气一行，文字接在它下面
+    int y = kHudTop + kHudGap;
     if (weather_box_ != nullptr && !lv_obj_has_flag(weather_box_, LV_OBJ_FLAG_HIDDEN)) {
-        y = (int)lv_obj_get_y(weather_box_) + (int)lv_obj_get_height(weather_box_) + 4;
+        y = (int)lv_obj_get_y(weather_box_) + (int)lv_obj_get_height(weather_box_) + kHudGap;
     }
     int x = (cw - vw) / 2;
     lv_obj_set_pos(chat_view_, x < 0 ? 0 : x, y < 0 ? 0 : y);
@@ -1168,24 +1497,29 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         lv_label_set_text(chat_message_label_, "");
         lv_obj_set_height(chat_view_, 0);
         lv_obj_add_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+        // 没人说话了：天气立刻把整块信息区拿回去，否则它继续缩在 1 行视窗里慢慢滚
+        RefitWeatherView();
         return;
     }
 
     // system 之类（升级进度、告警）和 assistant 的每一句都一样：顶掉上一句直接显示
     chat_text_ = content;
     lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
+    // 对话要上屏了，天气先让位：不先收天气，avail 会按它撑开后的高度算，对话会被挤到屏外
+    RefitWeatherView();
     lv_label_set_text(chat_message_label_, chat_text_.c_str());
     // 视窗里的文字永远贴在顶部，短句就不会在视窗里上下浮
     lv_anim_del(chat_message_label_, nullptr);
     lv_obj_set_y(chat_message_label_, 0);
     lv_obj_update_layout(chat_message_label_);
 
-    // 去表情和天气之后剩下的高度就是视窗能占的高度，超出的一屏只显示开头
-    int top = EMOJI_H + 4;
+    // 小人下半身往下剩下的高度就是视窗能占的高度，超出的一屏只显示开头
+    int top = kHudTop + kHudGap;
     if (weather_box_ != nullptr && !lv_obj_has_flag(weather_box_, LV_OBJ_FLAG_HIDDEN)) {
-        top += lv_obj_get_height(weather_box_) + 4;
+        top = (int)lv_obj_get_y(weather_box_) + (int)lv_obj_get_height(weather_box_) + kHudGap;
     }
-    int avail = lv_obj_get_height(content_) - top - 10; // 10 = 视窗上方那条 flex 间距
+    // content_ 上下各有 5px 内边距，能用的是扣掉之后的净高
+    int avail = lv_obj_get_content_height(content_) - top - kHudGap;
     if (avail < 1) {
         avail = 1;
     }
@@ -1231,7 +1565,14 @@ void LcdDisplay::SetWeatherText(const char* text) {
             }
             lv_label_set_text(weather_lines_[used], weather_text_.substr(pos, nl - pos).c_str());
             lv_obj_clear_flag(weather_lines_[used], LV_OBJ_FLAG_HIDDEN);
+            // 折行会把 4 行撑成 5 行：多滚一截，折出来的半行还很难看。把每行像素宽
+            // 打出来，文案超宽时能直接指到是哪一行，不用靠猜
+            const char* ltxt = lv_label_get_text(weather_lines_[used]);
+            ESP_LOGI(TAG, "Weather line %d: %dpx (room %dpx)", used + 1,
+                     (int)lv_text_get_width(ltxt, (uint32_t)strlen(ltxt), fonts_.text_font, 0),
+                     (int)lv_obj_get_width(weather_inner_));
             ++used;
+
             if (nl >= weather_text_.size()) {
                 break;
             }
@@ -1249,19 +1590,11 @@ void LcdDisplay::SetWeatherText(const char* text) {
     }
     lv_obj_clear_flag(weather_box_, LV_OBJ_FLAG_HIDDEN);
 
-    // 折行后的真实高度要布局算完才知道，据此决定滚不滚、滚多远
-    lv_obj_update_layout(weather_inner_);
-    int inner_h = lv_obj_get_height(weather_inner_);
-    int view_h = lv_obj_get_height(weather_box_);
-    int over = inner_h - view_h;
-    if (over > 0) {
-        StartSlowVerticalScroll(weather_inner_, over);
-        ESP_LOGI(TAG, "Weather on screen: %d lines, content %dpx / view %dpx, scroll on, stop top 1000ms bottom 1500ms",
-                 used, inner_h, view_h);
-        return;
-    }
-    ESP_LOGI(TAG, "Weather on screen: %d lines, content %dpx / view %dpx, scroll %s",
-             used, inner_h, view_h, over > 0 ? "on" : "off");
+    // 视窗高度跟着内容走：「固定一行 + 内部慢滚」等于把 3 行天气藏成一行动画
+    // 高度和是否滚动由 RefitWeatherView 负责并自己打日志（刚 set_height 后立刻
+    // 读 lv_obj_get_height 拿到的是旧 coords，那行日志写出来会骗人）
+    RefitWeatherView();
+    ESP_LOGI(TAG, "Weather on screen: %d lines", used);
 }
 
 void LcdDisplay::SetEmotion(const char* emotion) {
@@ -1269,8 +1602,13 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     if (emotion_image_ == nullptr) {
         return;
     }
+    // 中性 / 倾听都不算情绪：待机时允许状态机把它们换成倾听脸。
+    // 其它表情是情绪事件给的，要一直留到下一句，不能被待机顺手抹平
+    mood_active_ = !(emotion == nullptr || strcmp(emotion, "neutral") == 0 ||
+                     strcmp(emotion, "listening") == 0);
 
-    const lv_image_dsc_t* img = &emoji_neutral;
+    const lv_image_dsc_t* patch = nullptr;
+    int16_t px = 0, py = 0, pw = 0, ph = 0;
     const lv_image_dsc_t* mouth = &emoji_neutral_mouth;
     const lv_image_dsc_t* blink = nullptr;
     const lv_image_dsc_t* blink_hair = nullptr;
@@ -1278,7 +1616,11 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     if (emotion != nullptr) {
         for (int i = 0; i < emoji_table_count; i++) {
             if (strcmp(emoji_table[i].name, emotion) == 0) {
-                img = emoji_table[i].img;
+                patch = emoji_table[i].patch;
+                px = emoji_table[i].px;
+                py = emoji_table[i].py;
+                pw = emoji_table[i].pw;
+                ph = emoji_table[i].ph;
                 mouth = emoji_table[i].mouth;
                 blink = emoji_table[i].blink;
                 blink_hair = emoji_table[i].blink_hair;
@@ -1287,7 +1629,19 @@ void LcdDisplay::SetEmotion(const char* emotion) {
             }
         }
     }
-    lv_image_set_src(emotion_image_, img);
+    // 底图固定一张，只有补丁在换；neutral 自己没有补丁，直接隐藏这层
+    if (patch_image_ != nullptr) {
+        if (patch != nullptr) {
+            lv_image_set_src(patch_image_, patch);
+            lv_obj_set_size(patch_image_, pw, ph);
+            lv_obj_set_pos(patch_image_, px, py);
+            lv_obj_clear_flag(patch_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(patch_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    ESP_LOGI(TAG, "Emotion '%s': patch %dx%d at %d,%d (base %dx%d)",
+             emotion == nullptr ? "(null)" : emotion, pw, ph, px, py, EMOJI_W, EMOJI_H);
     mouth_img_ = mouth;
     blink_img_ = blink;
     blink_hair_img_ = blink_hair;
@@ -1313,8 +1667,16 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     mouth_tick_ = 0;
     mouth_open_ = false;
     mouth_active_ = false;
+    // 换脸时眼神/「嗯」/换姿势全得归零：下一个表情脸上不能挂着上一张脸的眼睛
+    ClearListenAnim();
 
     lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
+    if (arms_image_ != nullptr) {
+        lv_obj_clear_flag(arms_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (body_image_ != nullptr) {
+        lv_obj_clear_flag(body_image_, LV_OBJ_FLAG_HIDDEN);
+    }
     if (emotion_label_ != nullptr) {
         lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1384,7 +1746,7 @@ void LcdDisplay::SetMusicInfo(const char* song_name) {
             lv_obj_set_y(chat_message_label_, 0);
             lv_obj_update_layout(chat_message_label_);
             int lyric_h = lv_obj_get_height(chat_message_label_);
-            int lyric_max = lv_obj_get_content_height(content_) - EMOJI_H - 8;
+            int lyric_max = lv_obj_get_content_height(content_) - kHudTop - 8;
             int lyric_vh = lyric_h < lyric_max ? lyric_h : lyric_max;
             lv_obj_set_height(chat_view_, lyric_vh < 1 ? 1 : lyric_vh);
             lv_obj_clear_flag(chat_view_, LV_OBJ_FLAG_HIDDEN);
@@ -1392,6 +1754,12 @@ void LcdDisplay::SetMusicInfo(const char* song_name) {
         }
 
         // 确保显示 emotion_image_ 和 chat_message_label_，隐藏 preview_image_
+        if (arms_image_ != nullptr) {
+            lv_obj_clear_flag(arms_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (body_image_ != nullptr) {
+            lv_obj_clear_flag(body_image_, LV_OBJ_FLAG_HIDDEN);
+        }
         if (emotion_image_ != nullptr) {
             lv_obj_clear_flag(emotion_image_, LV_OBJ_FLAG_HIDDEN);
         }
@@ -1699,9 +2067,10 @@ void LcdDisplay::start(){
     );
 }
 
-// 真人眨眼间隔不均匀：2.4~4.8s 随机，固定节拍一眼就看得出是机器
-static uint16_t NextBlinkTicks() {
-    return static_cast<uint16_t>(24 + esp_random() % 25);
+// 真人眨眼间隔不均匀：2.4~4.8s 随机，固定节拍一眼就看得出是机器。
+// 听人说话时会眨得更少（专注），分神才眨得勤
+static uint16_t NextBlinkTicks(bool listening) {
+    return static_cast<uint16_t>(listening ? (40 + esp_random() % 41) : (24 + esp_random() % 25));
 }
 
 void LcdDisplay::BlinkTick() {
@@ -1719,7 +2088,14 @@ void LcdDisplay::BlinkTick() {
     }
 
     // 说话中：嘴部贴片一显一隐，什么表情都能张嘴；眨眼照常跑（两者像素区不重叠）
-    if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+    DeviceState state = Application::GetInstance().GetDeviceState();
+    if (state == kDeviceStateSpeaking) {
+        // 说话时呼吸略快、手跟着句子轻摆；快得有限度，不再打拍子
+        float_talk_ = true;
+        if (arms_image_ != nullptr && arm_wave_ms_ != kArmWaveTalkMs) {
+            arm_wave_ms_ = kArmWaveTalkMs;
+            StartArmWave(arms_image_, arm_wave_ms_, true);
+        }
         if (mouth_image_ != nullptr && mouth_img_ != nullptr) {
             mouth_active_ = true;
             if (++mouth_tick_ % 2 == 0) {
@@ -1739,6 +2115,53 @@ void LcdDisplay::BlinkTick() {
         if (mouth_image_ != nullptr) {
             lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
         }
+        float_talk_ = false;
+        // 说完不让它接着摆：待机的手该静下来，等偶发轻摆自己到点
+        if (arms_image_ != nullptr) {
+            lv_anim_del(arms_image_, nullptr);
+            lv_obj_set_user_data(arms_image_, (void*)(intptr_t)0);
+            lv_image_set_src(arms_image_, kArmFrames[0]);
+            arm_wave_ms_ = 0;
+            arm_idle_tick_ = 0;
+            arm_idle_next_ = 0;
+        }
+    }
+
+    // 待机轻摆：不循环，隔 7~13s 放一次单程，摆完停住。
+    // 均匀地一直摆是最像机器人的做法——真人安静时手几乎不动
+    // 手只在待机时偶发轻摆。聆听时手要静——边听边摆手不是听人说话的人
+    if (!float_talk_ && state == kDeviceStateIdle && arms_image_ != nullptr) {
+        if (arm_idle_next_ == 0) {
+            arm_idle_next_ = kArmSwingMinTicks + esp_random() % kArmSwingSpanTicks;
+        }
+        if (++arm_idle_tick_ >= arm_idle_next_) {
+            arm_idle_tick_ = 0;
+            arm_idle_next_ = kArmSwingMinTicks + esp_random() % kArmSwingSpanTicks;
+            StartArmWave(arms_image_, kArmSwingMs, false);
+        }
+    }
+
+    // 只有真进入「聆听中」才换倾听脸：待机是一张放空的中性脸，一开口脸才变，
+    // 用户才看得见它在等你说话。上一句的情绪属于说话那一段，聆听来了就该让位
+    if ((int)state != last_state_) {
+        last_state_ = (int)state;
+        if (state == kDeviceStateListening) {
+            SetEmotion("listening");
+            // 一进聆听就轻点一下头：「嗯，我在听着」的即时回应，之后转成 3~7s 的不规则节奏
+            nod_phase_ms_ = 0;
+            nod_wait_ms_ = 320;
+            // 眼神 0.3s 后就挑走，不用等满 1.2s：注意力刚转过去的那下最该有反应
+            gaze_wait_ = 3;
+        } else if (state == kDeviceStateIdle && !mood_active_) {
+            SetEmotion("neutral");
+        }
+    }
+
+    // 聆听微表情只在真听着的时候跑，离开就一律清干净
+    if (state == kDeviceStateListening) {
+        ListenAnimTick();
+    } else {
+        ClearListenAnim();
     }
 
     if (blink_frames_ > 0) {
@@ -1749,12 +2172,13 @@ void LcdDisplay::BlinkTick() {
     }
     // 表里没眨眼贴片的表情（本来闭眼/戴墨镜）跳过眨眼
     if (blink_img_ != nullptr && blink_image_ != nullptr) {
+        const bool listening = (state == kDeviceStateListening);
         if (blink_next_ == 0) {
-            blink_next_ = NextBlinkTicks();
+            blink_next_ = NextBlinkTicks(listening);
         }
         if (++blink_tick_ >= blink_next_) {
             blink_tick_ = 0;
-            blink_next_ = NextBlinkTicks();
+            blink_next_ = NextBlinkTicks(listening);
             lv_image_set_src(blink_image_, blink_img_);
             lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
             lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
@@ -1767,6 +2191,132 @@ void LcdDisplay::BlinkTick() {
                 ESP_LOGI(TAG, "Blink started: src=%p pos=%d,%d", (void*)blink_img_, BLINK_OX, BLINK_OY);
             }
         }
+    }
+}
+
+// 聆听微表情：一张静脸撑不起「在听」。
+// 真人听人说话时眼睛一直在对方脸上移动、偶尔松一下嘴、手会换个姿势。
+// 三件事都在这里按 100ms 一拍推进，间隔全部随机——固定间隔一眼就是节拍器
+void LcdDisplay::ListenAnimTick()
+{
+    // ---- 眼神游移 ----
+    if (gaze_image_ != nullptr && GAZE_COUNT > 0) {
+        if (gaze_hold_ > 0) {
+            if (blink_frames_ > 0) {
+                // 闭眼贴片要整块盖住眼睛，眼神贴片压在上面会露出半只瞳孔
+                if (!gaze_blink_hide_) {
+                    lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+                    gaze_blink_hide_ = true;
+                }
+            } else if (gaze_blink_hide_) {
+                lv_obj_clear_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+                gaze_blink_hide_ = false;
+            }
+            if (--gaze_hold_ == 0) {
+                gaze_idx_ = -1;
+                // 一半概率不回正、直接挑下一个落点：真人扫视时也不是每次都先看回正前方
+                if (esp_random() % 2 == 0) {
+                    gaze_wait_ = 1;
+                } else {
+                    lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+                    gaze_blink_hide_ = false;
+                    gaze_wait_ = kGazeWaitMinTicks + esp_random() % kGazeWaitSpanTicks;
+                }
+            }
+        } else if (gaze_wait_ > 0) {
+            if (--gaze_wait_ == 0) {
+                int idx = (int)(esp_random() % GAZE_COUNT);
+                if (idx == (int)gaze_idx_) {
+                    idx = (idx + 1) % GAZE_COUNT;  // 连着两次同一个落点等于没动
+                }
+                gaze_idx_ = (int8_t)idx;
+                gaze_hold_ = kGazeHoldMinTicks + esp_random() % kGazeHoldSpanTicks;
+                lv_image_set_src(gaze_image_, kGazeFrames[idx]);
+                lv_obj_set_pos(gaze_image_, GAZE_OX, GAZE_OY);
+                if (blink_frames_ == 0) {
+                    lv_obj_clear_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+                    gaze_blink_hide_ = false;
+                } else {
+                    gaze_blink_hide_ = true;
+                }
+                static int gaze_logged = 0;
+                if (gaze_logged < 3) {
+                    ++gaze_logged;
+                    ESP_LOGI(TAG, "Listen gaze: frame %d %dx%d at %d,%d", idx, (int)GAZE_W,
+                             (int)GAZE_H, (int)GAZE_OX, (int)GAZE_OY);
+                }
+            }
+        } else {
+            gaze_wait_ = kGazeWaitMinTicks + esp_random() % kGazeWaitSpanTicks;
+        }
+    }
+
+    // ---- 偶发「嗯」：松一下嘴 ----
+    if (mouth_image_ != nullptr && mouth_img_ != nullptr) {
+        if (listen_mouth_hold_ > 0) {
+            if (--listen_mouth_hold_ == 0) {
+                lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+                listen_mouth_wait_ = kListenMouthMinTicks + esp_random() % kListenMouthSpanTicks;
+            }
+        } else if (listen_mouth_wait_ == 0) {
+            listen_mouth_wait_ = kListenMouthMinTicks + esp_random() % kListenMouthSpanTicks;
+        } else if (--listen_mouth_wait_ == 0) {
+            lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
+            lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(hair_image_);
+            listen_mouth_hold_ = kListenMouthHoldMin + esp_random() % kListenMouthHoldSpan;
+            static int mouth_logged = 0;
+            if (mouth_logged < 2) {
+                ++mouth_logged;
+                ESP_LOGI(TAG, "Listen nod-mouth: patched %dx%d at %d,%d", (int)MOUTH_W,
+                         (int)MOUTH_H, (int)MOUTH_OX, (int)MOUTH_OY);
+            }
+        }
+    }
+
+    // ---- 换姿势：只做单程 ----
+    // 说话时手跟句子摆，聆听时不能；但完全不动是石膏像
+    if (arms_image_ != nullptr && arm_wave_ms_ == 0) {
+        if (listen_arm_wait_ == 0) {
+            listen_arm_wait_ = kArmListenMinTicks + esp_random() % kArmListenSpanTicks;
+        } else if (--listen_arm_wait_ == 0) {
+            StartArmWave(arms_image_, kArmListenMs, false);
+            listen_arm_wait_ = kArmListenMinTicks + esp_random() % kArmListenSpanTicks;
+            static int arm_logged = 0;
+            if (arm_logged < 2) {
+                ++arm_logged;
+                ESP_LOGI(TAG, "Listen arm: single swing %dms/frame, next in %d ticks",
+                         (int)kArmListenMs, (int)listen_arm_wait_);
+            }
+        }
+    }
+}
+
+void LcdDisplay::ClearListenAnim()
+{
+    // 每 100ms 都会被调一次，没东西可清就直接返回：
+    // 无脑 add_flag 一次就是一帧重绘，白烧屏
+    const bool dirty = gaze_idx_ >= 0 || gaze_hold_ != 0 || gaze_wait_ != 0 ||
+                       gaze_blink_hide_ || listen_mouth_hold_ != 0 ||
+                       listen_mouth_wait_ != 0 || listen_arm_wait_ != 0;
+    if (!dirty) {
+        return;
+    }
+    // 只有「聆听的嘴」还在屏上才收起它：说话口型也用这块贴片，
+    // 从 listening 切 speaking 那一拍先显示口型、再进这里，无脑隐藏就会闪一下
+    const bool listen_mouth_on = listen_mouth_hold_ != 0;
+    gaze_idx_ = -1;
+    gaze_hold_ = 0;
+    gaze_wait_ = 0;
+    gaze_blink_hide_ = false;
+    listen_mouth_hold_ = 0;
+    listen_mouth_wait_ = 0;
+    listen_arm_wait_ = 0;
+    if (gaze_image_ != nullptr) {
+        lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (listen_mouth_on && mouth_image_ != nullptr) {
+        lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
