@@ -905,6 +905,12 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_image_recolor_opa(blink_hair_image_, LV_OPA_COVER, 0);
     lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(hair_color_), 0);
 
+    // 贴片指针的初值必须在这里给：开机后如果一直没人调 SetEmotion（Idle 状态故意不回中性表情），
+    // blink_img_ 就永远是 nullptr，待机那张脸一辈子不眨眼
+    blink_img_ = &emoji_neutral_blink;
+    blink_hair_img_ = &emoji_neutral_blink_hair;
+    lv_image_set_src(blink_hair_image_, blink_hair_img_);
+
     // 说话张嘴：只在脸上叠一小块嘴部贴片，不为 21 个表情各存一张全脸（省 900KB flash）
     mouth_image_ = lv_image_create(emotion_image_);
     lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -1666,6 +1672,11 @@ void LcdDisplay::start(){
     );
 }
 
+// 真人眨眼间隔不均匀：2.4~4.8s 随机，固定节拍一眼就看得出是机器
+static uint16_t NextBlinkTicks() {
+    return static_cast<uint16_t>(24 + esp_random() % 25);
+}
+
 void LcdDisplay::BlinkTick() {
     if (emotion_image_ == nullptr) {
         return;
@@ -1710,12 +1721,25 @@ void LcdDisplay::BlinkTick() {
         return;
     }
     // 表里没眨眼贴片的表情（本来闭眼/戴墨镜）跳过眨眼
-    if (blink_img_ != nullptr && blink_image_ != nullptr && ++blink_tick_ % 32 == 0) {
-        lv_image_set_src(blink_image_, blink_img_);
-        lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
-        lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(hair_image_);
-        blink_frames_ = 2;
+    if (blink_img_ != nullptr && blink_image_ != nullptr) {
+        if (blink_next_ == 0) {
+            blink_next_ = NextBlinkTicks();
+        }
+        if (++blink_tick_ >= blink_next_) {
+            blink_tick_ = 0;
+            blink_next_ = NextBlinkTicks();
+            lv_image_set_src(blink_image_, blink_img_);
+            lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
+            lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(hair_image_);
+            blink_frames_ = 2;
+            // 只打第一次：以后有人问「为什么不眨眼」，这条日志直接分辨是没触发还是被别的层盖住
+            static bool blink_logged = false;
+            if (!blink_logged) {
+                blink_logged = true;
+                ESP_LOGI(TAG, "Blink started: src=%p pos=%d,%d", (void*)blink_img_, BLINK_OX, BLINK_OY);
+            }
+        }
     }
 }
 

@@ -6,6 +6,14 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config ACTIVATION_URL
+    string "Activation server URL (code / mqtt / websocket config)"
+    default "https://api.tenclass.net/xiaozhi/ota/"
+    help
+        激活码、mqtt 与 websocket 配置只能由激活服务端下发，静态固件清单里没有这些段。
+        单靠 OTA_URL 查静态 JSON 会跳过验证码播报，也拿不到协议配置。
+        默认同 OTA_URL（官方服务端）；指向自建清单时两项需分开配置。
+
 
 config XZ_MUSIC_API_BASE
     string "Music API base URL (dabai)"

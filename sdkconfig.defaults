@@ -74,3 +74,4 @@ CONFIG_LV_USE_WIN=n
 CONFIG_LV_BUILD_EXAMPLES=n
 
 CONFIG_OTA_URL="https://gh-proxy.com/https://raw.githubusercontent.com/geek-alpha/xiaozhi-esp32-music/main/ota/xiaozhi-music-ota.json"
+CONFIG_ACTIVATION_URL="https://api.tenclass.net/xiaozhi/ota/"

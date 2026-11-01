@@ -49,6 +49,14 @@ std::string Ota::GetCheckVersionUrl() {
     return url;
 }
 
+std::string Ota::GetActivationUrl() {
+    Settings settings("wifi", false);
+    std::string url = settings.GetString("activation_url");
+    if (url.empty()) {
+        url = CONFIG_ACTIVATION_URL;
+    }
+    return url;
+}
 std::unique_ptr<Http> Ota::SetupHttp() {
     auto& board = Board::GetInstance();
     auto app_desc = esp_app_get_description();
@@ -72,21 +80,36 @@ std::unique_ptr<Http> Ota::SetupHttp() {
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 bool Ota::CheckVersion() {
-    auto& board = Board::GetInstance();
     auto app_desc = esp_app_get_description();
-
-    // Check if there is a new firmware version available
     current_version_ = app_desc->version;
     ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
 
-    std::string url = GetCheckVersionUrl();
+    // 激活码和协议配置只能来自激活服务端；固件清单是静态 JSON，没有 activation 段，
+    // 只查清单会让设备跳过播报验证码，也拿不到 mqtt/websocket 配置。
+    std::string config_url = GetActivationUrl();
+    std::string manifest_url = GetCheckVersionUrl();
+    bool single_pass = (manifest_url == config_url);
+
+    if (!FetchFrom(config_url, true, single_pass)) {
+        return false;
+    }
+    if (!single_pass && !FetchFrom(manifest_url, false, true)) {
+        // 清单挂了不影响激活和对话，只是这一轮不知道有没有新版
+        ESP_LOGW(TAG, "Firmware manifest unreachable, version check skipped");
+        has_new_version_ = false;
+    }
+    return true;
+}
+
+bool Ota::FetchFrom(const std::string& url, bool want_config, bool want_firmware) {
+    auto& board = Board::GetInstance();
+
     if (url.length() < 10) {
         ESP_LOGE(TAG, "Check version URL is not properly set");
         return false;
     }
 
     auto http = SetupHttp();
-
     std::string data = board.GetJson();
     std::string method = data.length() > 0 ? "POST" : "GET";
     http->SetContent(std::move(data));
@@ -117,135 +140,135 @@ bool Ota::CheckVersion() {
     data = http->ReadAll();
     http->Close();
 
-    // Response: { "firmware": { "version": "1.0.0", "url": "http://" } }
-    // Parse the JSON response and check if the version is newer
-    // If it is, set has_new_version_ to true and store the new version and URL
-    
     cJSON *root = cJSON_Parse(data.c_str());
     if (root == NULL) {
         ESP_LOGE(TAG, "Failed to parse JSON response");
         return false;
     }
 
-    has_activation_code_ = false;
-    has_activation_challenge_ = false;
-    cJSON *activation = cJSON_GetObjectItem(root, "activation");
-    if (cJSON_IsObject(activation)) {
-        cJSON* message = cJSON_GetObjectItem(activation, "message");
-        if (cJSON_IsString(message)) {
-            activation_message_ = message->valuestring;
+    if (want_config) {
+        has_activation_code_ = false;
+        has_activation_challenge_ = false;
+        cJSON *activation = cJSON_GetObjectItem(root, "activation");
+        if (cJSON_IsObject(activation)) {
+            cJSON* message = cJSON_GetObjectItem(activation, "message");
+            if (cJSON_IsString(message)) {
+                activation_message_ = message->valuestring;
+            }
+            cJSON* code = cJSON_GetObjectItem(activation, "code");
+            if (cJSON_IsString(code)) {
+                activation_code_ = code->valuestring;
+                has_activation_code_ = true;
+            }
+            cJSON* challenge = cJSON_GetObjectItem(activation, "challenge");
+            if (cJSON_IsString(challenge)) {
+                activation_challenge_ = challenge->valuestring;
+                has_activation_challenge_ = true;
+            }
+            cJSON* timeout_ms = cJSON_GetObjectItem(activation, "timeout_ms");
+            if (cJSON_IsNumber(timeout_ms)) {
+                activation_timeout_ms_ = timeout_ms->valueint;
+            }
         }
-        cJSON* code = cJSON_GetObjectItem(activation, "code");
-        if (cJSON_IsString(code)) {
-            activation_code_ = code->valuestring;
-            has_activation_code_ = true;
+
+        has_mqtt_config_ = false;
+        cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
+        if (cJSON_IsObject(mqtt)) {
+            Settings settings("mqtt", true);
+            cJSON *item = NULL;
+            cJSON_ArrayForEach(item, mqtt) {
+                if (cJSON_IsString(item)) {
+                    if (settings.GetString(item->string) != item->valuestring) {
+                        settings.SetString(item->string, item->valuestring);
+                    }
+                } else if (cJSON_IsNumber(item)) {
+                    if (settings.GetInt(item->string) != item->valueint) {
+                        settings.SetInt(item->string, item->valueint);
+                    }
+                }
+            }
+            has_mqtt_config_ = true;
+        } else {
+            ESP_LOGI(TAG, "No mqtt section found !");
         }
-        cJSON* challenge = cJSON_GetObjectItem(activation, "challenge");
-        if (cJSON_IsString(challenge)) {
-            activation_challenge_ = challenge->valuestring;
-            has_activation_challenge_ = true;
+
+        has_websocket_config_ = false;
+        cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
+        if (cJSON_IsObject(websocket)) {
+            Settings settings("websocket", true);
+            cJSON *item = NULL;
+            cJSON_ArrayForEach(item, websocket) {
+                if (cJSON_IsString(item)) {
+                    if (settings.GetString(item->string) != item->valuestring) {
+                        settings.SetString(item->string, item->valuestring);
+                    }
+                } else if (cJSON_IsNumber(item)) {
+                    if (settings.GetInt(item->string) != item->valueint) {
+                        settings.SetInt(item->string, item->valueint);
+                    }
+                }
+            }
+            has_websocket_config_ = true;
+        } else {
+            ESP_LOGI(TAG, "No websocket section found!");
         }
-        cJSON* timeout_ms = cJSON_GetObjectItem(activation, "timeout_ms");
-        if (cJSON_IsNumber(timeout_ms)) {
-            activation_timeout_ms_ = timeout_ms->valueint;
+
+        has_server_time_ = false;
+        cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
+        if (cJSON_IsObject(server_time)) {
+            cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
+            cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
+
+            if (cJSON_IsNumber(timestamp)) {
+                // 设置系统时间
+                struct timeval tv;
+                double ts = timestamp->valuedouble;
+
+                // 如果有时区偏移，计算本地时间
+                if (cJSON_IsNumber(timezone_offset)) {
+                    ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                }
+
+                tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
+                tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
+                settimeofday(&tv, NULL);
+                has_server_time_ = true;
+            }
+        } else {
+            ESP_LOGW(TAG, "No server_time section found!");
         }
     }
 
-    has_mqtt_config_ = false;
-    cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
-    if (cJSON_IsObject(mqtt)) {
-        Settings settings("mqtt", true);
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, mqtt) {
-            if (cJSON_IsString(item)) {
-                if (settings.GetString(item->string) != item->valuestring) {
-                    settings.SetString(item->string, item->valuestring);
-                }
-            } else if (cJSON_IsNumber(item)) {
-                if (settings.GetInt(item->string) != item->valueint) {
-                    settings.SetInt(item->string, item->valueint);
-                }
+    if (want_firmware) {
+        has_new_version_ = false;
+        cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
+        if (cJSON_IsObject(firmware)) {
+            cJSON *version = cJSON_GetObjectItem(firmware, "version");
+            if (cJSON_IsString(version)) {
+                firmware_version_ = version->valuestring;
             }
-        }
-        has_mqtt_config_ = true;
-    } else {
-        ESP_LOGI(TAG, "No mqtt section found !");
-    }
+            cJSON *url_item = cJSON_GetObjectItem(firmware, "url");
+            if (cJSON_IsString(url_item)) {
+                firmware_url_ = url_item->valuestring;
+            }
 
-    has_websocket_config_ = false;
-    cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
-    if (cJSON_IsObject(websocket)) {
-        Settings settings("websocket", true);
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, websocket) {
-            if (cJSON_IsString(item)) {
-                if (settings.GetString(item->string) != item->valuestring) {
-                    settings.SetString(item->string, item->valuestring);
+            if (cJSON_IsString(version) && cJSON_IsString(url_item)) {
+                // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
+                has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
+                if (has_new_version_) {
+                    ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
+                } else {
+                    ESP_LOGI(TAG, "Current is the latest version");
                 }
-            } else if (cJSON_IsNumber(item)) {
-                if (settings.GetInt(item->string) != item->valueint) {
-                    settings.SetInt(item->string, item->valueint);
+                // If the force flag is set to 1, the given version is forced to be installed
+                cJSON *force = cJSON_GetObjectItem(firmware, "force");
+                if (cJSON_IsNumber(force) && force->valueint == 1) {
+                    has_new_version_ = true;
                 }
             }
+        } else {
+            ESP_LOGW(TAG, "No firmware section found!");
         }
-        has_websocket_config_ = true;
-    } else {
-        ESP_LOGI(TAG, "No websocket section found!");
-    }
-
-    has_server_time_ = false;
-    cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
-    if (cJSON_IsObject(server_time)) {
-        cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
-        cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
-        
-        if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
-            struct timeval tv;
-            double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
-            }
-            
-            tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
-            tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
-            settimeofday(&tv, NULL);
-            has_server_time_ = true;
-        }
-    } else {
-        ESP_LOGW(TAG, "No server_time section found!");
-    }
-
-    has_new_version_ = false;
-    cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
-    if (cJSON_IsObject(firmware)) {
-        cJSON *version = cJSON_GetObjectItem(firmware, "version");
-        if (cJSON_IsString(version)) {
-            firmware_version_ = version->valuestring;
-        }
-        cJSON *url = cJSON_GetObjectItem(firmware, "url");
-        if (cJSON_IsString(url)) {
-            firmware_url_ = url->valuestring;
-        }
-
-        if (cJSON_IsString(version) && cJSON_IsString(url)) {
-            // Check if the version is newer, for example, 0.1.0 is newer than 0.0.1
-            has_new_version_ = IsNewVersionAvailable(current_version_, firmware_version_);
-            if (has_new_version_) {
-                ESP_LOGI(TAG, "New version available: %s", firmware_version_.c_str());
-            } else {
-                ESP_LOGI(TAG, "Current is the latest version");
-            }
-            // If the force flag is set to 1, the given version is forced to be installed
-            cJSON *force = cJSON_GetObjectItem(firmware, "force");
-            if (cJSON_IsNumber(force) && force->valueint == 1) {
-                has_new_version_ = true;
-            }
-        }
-    } else {
-        ESP_LOGW(TAG, "No firmware section found!");
     }
 
     cJSON_Delete(root);
@@ -457,7 +480,7 @@ esp_err_t Ota::Activate() {
         return ESP_FAIL;
     }
 
-    std::string url = GetCheckVersionUrl();
+    std::string url = GetActivationUrl();
     if (url.back() != '/') {
         url += "/activate";
     } else {

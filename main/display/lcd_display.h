@@ -54,6 +54,8 @@ protected:
     const lv_image_dsc_t* blink_img_ = nullptr;
     const lv_image_dsc_t* blink_hair_img_ = nullptr;
     uint16_t blink_tick_ = 0;
+    // 下一次眨眼要等的 tick 数：固定 32 拍（3.2s）像个节拍器，人眼一眼看出是机器
+    uint16_t blink_next_ = 0;
     uint8_t blink_frames_ = 0;
     uint16_t mouth_tick_ = 0;
     bool mouth_open_ = false;

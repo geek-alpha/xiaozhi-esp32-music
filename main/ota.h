@@ -28,6 +28,7 @@ public:
     const std::string& GetActivationMessage() const { return activation_message_; }
     const std::string& GetActivationCode() const { return activation_code_; }
     std::string GetCheckVersionUrl();
+    std::string GetActivationUrl();
 
 private:
     std::string activation_message_;
@@ -47,6 +48,7 @@ private:
     int activation_timeout_ms_ = 30000;
 
     bool Upgrade(const std::string& firmware_url);
+    bool FetchFrom(const std::string& url, bool want_config, bool want_firmware);
     std::function<void(int progress, size_t speed)> upgrade_callback_;
     std::vector<int> ParseVersion(const std::string& version);
     bool IsNewVersionAvailable(const std::string& currentVersion, const std::string& newVersion);
