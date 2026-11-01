@@ -7,6 +7,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <font_emoji.h>
 #include "emoji_assets.h"
+#include "tech_backdrop.h"
 
 #include <atomic>
 #include <vector>
@@ -66,6 +67,8 @@ protected:
     // 对话：屏幕上只留最新一句，超出一屏就从这句话的开头裁切
     std::string chat_text_;
     lv_obj_t* chat_view_ = nullptr;
+    // 科幻底图（渐变/网格/角标烘成图 + 扫描带和粒子两层动态）。wechat 样式分支不建
+    TechBackdrop backdrop_;
     void PlaceChatView(int vh);
     void LayoutContentBlocks();
 
@@ -140,6 +143,7 @@ public:
 
     // Add theme switching function
     virtual void SetTheme(const std::string& theme_name) override;
+    virtual void SetPowerSaveMode(bool on) override;
     virtual void start() override;
 
 };

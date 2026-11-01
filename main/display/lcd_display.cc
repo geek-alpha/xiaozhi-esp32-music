@@ -88,6 +88,10 @@ static float avg_power_spectrum[FFT_SIZE/2]={-25.0f};
 #define LIGHT_BORDER_COLOR           lv_color_hex(0xE0E0E0)     // Light gray border
 #define LIGHT_LOW_BATTERY_COLOR      lv_color_black()           // Black for light mode
 
+// 顶栏 HUD 主色，跟 tech_backdrop 的扫描带/核心用同一对颜色，顶栏和底图才不会像两块皮
+#define HUD_ACCENT_DARK              lv_color_hex(0x00E5FF)
+#define HUD_ACCENT_LIGHT             lv_color_hex(0xD8408C)
+
 
 // Define dark theme colors
 const ThemeColors DARK_THEME = {
@@ -816,6 +820,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(screen, current_theme_.text, 0);
     lv_obj_set_style_bg_color(screen, current_theme_.background, 0);
 
+    // 科幻底图垫在最底层：渐变、网格、角标、雷达环、遥测刻度全烘在图上，
+    // 运行时只有 1 次 blit；动态只剩扫描带和粒子，脏区不到 20KB/帧
+    backdrop_.Create(screen, LV_HOR_RES, LV_VER_RES, fonts_.text_font->line_height);
+    backdrop_.ApplyTheme(current_theme_name_ == "dark");
+
     /* Container */
     container_ = lv_obj_create(screen);
     lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
@@ -824,14 +833,23 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_border_width(container_, 0, 0);
     lv_obj_set_style_pad_row(container_, 0, 0);
     lv_obj_set_style_bg_color(container_, current_theme_.background, 0);
+    lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);  // 不透明就把底图盖死了
     lv_obj_set_style_border_color(container_, current_theme_.border, 0);
 
     /* Status bar */
     status_bar_ = lv_obj_create(container_);
     lv_obj_set_size(status_bar_, LV_HOR_RES, fonts_.text_font->line_height);
     lv_obj_set_style_radius(status_bar_, 0, 0);
+    // 顶栏也是 HUD 的一部分：背景透出来让底图连上去，只在底部压一条青色扫描线
     lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
-    lv_obj_set_style_text_color(status_bar_, current_theme_.text, 0);
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(status_bar_,
+        (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT, 0);
+    lv_obj_set_style_border_width(status_bar_, 1, 0);
+    lv_obj_set_style_border_side(status_bar_, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(status_bar_,
+        (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT, 0);
+    lv_obj_set_style_border_opa(status_bar_, LV_OPA_50, 0);
     
     /* Content */
     content_ = lv_obj_create(container_);
@@ -841,7 +859,8 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_grow(content_, 1);
     lv_obj_set_style_pad_all(content_, 5, 0);
     lv_obj_set_style_bg_color(content_, current_theme_.chat_background, 0);
-    lv_obj_set_style_border_color(content_, current_theme_.border, 0); // Border color for content
+    lv_obj_set_style_bg_opa(content_, LV_OPA_TRANSP, 0);   // 同上：透出底图
+    lv_obj_set_style_border_width(content_, 0, 0);
 
     // content_ 不挂 flex 布局：表情、天气、对话视窗各自绝对定位（LayoutContentBlocks），
     // 任何一方内容怎么变都不会挪动别人的坐标
@@ -976,7 +995,12 @@ void LcdDisplay::SetupUI() {
     /* Status bar */
     lv_obj_set_flex_flow(status_bar_, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(status_bar_, 0, 0);
-    lv_obj_set_style_border_width(status_bar_, 0, 0);
+    lv_color_t hud = (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT;
+    // 顶栏底边那道霓虹线创建时设过，这里不能再清成 0
+    lv_obj_set_style_border_width(status_bar_, 1, 0);
+    lv_obj_set_style_border_side(status_bar_, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(status_bar_, hud, 0);
+    lv_obj_set_style_border_opa(status_bar_, LV_OPA_50, 0);
     lv_obj_set_style_pad_column(status_bar_, 0, 0);
     lv_obj_set_style_pad_left(status_bar_, 2, 0);
     lv_obj_set_style_pad_right(status_bar_, 2, 0);
@@ -984,12 +1008,12 @@ void LcdDisplay::SetupUI() {
     network_label_ = lv_label_create(status_bar_);
     lv_label_set_text(network_label_, "");
     lv_obj_set_style_text_font(network_label_, fonts_.icon_font, 0);
-    lv_obj_set_style_text_color(network_label_, current_theme_.text, 0);
+    lv_obj_set_style_text_color(network_label_, hud, 0);
 
     notification_label_ = lv_label_create(status_bar_);
     lv_obj_set_flex_grow(notification_label_, 1);
     lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(notification_label_, current_theme_.text, 0);
+    lv_obj_set_style_text_color(notification_label_, hud, 0);
     lv_label_set_text(notification_label_, "");
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
@@ -997,19 +1021,19 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_flex_grow(status_label_, 1);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(status_label_, current_theme_.text, 0);
+    lv_obj_set_style_text_color(status_label_, hud, 0);
     // 状态栏要显示“周五”这类中文，默认字体是 Montserrat（无汉字），换成板子的中文点阵
     lv_obj_set_style_text_font(status_label_, fonts_.text_font, 0);
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     mute_label_ = lv_label_create(status_bar_);
     lv_label_set_text(mute_label_, "");
     lv_obj_set_style_text_font(mute_label_, fonts_.icon_font, 0);
-    lv_obj_set_style_text_color(mute_label_, current_theme_.text, 0);
+    lv_obj_set_style_text_color(mute_label_, hud, 0);
 
     battery_label_ = lv_label_create(status_bar_);
     lv_label_set_text(battery_label_, "");
     lv_obj_set_style_text_font(battery_label_, fonts_.icon_font, 0);
-    lv_obj_set_style_text_color(battery_label_, current_theme_.text, 0);
+    lv_obj_set_style_text_color(battery_label_, hud, 0);
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -1379,6 +1403,14 @@ void LcdDisplay::SetMusicInfo(const char* song_name) {
 #endif
 }
 
+// 背景动画纯装饰：熄屏时停掉，不跟音频抢 CPU。
+// Display::SetPowerSaveMode 内部会走 SetEmotion 自己加锁，所以先调完它再单独取一次锁
+void LcdDisplay::SetPowerSaveMode(bool on) {
+    Display::SetPowerSaveMode(on);
+    DisplayLockGuard lock(this);
+    backdrop_.SetAnimationsEnabled(!on);
+}
+
 void LcdDisplay::SetTheme(const std::string& theme_name) {
     DisplayLockGuard lock(this);
     
@@ -1391,6 +1423,8 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
         ESP_LOGE(TAG, "Invalid theme name: %s", theme_name.c_str());
         return;
     }
+    backdrop_.ApplyTheme(theme_name == "dark" || theme_name == "DARK");
+    current_theme_name_ = (theme_name == "dark" || theme_name == "DARK") ? "dark" : "light";
     
     // Get the active screen
     lv_obj_t* screen = lv_screen_active();
@@ -1407,24 +1441,27 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
     
     // Update status bar colors
     if (status_bar_ != nullptr) {
+        lv_color_t accent = (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT;
         lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
-        lv_obj_set_style_text_color(status_bar_, current_theme_.text, 0);
+        lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(status_bar_, accent, 0);
+        lv_obj_set_style_border_color(status_bar_, accent, 0);
         
         // Update status bar elements
         if (network_label_ != nullptr) {
-            lv_obj_set_style_text_color(network_label_, current_theme_.text, 0);
+            lv_obj_set_style_text_color(network_label_, accent, 0);
         }
         if (status_label_ != nullptr) {
-            lv_obj_set_style_text_color(status_label_, current_theme_.text, 0);
+            lv_obj_set_style_text_color(status_label_, accent, 0);
         }
         if (notification_label_ != nullptr) {
-            lv_obj_set_style_text_color(notification_label_, current_theme_.text, 0);
+            lv_obj_set_style_text_color(notification_label_, accent, 0);
         }
         if (mute_label_ != nullptr) {
-            lv_obj_set_style_text_color(mute_label_, current_theme_.text, 0);
+            lv_obj_set_style_text_color(mute_label_, accent, 0);
         }
         if (battery_label_ != nullptr) {
-            lv_obj_set_style_text_color(battery_label_, current_theme_.text, 0);
+            lv_obj_set_style_text_color(battery_label_, accent, 0);
         }
         if (emotion_label_ != nullptr) {
             lv_obj_set_style_text_color(emotion_label_, current_theme_.text, 0);

@@ -20,6 +20,11 @@ public:
     virtual void OnVadStateChange(std::function<void(bool speaking)> callback) = 0;
     virtual size_t GetFeedSize() = 0;
     virtual void EnableDeviceAec(bool enable) = 0;
+
+    // 单工编解码没有回采通道时，由上层把即将送喇叭的 PCM 推下来，当 AEC 的参考信号（R 通道）。
+    // 只有真正开了设备端 AEC 的处理器才会用到它。
+    virtual void PushReference(const std::vector<int16_t>& pcm, int sample_rate) {}
+    virtual bool AecActive() const { return false; }
 };
 
 #endif

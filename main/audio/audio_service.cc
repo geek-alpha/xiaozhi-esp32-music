@@ -1,4 +1,7 @@
 #include "audio_service.h"
+
+#include <cmath>
+
 #include <esp_log.h>
 
 #if CONFIG_USE_AUDIO_PROCESSOR
@@ -16,6 +19,21 @@
 #endif
 
 #define TAG "AudioService"
+
+namespace {
+
+int RmsOf(const std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return 0;
+    }
+    int64_t sum = 0;
+    for (auto v : pcm) {
+        sum += (int64_t)v * v;
+    }
+    return (int)std::sqrt((double)sum / (double)pcm.size());
+}
+
+}  // namespace
 
 
 AudioService::AudioService() {
@@ -290,6 +308,12 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         }
+        // 先把这一帧 PCM 交给 AEC 当参考信号（R 通道），再送去喇叭；播放路径延迟在
+        // AfeAudioProcessor 里按固定样本数补偿。同时记下电平和时刻，用来判断「最近有没有在出声」。
+        if (audio_processor_) {
+            audio_processor_->PushReference(task->pcm, codec_->output_sample_rate());
+        }
+        UpdateEchoReference(task->pcm);
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
@@ -402,7 +426,121 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     }
 }
 
+void AudioService::UpdateEchoReference(const std::vector<int16_t>& pcm) {
+    echo_ref_rms_.store(RmsOf(pcm), std::memory_order_relaxed);
+    echo_ref_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+}
+
+void AudioService::GateEchoFrame(std::vector<int16_t>& pcm) {
+    int64_t now = esp_timer_get_time();
+    int32_t ref = echo_ref_rms_.load(std::memory_order_relaxed);
+    int64_t ref_us = echo_ref_us_.load(std::memory_order_relaxed);
+    bool playing = (ref > 0) && (now - ref_us) <= 300000;
+
+    // 设备端 AEC 已经接管回声：上行不再压静音（压了人声也一起没了），只报播放期的上行
+    // 残余电平——AI 说话、没人插话时这个值应该贴近底噪，这是 AEC 真生效的唯一硬证据。
+    if (audio_processor_ && audio_processor_->AecActive()) {
+        if (playing) {
+            aec_up_sum_ += RmsOf(pcm);
+            aec_frames_++;
+        }
+        if (now - gate_log_us_ > 500000) {
+            gate_log_us_ = now;
+            int32_t avg = aec_frames_ ? (int32_t)(aec_up_sum_ / aec_frames_) : 0;
+            ESP_LOGI(TAG, "AEC: playing=%d up_avg=%ld ref=%ld frames=%lu", (int)playing, (long)avg,
+                     (long)ref, (unsigned long)aec_frames_);
+            aec_up_sum_ = 0;
+            aec_frames_ = 0;
+        }
+        return;
+    }
+    // 上一版把未确认帧衰减 -30dB（/32）就放上去，实测没用：服务端 VAD 是按神经网络
+    // 判语音的，回声哪怕只剩 90 的电平也照样判成「有人在说话」。播放期上行必须压成
+    // 真静音，服务端才没有任何东西可误判；打断改由下面的确认窗口在设备端放行。
+    constexpr int32_t kFloorRatio = 3;      // 上行要盖过回声底 3 倍
+    constexpr int32_t kAbsOpenRms = 900;    // 同时绝对电平得够，挡掉底噪
+    // 实测：本机播放期上行 RMS 中位数 26694、峰值 32230（S16 满幅 32767）。
+    // 之前封顶 2500 把门限算成 7500，回声十倍于门限，每 300ms 就确认一次「插话」。
+    // 现在封顶抬到满幅：floor 跟着真实回声走，门限 >> 回声，播放期一律不放行。
+    // 这不是调参能解决的问题——人声在麦克风上同样削波到 32000，和回声无法用电平分开，
+    // 要恢复打断必须上设备端 AEC（喂播放 PCM 当 R 通道），那是下一步的事。
+    constexpr int32_t kFloorCeil = 32000;
+    constexpr int64_t kTailUs = 300000;     // 播放停 300ms 后回声尾巴已散，不再门控
+    constexpr int kConfirmFrames = 5;       // 300ms 连续超阈值才算真插话
+    constexpr int kSettleFrames = 8;        // 每次开口头 480ms 只标定回声底，不放行
+    constexpr int64_t kHoldUs = 400000;     // 确认插话后 400ms 全放行，让人声完整上行
+
+    // 确认插话之后的保持窗口：整帧放行
+    if (now < gate_hold_until_us_) {
+        return;
+    }
+
+    if (!playing) {
+        // 喇叭静着，没有回声风险，原样上行
+        gate_playing_ = false;
+        gate_echo_floor_ = 0;
+        gate_settle_frames_ = 0;
+        gate_confirm_frames_ = 0;
+        return;
+    }
+
+    if (!gate_playing_) {
+        // 刚开口：重开一轮标定，回声底丢掉重学
+        gate_playing_ = true;
+        gate_echo_floor_ = 0;
+        gate_settle_frames_ = kSettleFrames;
+        gate_confirm_frames_ = 0;
+    }
+
+    int up = RmsOf(pcm);
+
+    if (gate_settle_frames_ > 0) {
+        // 标定期：取峰值当回声底（回音是起伏的，峰值更安全），一律压成静音
+        gate_echo_floor_ = std::min<int32_t>(std::max<int32_t>(gate_echo_floor_, up), kFloorCeil);
+        gate_settle_frames_--;
+        gate_confirm_frames_ = 0;
+        std::fill(pcm.begin(), pcm.end(), 0);
+        if (now - gate_log_us_ > 200000) {
+            gate_log_us_ = now;
+            ESP_LOGI(TAG, "Echo gate: up=%d floor=%ld settle %d ref=%ld", up,
+                     (long)gate_echo_floor_, gate_settle_frames_, (long)ref);
+        }
+        return;
+    }
+
+    // 标定后不跟着往上跑，只在更低时缓慢下调（回声底可能被标定期高估）
+    if (up < gate_echo_floor_) {
+        gate_echo_floor_ = (int32_t)(0.5f * gate_echo_floor_ + 0.5f * up);
+    }
+
+    int32_t open_thr = std::max<int32_t>((int32_t)(gate_echo_floor_ * kFloorRatio), kAbsOpenRms);
+    bool candidate = (up >= open_thr);
+    gate_confirm_frames_ = candidate ? gate_confirm_frames_ + 1 : 0;
+
+    bool open = gate_confirm_frames_ >= kConfirmFrames;
+    if (open) {
+        gate_hold_until_us_ = now + kHoldUs;   // 确认插话：放行并保持一段
+        gate_confirm_frames_ = 0;
+        gate_open_count_++;
+    } else {
+        std::fill(pcm.begin(), pcm.end(), 0);
+        gate_mute_count_++;
+    }
+
+    if (now - gate_log_us_ > 200000) {
+        gate_log_us_ = now;
+        ESP_LOGI(TAG, "Echo gate: up=%d floor=%ld thr=%ld ref=%ld %s muted=%lu opened=%lu", up,
+                 (long)gate_echo_floor_, (long)open_thr, (long)ref, open ? "OPEN" : "mute",
+                 (unsigned long)gate_mute_count_, (unsigned long)gate_open_count_);
+    }
+}
+
+
 void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
+    if (type == kAudioTaskTypeEncodeToSendQueue) {
+        GateEchoFrame(pcm);
+    }
+
     auto task = std::make_unique<AudioTask>();
     task->type = type;
     task->pcm = std::move(pcm);

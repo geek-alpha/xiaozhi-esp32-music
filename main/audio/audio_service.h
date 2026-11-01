@@ -4,6 +4,7 @@
 #include <memory>
 #include <deque>
 #include <condition_variable>
+#include <atomic>
 #include <chrono>
 #include <mutex>
 
@@ -141,9 +142,28 @@ private:
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;
     bool voice_detected_ = false;
+
+    // 回声门控：单工编解码（NoAudioCodecSimplex）没有回采参考通道，AFE 的 AEC 一直是关的，
+    // 喇叭出声时麦克风拾到的就是自己的声音；服务端把回声当用户插话，AI 刚开口就被自己打断。
+    // 播放数字电平和声学泄漏差几个数量级，比值判据不可用；改为每次开口先用前几帧标定
+    // 「播放中的上行基线」（回声底），之后的帧要明显盖过这个基线才当插话放行。
+    void UpdateEchoReference(const std::vector<int16_t>& pcm);
+    void GateEchoFrame(std::vector<int16_t>& pcm);
+    std::atomic<int32_t> echo_ref_rms_{0};
+    std::atomic<int64_t> echo_ref_us_{0};
+    bool gate_playing_ = false;
+    int32_t gate_echo_floor_ = 0;     // 播放期间的上行基线（回声电平），每次开口重新标定
+    int gate_settle_frames_ = 0;
+    int gate_confirm_frames_ = 0;
+    int64_t gate_hold_until_us_ = 0;  // 确认插话后短时间内全放行，让人声完整上行
+    int64_t gate_log_us_ = 0;
+    uint32_t gate_mute_count_ = 0;    // 播放期被压成静音的帧数
+    uint32_t gate_open_count_ = 0;    // 确认成插话、放行的次数
+    int64_t aec_up_sum_ = 0;          // 设备端 AEC 生效时，播放期上行 RMS 的累计（诊断用）
+    uint32_t aec_frames_ = 0;
+
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
-
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
