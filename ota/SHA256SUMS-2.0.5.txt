@@ -1,0 +1,2 @@
+602cef4f60cadcbda2322f6eb7047e3432b1ab7c7e94450ee6abbade60aeb10b  xiaozhi-music-v2.0.5-full.bin
+25a380709cc9b43393b0684bcd09a50676e5e9025f7b5035906a431426da13c2  xiaozhi-music-v2.0.5-app-ota.bin
