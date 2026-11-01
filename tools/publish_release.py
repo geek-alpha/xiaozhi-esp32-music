@@ -69,15 +69,55 @@ def http(method, url, tok, body=None, ctype="application/vnd.github+json", timeo
     return int(code), payload
 
 
-def ensure_release(tok, version):
+def release_body(version):
+    full = "xiaozhi-music-v%s-full.bin" % version
+    app = "xiaozhi-music-v%s-app-ota.bin" % version
+    return "\n".join([
+        "## 小智音乐固件 v%s" % version,
+        "",
+        "目标硬件：**星智 Cube 1.54 (WiFi)**（`xingzhi-cube-1.54tft-wifi`，esp32s3，16MB flash），ESP-IDF v5.4。",
+        "",
+        "### 两个包，别搞混",
+        "",
+        "| 资产 | 起始地址 | 用途 |",
+        "| --- | --- | --- |",
+        "| `%s` | **0x0** | 全量镜像：bootloader + 分区表 + otadata + 语音模型 + app，新板或刷坏了的板子用这个 |" % full,
+        "| `%s` | 0x100000 | 纯 app 包，只给设备端 OTA 用，**不能**烧到 0x0 |" % app,
+        "",
+        "> v2.0.4 只发了 app 包，按「烧到 0x0」会起不来，设备端分区表也会被写坏——这就是上一版烧不进去的根因。",
+        "",
+        "### 全量烧录（一条命令）",
+        "",
+        "```",
+        "esptool.py --chip esp32s3 -p <PORT> -b 460800 write_flash 0x0 %s" % full,
+        "```",
+        "",
+        "仓库里的 `scripts/flash.sh` 会自己找最新的 full 包，端口留空交给 esptool 自动探测。",
+        "Windows 下别把 COM 号写死进脚本：板子的 USB-Serial/JTAG 口每次插拔可能换号（曾经写死 COM19、实际枚举成 COM22，esptool 直接报 port is busy）。",
+        "",
+        "### 校验",
+        "",
+        "```",
+        "certutil -hashfile %s SHA256" % full,
+        "```",
+        "",
+        "对照 `SHA256SUMS.txt`（两个包都在里面）。",
+    ])
+
+
+def ensure_release(tok, version, body):
     tag = "v%s" % version
     status, rel = http("GET", "%s/repos/%s/releases/tags/%s" % (API, REPO, tag), tok, timeout=60)
     if status == 200 and rel:
         print("复用已存在的 release %s (id=%s)" % (tag, rel["id"]))
+        st, patched = http("PATCH", "%s/repos/%s/releases/%s" % (API, REPO, rel["id"]), tok,
+                           {"body": body})
+        if st == 200:
+            print("更新 release 说明 (HTTP %s)" % st)
+            return patched
         return rel
     status, rel = http("POST", "%s/repos/%s/releases" % (API, REPO), tok,
-                       {"tag_name": tag, "name": tag,
-                        "body": "小智音乐 %s\n\nOTA 清单经 gh-proxy.com 加速，设备端直连升级。" % tag,
+                       {"tag_name": tag, "name": tag, "body": body,
                         "draft": False, "prerelease": False})
     if status not in (200, 201):
         raise SystemExit("建 release 失败 HTTP %s: %s" % (status, rel))
@@ -104,16 +144,24 @@ def main() -> int:
     if not os.path.exists(bin_path):
         raise SystemExit("缺少 %s，先跑 tools/release_ota.py" % bin_path)
 
-    digest = hashlib.sha256(open(bin_path, "rb").read()).hexdigest()
+    subprocess.run([sys.executable, os.path.join("tools", "make_full_bin.py")], check=True)
+    full_path = os.path.join("ota", "xiaozhi-music-v%s-full.bin" % version)
+    if not os.path.exists(full_path):
+        raise SystemExit("缺少 %s" % full_path)
+
     sums = os.path.join("ota", "SHA256SUMS-%s.txt" % version)
-    io.open(sums, "w", encoding="utf-8", newline="\n").write(
-        "%s  %s\n" % (digest, os.path.basename(bin_path)))
+    lines = []
+    for p in (full_path, bin_path):
+        digest = hashlib.sha256(open(p, "rb").read()).hexdigest()
+        lines.append("%s  %s\n" % (digest, os.path.basename(p)))
+        print("%s %s" % (digest[:16], os.path.basename(p)))
+    io.open(sums, "w", encoding="utf-8", newline="\n").write("".join(lines))
 
     tok = token()
-    rel = ensure_release(tok, version)
-    upload(tok, rel, bin_path, os.path.basename(bin_path))
+    rel = ensure_release(tok, version, release_body(version))
+    for p in (full_path, bin_path):
+        upload(tok, rel, p, os.path.basename(p))
     upload(tok, rel, sums, "SHA256SUMS.txt")
-    print("sha256=%s" % digest)
     return 0
 
 
