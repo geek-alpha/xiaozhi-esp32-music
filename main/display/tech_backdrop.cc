@@ -83,6 +83,18 @@ void TechBackdrop::Create(lv_obj_t* parent, int w, int h, int status_h)
     lv_obj_set_pos(bg_image_, 0, 0);
     lv_image_set_src(bg_image_, &bg_dark);
 
+    // 全屏染色层：紧跟在底图之后建，后建的盖在上面，所以它压住底图但不遮动态元素。
+    // accent=0 时透明度 0，透传下去完全是旧观感，不动老布局。
+    tint_ = lv_obj_create(root_);
+    lv_obj_remove_style_all(tint_);
+    lv_obj_add_flag(tint_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(tint_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(tint_, 0, 0);
+    lv_obj_set_size(tint_, w, h);
+    lv_obj_set_style_bg_opa(tint_, LV_OPA_0, 0);
+    lv_obj_set_style_radius(tint_, 0, 0);
+    lv_obj_set_style_border_width(tint_, 0, 0);
+
     // 核心呼吸：能量核上再叠一层明灭的光，标出「核心在充能」
     core_ = lv_obj_create(root_);
     lv_obj_remove_style_all(core_);
@@ -139,35 +151,58 @@ void TechBackdrop::Create(lv_obj_t* parent, int w, int h, int status_h)
     SetAnimationsEnabled(true);
 }
 
-void TechBackdrop::ApplyTheme(bool dark)
+void TechBackdrop::ApplyTheme(bool dark, uint32_t accent, int strength)
 {
     dark_ = dark;
+    accent_ = accent;
+    strength_ = strength;
     if (bg_image_ != nullptr) {
         lv_image_set_src(bg_image_, dark ? &bg_dark : &bg_light);
     }
+
+    // accent==0 走原来那套手调色，观感跟旧版逐像素一致；配了 accent 才从它派生
+    const lv_color_t base = lv_color_hex(accent != 0 ? accent : (dark ? 0x00E5FF : 0xD8408C));
+    const lv_color_t ring = accent != 0 ? lv_color_mix(base, lv_color_white(), 60)
+                                        : lv_color_hex(dark ? 0xFF3E9E : 0xC03878);
+    const lv_color_t spark = accent != 0 ? lv_color_mix(base, lv_color_white(), 140)
+                                         : lv_color_hex(dark ? 0xBFF6FF : 0x3A82B4);
+    const lv_color_t trail_a = accent != 0 ? lv_color_mix(base, lv_color_white(), 100)
+                                           : lv_color_hex(dark ? 0xA8FFF4 : 0x8A5AC8);
+    const lv_color_t trail_b = accent != 0 ? base : lv_color_hex(dark ? 0xFF6AB0 : 0xC03878);
+
+    // 整屏染色：底图占满全屏，不染它的话换主色只有几样小元素变，肉眼几乎看不出来。
+    // 10 级映射到 0~230，默认 3 约 24%。
+    if (tint_ != nullptr) {
+        lv_obj_set_style_bg_color(tint_, base, 0);
+        int s = strength;
+        if (s < 0) s = 0;
+        if (s > kMaxTint) s = kMaxTint;
+        lv_obj_set_style_bg_opa(tint_, (lv_opa_t)(accent != 0 ? s * 23 : 0), 0);
+    }
+
     if (sweep_ != nullptr) {
-        lv_obj_set_style_bg_color(sweep_, lv_color_hex(dark ? 0x00E5FF : 0xD8408C), 0);
+        lv_obj_set_style_bg_color(sweep_, base, 0);
     }
     if (core_ != nullptr) {
-        lv_obj_set_style_bg_color(core_, lv_color_hex(dark ? 0x00E5FF : 0xD8408C), 0);
+        lv_obj_set_style_bg_color(core_, base, 0);
     }
     for (int i = 0; i < kRings; i++) {
         if (rings_[i] != nullptr) {
-            lv_obj_set_style_border_color(rings_[i], lv_color_hex(dark ? 0xFF3E9E : 0xC03878), 0);
+            lv_obj_set_style_border_color(rings_[i], ring, 0);
         }
     }
     for (int i = 0; i < kSparks; i++) {
         if (sparks_[i] != nullptr) {
-            lv_obj_set_style_bg_color(sparks_[i], lv_color_hex(dark ? 0xBFF6FF : 0x3A82B4), 0);
+            lv_obj_set_style_bg_color(sparks_[i], spark, 0);
         }
     }
     for (int i = 0; i < kTrail; i++) {
         if (trail_[i] != nullptr) {
-            lv_obj_set_style_bg_color(trail_[i], lv_color_hex(i % 2 == 0 ? (dark ? 0xA8FFF4 : 0x8A5AC8)
-                                                                         : (dark ? 0xFF6AB0 : 0xC03878)), 0);
+            lv_obj_set_style_bg_color(trail_[i], i % 2 == 0 ? trail_a : trail_b, 0);
         }
     }
 }
+
 
 void TechBackdrop::SetAnimationsEnabled(bool on)
 {

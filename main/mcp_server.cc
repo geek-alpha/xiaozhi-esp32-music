@@ -60,7 +60,66 @@
       return any ? mask : -1;
   }
  
- McpServer::McpServer() {
+ // 色名 / #RRGGBB → RGB。中文名允许带「色」尾巴（深蓝色、浅绿都认）
+static bool ParseColorName(const std::string& raw, uint32_t* rgb) {
+    size_t b = raw.find_first_not_of(" \t");
+    if (b == std::string::npos) {
+        return false;
+    }
+    size_t e = raw.find_last_not_of(" \t");
+    std::string name = raw.substr(b, e - b + 1);
+    if (name[0] == '#') {
+        char* end = nullptr;
+        unsigned long v = strtoul(name.c_str() + 1, &end, 16);
+        if (end == name.c_str() + 1 || v == 0 || v > 0xFFFFFF) {
+            return false;
+        }
+        *rgb = (uint32_t)v;
+        return true;
+    }
+    static const struct { const char* key; uint32_t rgb; } kColors[] = {
+        {"粉", 0xFF8FB8}, {"粉色", 0xFF8FB8}, {"pink", 0xFF8FB8},
+        {"金", 0xFFD76B}, {"金色", 0xFFD76B}, {"gold", 0xFFD76B},
+        {"银", 0xE0E6F0}, {"银灰", 0xE0E6F0}, {"silver", 0xE0E6F0},
+        {"白", 0xF2F6FF}, {"white", 0xF2F6FF},
+        {"黑", 0x2A2A38}, {"black", 0x2A2A38},
+        {"紫", 0xB48CFF}, {"purple", 0xB48CFF},
+        {"深紫", 0x7A4BD6}, {"darkpurple", 0x7A4BD6},
+        {"绿", 0x8CF0B4}, {"绿色", 0x8CF0B4}, {"green", 0x8CF0B4},
+        {"浅绿", 0x7BF5B0}, {"lightgreen", 0x7BF5B0},
+        {"深绿", 0x1FA35C}, {"darkgreen", 0x1FA35C},
+        {"红", 0xFF6B6B}, {"red", 0xFF6B6B},
+        {"深红", 0xB3241F}, {"darkred", 0xB3241F},
+        {"棕", 0xB07A50}, {"brown", 0xB07A50},
+        {"蓝", 0x76A6FF}, {"蓝色", 0x76A6FF}, {"blue", 0x76A6FF},
+        {"浅蓝", 0x9BD4FF}, {"lightblue", 0x9BD4FF},
+        {"深蓝", 0x2D5BFF}, {"darkblue", 0x2D5BFF},
+        {"品红", 0xD8408C}, {"洋红", 0xD8408C}, {"magenta", 0xD8408C},
+        {"青", 0x00E5FF}, {"青色", 0x00E5FF}, {"cyan", 0x00E5FF},
+        {"橙", 0xFF9A3C}, {"橙色", 0xFF9A3C}, {"orange", 0xFF9A3C},
+        {"黄", 0xFFE066}, {"黄色", 0xFFE066}, {"yellow", 0xFFE066},
+    };
+    const size_t n = sizeof(kColors) / sizeof(kColors[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (name == kColors[i].key) {
+            *rgb = kColors[i].rgb;
+            return true;
+        }
+    }
+    // 「深蓝色」这类比表里多一个「色」字，去掉再查一次（「色」是 3 字节）
+    if (name.size() > 3 && name.compare(name.size() - 3, 3, "色") == 0) {
+        std::string trimmed = name.substr(0, name.size() - 3);
+        for (size_t i = 0; i < n; i++) {
+            if (trimmed == kColors[i].key) {
+                *rgb = kColors[i].rgb;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+McpServer::McpServer() {
  }
  
  McpServer::~McpServer() {
@@ -135,36 +194,38 @@
                 Property("color", kPropertyTypeString)
             }),
             [display](const PropertyList& properties) -> ReturnValue {
-                std::string name = properties["color"].value<std::string>();
-                static const struct { const char* key; uint32_t rgb; } kColors[] = {
-                    {"粉", 0xFF8FB8}, {"pink", 0xFF8FB8}, {"粉色", 0xFF8FB8},
-                    {"金", 0xFFD76B}, {"gold", 0xFFD76B}, {"金色", 0xFFD76B},
-                    {"银", 0xE0E6F0}, {"silver", 0xE0E6F0}, {"银灰", 0xE0E6F0},
-                    {"白", 0xF2F6FF}, {"white", 0xF2F6FF},
-                    {"黑", 0x2A2A38}, {"black", 0x2A2A38},
-                    {"紫", 0xB48CFF}, {"purple", 0xB48CFF},
-                    {"绿", 0x8CF0B4}, {"green", 0x8CF0B4},
-                    {"红", 0xFF6B6B}, {"red", 0xFF6B6B},
-                    {"棕", 0xB07A50}, {"brown", 0xB07A50},
-                    {"蓝", 0x76A6FF}, {"blue", 0x76A6FF},
-                };
                 uint32_t rgb = 0;
-                if (!name.empty() && name[0] == '#') {
-                    rgb = (uint32_t)strtoul(name.c_str() + 1, nullptr, 16);
-                } else {
-                    for (size_t i = 0; i < sizeof(kColors) / sizeof(kColors[0]); i++) {
-                        if (name == kColors[i].key) {
-                            rgb = kColors[i].rgb;
-                            break;
-                        }
-                    }
-                }
-                if (rgb == 0) {
+                if (!ParseColorName(properties["color"].value<std::string>(), &rgb)) {
                     return std::string("{\"success\": false, \"message\": \"认不出这个颜色，给色名（粉/金/银/黑/白/紫/绿/红/棕/蓝）或 #RRGGBB\"}");
                 }
                 display->SetHairColor(rgb);
                 char buf[80];
                 snprintf(buf, sizeof(buf), "{\"success\": true, \"message\": \"头发已换成 #%06X\"}", (unsigned)rgb);
+                return std::string(buf);
+            });
+
+        AddTool("self.screen.set_accent_color",
+            "换屏幕主色，并控制整屏染色浓度。整屏（包括待机背景那张底图）都会染上这个颜色。\n"
+            "用户说「背景改成深蓝色」「换成浅绿色」「整个屏幕变个气氛」「颜色太扎眼了/太暗了」时用它。\n"
+            "参数:\n"
+            "  `color`: 色名（品红/青/深蓝/浅蓝/深绿/浅绿/紫/金/橙/红/粉/黄/白），也可以给 #RRGGBB。\n"
+            "  `strength`: 1~10 染色浓淡，默认 3。用户嫌看不出来就调到 6~8，喊太浓太糊就降到 1~2，0 = 只换顶栏和光效、不染整屏。\n"
+            "返回 success 表示屏幕已经变色，照着说就行。",
+            PropertyList({
+                Property("color", kPropertyTypeString),
+                Property("strength", kPropertyTypeInteger, 3, 0, 10)
+            }),
+            [display](const PropertyList& properties) -> ReturnValue {
+                uint32_t rgb = 0;
+                if (!ParseColorName(properties["color"].value<std::string>(), &rgb)) {
+                    return std::string("{\"success\": false, \"message\": \"认不出这个颜色，给色名（品红/青/深蓝/浅蓝/深绿/浅绿/紫/金/橙/红/粉/黄/白）或 #RRGGBB\"}");
+                }
+                int strength = properties["strength"].value<int>();
+                display->SetAccentColor(rgb, strength);
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "{\"success\": true, \"message\": \"屏幕主色已换成 #%06X，整屏染色 %d/10\"}",
+                         (unsigned)rgb, strength);
                 return std::string(buf);
             });
     }

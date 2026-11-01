@@ -25,6 +25,18 @@ IRIS_BOT = (146, 208, 255, 255)
 MOUTH = (198, 80, 94, 255)
 TONGUE = (255, 142, 152, 255)
 BLUSH = (255, 156, 174, 255)
+# 轮廓线专用色：中性深紫黑。不能跟 LINE 共用暖棕，否则在蓝发上发脏；
+# 也不能偏蓝，否则用户把发色改成红/绿后描边和头发打起来。
+# 必须同时满足两个条件：
+#   1) 不落入 hair_masks 的任一条判据（b-r<40 且非亮白），否则描边会被拉进 A8 遮罩，
+#      随 image_recolor 跟着发色一起染，改发色时轮廓就消失了
+#   2) 降采样后与发色混出的中间像素要尽量深，才不会被判成头发（见 OUTLINE_W 注释）
+OUTLINE = (46, 38, 52, 255)
+OUTLINE_W = 3.5  # 逻辑单位；最终 120px 画布上约 1.75px
+# 最外圈边缘光。屏幕背景是近黑的科技底（_bg_out/bg_0.png 实测），
+# 深色轮廓在黑底上等于隐形——这就是“没线条感”的真正原因。外圈必须用亮色才有对比。
+RIM = (198, 224, 255, 255)
+RIM_GLOW = (110, 164, 255, 255)
 
 
 def canvas():
@@ -35,17 +47,24 @@ def el(d, box, fill=None, outline=None, width=0):
     d.ellipse([int(v) for v in box], fill=fill, outline=outline, width=int(width))
 
 
-def poly(d, pts, fill):
-    d.polygon([(int(x), int(y)) for x, y in pts], fill=fill)
+def poly(d, pts, fill, outline=None, width=0):
+    p = [(int(x), int(y)) for x, y in pts]
+    if outline is not None and width > 0:
+        d.polygon(p, fill=fill, outline=outline, width=int(width))
+    else:
+        d.polygon(p, fill=fill)
 
 
-def hair_back(d, fill=None):
-    el(d, (30 * S, 26 * S, 210 * S, 214 * S), fill=HAIR_DK if fill is None else fill)
+def hair_back(d, fill=None, outline=True):
+    el(d, (30 * S, 26 * S, 210 * S, 214 * S), fill=HAIR_DK if fill is None else fill,
+       outline=OUTLINE if outline else None, width=int(OUTLINE_W * S))
 
 
-def hair_front(d, fill=None, dark=None, highlight=True):
+def hair_front(d, fill=None, dark=None, highlight=True, outline=True):
     F = HAIR if fill is None else fill
     K = HAIR_DK if dark is None else dark
+    ol = OUTLINE if outline else None
+    ow = int(OUTLINE_W * S)
     pts = []
     # 发际线：中间厚两侧薄（M 形），左 -> 右
     for i in range(41):
@@ -59,19 +78,20 @@ def hair_front(d, fill=None, dark=None, highlight=True):
         t = math.pi * i / 40.0
         pts.append(((120 + 84 * math.cos(t)) * S, (98 - 74 * math.sin(t)) * S))
     pts.append((36 * S, 44 * S))
-    poly(d, pts, F)
-    # 刘海分缕尖
+    poly(d, pts, F, ol, ow)
+    # 刘海分绉尖：三个尖彼此之间靠描边分开，否则同色叠同色就是一块蓝，看不出分绉
     for tx in (78, 120, 162):
         tip_y = 104 - 10 * math.cos((tx - 120) * math.pi / 80.0)
-        poly(d, [((tx - 16) * S, (tip_y - 20) * S), ((tx + 16) * S, (tip_y - 20) * S), (tx * S, tip_y * S)], F)
+        poly(d, [((tx - 16) * S, (tip_y - 20) * S), ((tx + 16) * S, (tip_y - 20) * S), (tx * S, tip_y * S)],
+             F, ol, ow)
     # 发丝高光
     if highlight:
         d.line([(78 * S, 62 * S), (150 * S, 52 * S)], fill=(255, 255, 255, 110), width=int(3 * S))
     # 鬃角
-    poly(d, [(38 * S, 96 * S), (58 * S, 102 * S), (52 * S, 168 * S), (34 * S, 150 * S)], K)
-    poly(d, [(202 * S, 96 * S), (182 * S, 102 * S), (188 * S, 168 * S), (206 * S, 150 * S)], K)
+    poly(d, [(38 * S, 96 * S), (58 * S, 102 * S), (52 * S, 168 * S), (34 * S, 150 * S)], K, ol, ow)
+    poly(d, [(202 * S, 96 * S), (182 * S, 102 * S), (188 * S, 168 * S), (206 * S, 150 * S)], K, ol, ow)
     # 呆毛
-    poly(d, [(118 * S, 36 * S), (140 * S, 10 * S), (152 * S, 20 * S), (134 * S, 42 * S)], F)
+    poly(d, [(118 * S, 36 * S), (140 * S, 10 * S), (152 * S, 20 * S), (134 * S, 42 * S)], F, ol, ow)
 
 
 def hair_masks(items):
@@ -79,13 +99,15 @@ def hair_masks(items):
     不能 21 张共用一张：闭眼弧、放大眼会盖住刘海，取交集下来刘海就缺一块（实测缺 898 像素）。
     光靠重放几何也不行：hair_back 是一整个大椭圆，全靠后画的 face 盖住，不减脸就是整颗头全染。"""
     back = Image.new("L", (W, W), 0)
-    hair_back(ImageDraw.Draw(back), fill=255)
+    hair_back(ImageDraw.Draw(back), fill=255, outline=False)
     face_img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
-    face(ImageDraw.Draw(face_img))
+    face(ImageDraw.Draw(face_img), outline=False)
     back = ImageChops.subtract(back, face_img.split()[3])
 
     front = Image.new("L", (W, W), 0)
-    hair_front(ImageDraw.Draw(front), fill=255, dark=255, highlight=False)
+    # 几何重放必须关掉描边：outline 是 4 元组 RGBA，画到 L 图上是 46 的灰值，
+    # 会形成一圈 gv>=8 的假几何，把刚加的那圈轮廓线整个拉进遮罩，改发色时轮廓跟着被染
+    hair_front(ImageDraw.Draw(front), fill=255, dark=255, highlight=False, outline=False)
 
     geo = ImageChops.lighter(back, front).resize((SZ, SZ), Image.LANCZOS).resize((OUT, OUT), Image.LANCZOS)
     gp = geo.load()
@@ -115,8 +137,9 @@ def hair_masks(items):
 
 
 
-def face(d):
-    el(d, (52 * S, 58 * S, 188 * S, 206 * S), fill=SKIN)
+def face(d, outline=True):
+    el(d, (52 * S, 58 * S, 188 * S, 206 * S), fill=SKIN,
+       outline=OUTLINE if outline else None, width=int(OUTLINE_W * S))
 
 
 def brows(d, style="normal"):
@@ -242,6 +265,34 @@ def tear(d, side=-1):
 def sweat(d):
     poly(d, [(196 * S, 96 * S), (206 * S, 114 * S), (186 * S, 114 * S)], (140, 210, 255, 255))
     el(d, (186 * S, 104 * S, 206 * S, 128 * S), fill=(140, 210, 255, 255))
+
+
+def add_outer_line(img, r=1):
+    """最外圈：1px 亮实线 + 1px 半透明光晕，把头从深色背景里拔出来。
+    逐形状 outline 只能画出每个形状自己的边，脸与头发、头发与外缘的交接处会留断口，
+    整张 alpha 外扩再减回原 alpha，才能保证「头 vs 背景」是一条连续的线。
+    ring 保留 grown-a 的差值而不是二值化，抗锯齿边缘得到的是一圈渐变实线，不是硬边。"""
+    a = img.split()[3]
+
+    def dilated(rad):
+        g = a.copy()
+        for dx in range(-rad, rad + 1):
+            for dy in range(-rad, rad + 1):
+                if dx or dy:
+                    g = ImageChops.lighter(g, ImageChops.offset(a, dx, dy))
+        return g
+
+    g1 = dilated(1)
+    g2 = dilated(2)
+    out = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    halo = Image.new("RGBA", img.size, RIM_GLOW)
+    halo.putalpha(ImageChops.subtract(g2, g1).point(lambda v: int(v * 0.55)))
+    out.alpha_composite(halo)
+    ring = Image.new("RGBA", img.size, RIM)
+    ring.putalpha(ImageChops.subtract(g1, a))
+    out.alpha_composite(ring)
+    out.alpha_composite(img)
+    return out
 
 
 def compose(fn):
@@ -547,7 +598,7 @@ def rgba(name, fn, talk=False):
         img = build(fn)
     finally:
         TALK_MODE = False
-    return img.resize((OUT, OUT), Image.LANCZOS)
+    return add_outer_line(img.resize((OUT, OUT), Image.LANCZOS))
 
 
 def mouth_patch(fn):
@@ -580,7 +631,9 @@ def render_blink(fn, style):
         img = build(fn)
     finally:
         BLINK_MODE, BLINK_STYLE = False, "flat"
-    return img.resize((OUT, OUT), Image.LANCZOS)
+    # 必须和 rgba() 走同一套外轮廓：少了这圈，睁眼版有轮廓、闭眼版没有，
+    # 整圈外轮廓全被算成「睁闭眼差异」，眨眼贴片从 72x42 涨到 104x110（+750KB flash）
+    return add_outer_line(img.resize((OUT, OUT), Image.LANCZOS))
 
 
 def diff_bbox(a, b):

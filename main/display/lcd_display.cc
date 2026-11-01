@@ -131,7 +131,10 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     Settings settings("display", false);
     current_theme_name_ = settings.GetString("theme", "light");
     hair_color_ = (uint32_t)settings.GetInt("hair_color", (int32_t)hair_color_);
-    ESP_LOGI(TAG, "Hair color from NVS: #%06X", (unsigned)hair_color_);
+    accent_color_ = (uint32_t)settings.GetInt("accent_color", 0);
+    accent_strength_ = (int)settings.GetInt("accent_strength", 3);
+    ESP_LOGI(TAG, "Hair color from NVS: #%06X, accent: %s (tint %d/10)", (unsigned)hair_color_,
+             accent_color_ ? "set" : "theme default", accent_strength_);
 
     // Update the theme
     if (current_theme_name_ == "dark") {
@@ -823,7 +826,7 @@ void LcdDisplay::SetupUI() {
     // 科幻底图垫在最底层：渐变、网格、角标、雷达环、遥测刻度全烘在图上，
     // 运行时只有 1 次 blit；动态只剩扫描带和粒子，脏区不到 20KB/帧
     backdrop_.Create(screen, LV_HOR_RES, LV_VER_RES, fonts_.text_font->line_height);
-    backdrop_.ApplyTheme(current_theme_name_ == "dark");
+    backdrop_.ApplyTheme(current_theme_name_ == "dark", accent_color_, accent_strength_);
 
     /* Container */
     container_ = lv_obj_create(screen);
@@ -1417,6 +1420,30 @@ void LcdDisplay::SetPowerSaveMode(bool on) {
     backdrop_.SetAnimationsEnabled(!on);
 }
 
+lv_color_t LcdDisplay::AccentColor() const {
+    if (accent_color_ != 0) {
+        return lv_color_hex(accent_color_);
+    }
+    return (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT;
+}
+
+void LcdDisplay::SetAccentColor(uint32_t rgb, int strength) {
+    accent_color_ = rgb;
+    if (strength >= 0) {
+        accent_strength_ = strength > 10 ? 10 : strength;
+    }
+    // 作用域收窄：SetTheme 内部还会开一个 "display" 句柄写 theme，别让两个句柄叠着
+    {
+        Settings settings("display", true);
+        settings.SetInt("accent_color", (int32_t)rgb);
+        settings.SetInt("accent_strength", accent_strength_);
+    }
+    // 重刷直接复用 SetTheme 那条链路：顶栏、气泡、底图动态一次全换，
+    // 免得再写一套刷新逻辑，两边迟早跑偏
+    SetTheme(current_theme_name_.empty() ? "light" : current_theme_name_);
+    ESP_LOGI(TAG, "Accent color -> #%06X, tint %d/10 (saved)", (unsigned)rgb, accent_strength_);
+}
+
 void LcdDisplay::SetTheme(const std::string& theme_name) {
     DisplayLockGuard lock(this);
     
@@ -1429,7 +1456,7 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
         ESP_LOGE(TAG, "Invalid theme name: %s", theme_name.c_str());
         return;
     }
-    backdrop_.ApplyTheme(theme_name == "dark" || theme_name == "DARK");
+    backdrop_.ApplyTheme(theme_name == "dark" || theme_name == "DARK", accent_color_, accent_strength_);
     current_theme_name_ = (theme_name == "dark" || theme_name == "DARK") ? "dark" : "light";
     
     // Get the active screen
@@ -1447,7 +1474,7 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
     
     // Update status bar colors
     if (status_bar_ != nullptr) {
-        lv_color_t accent = (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT;
+        lv_color_t accent = AccentColor();
         lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
         lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
         lv_obj_set_style_text_color(status_bar_, accent, 0);

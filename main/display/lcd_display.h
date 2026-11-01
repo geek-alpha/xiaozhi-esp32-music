@@ -46,6 +46,10 @@ protected:
     lv_obj_t* hair_image_ = nullptr;
     const lv_image_dsc_t* hair_img_ = nullptr;
     uint32_t hair_color_ = 0x76A6FF;  // 原发色，不染色时和旧版长得一模一样
+    // HUD 主色，0 = 跟随主题默认（light 品红 / dark 青）。配过就整屏顶栏+底图动态一起换
+    uint32_t accent_color_ = 0;
+    // 整屏染色强度 0~10，要和 accent_color_ 一起存 NVS，否则重启后颜色回来了、染层却没了
+    int accent_strength_ = 3;
     lv_obj_t* mouth_image_ = nullptr;
     lv_obj_t* blink_image_ = nullptr;
     // 眨眼贴片上再压一层：贴片会带出「睁眼时被眼球挡住的刘海」，按发色把它染掉
@@ -76,6 +80,8 @@ protected:
 
     DisplayFonts fonts_;
     ThemeColors current_theme_;
+    // 当前该用的 HUD 主色：配过用 accent_color_，没配按深浅主题取默认
+    lv_color_t AccentColor() const;
 
     void SetupUI();
     virtual bool Lock(int timeout_ms = 0) override;
@@ -137,6 +143,7 @@ public:
     void BlinkTick();
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetHairColor(uint32_t rgb) override;
+    virtual void SetAccentColor(uint32_t rgb, int strength = -1) override;
     virtual void SetIcon(const char* icon) override;
     virtual void SetMusicInfo(const char* song_name) override;
     virtual void SetWeatherText(const char* text) override;
