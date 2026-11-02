@@ -103,7 +103,11 @@ static void StartArmWave(lv_obj_t* arms, uint32_t per_frame_ms, bool loop = true
     lv_anim_set_repeat_count(&a, loop ? LV_ANIM_REPEAT_INFINITE : 0);
     lv_anim_set_path_cb(&a, lv_anim_path_linear);
     lv_anim_start(&a);
-    ESP_LOGI(TAG, "Arm wave: %d frames x %dms%s", (int)kArmFrameCount, (int)per_frame_ms,
+    // 这里原来打的是 ESP_LOGI：每摆一次手就往 taskLVGL 里压一层 vfprintf，
+    // 实测每 80 余秒一次 Core1 LoadStoreAlignment panic 重启，崩溃栈顶就是这行
+    // （lvgl_port_task → lv_timer → BlinkTick → StartArmWave → esp_log_write → _vfprintf_r）。
+    // 它在 100ms 定时器热路径上，诊断价值为零，留成 DEBUG 由编译期裁掉
+    ESP_LOGD(TAG, "Arm wave: %d frames x %dms%s", (int)kArmFrameCount, (int)per_frame_ms,
              loop ? "" : " once");
 }
 
