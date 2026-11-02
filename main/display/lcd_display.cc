@@ -350,6 +350,9 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = 1;
+    // 默认 7168 字节扛不住 LVGL9 分层重绘的递归深度（refr_obj/lv_obj_redraw 交替），
+    // 会踩到任务栈外触发间歇性 LoadStoreAlignment / MMU entry fault panic。
+    port_cfg.task_stack = 16 * 1024;
     port_cfg.timer_period_ms = 50;
     lvgl_port_init(&port_cfg);
 
