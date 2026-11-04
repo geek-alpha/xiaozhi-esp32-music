@@ -63,7 +63,10 @@ private:
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
     static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB缓冲区（降低以减少brownout风险）
-    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）
+    static constexpr size_t MIN_BUFFER_SIZE = 48 * 1024;   // 起播门槛：约3秒(128kbps)，起得稳一点
+    // 断流后恢复播放的门槛：实测拉流 13KB/s 略低于 128kbps(16KB/s)，等 64KB 就是每断一次静音 5 秒。
+    // 8KB≈0.5 秒，既不会每次抖动都破音，也不会把一次断流拖成一条长静音。
+    static constexpr size_t RESUME_BUFFER_SIZE = 8 * 1024;
     
     // MP3解码器相关
     HMP3Decoder mp3_decoder_;
@@ -80,8 +83,18 @@ private:
     // 0=普通播放；1=该上报完整提醒事件（最后一次收尾）；2=后面还有声，先静默
     int NextReminderStage(std::string& label, std::string& at);
 
+    // 电台是无限流：断了自动重连、永远没有「播完」那一刻，所以不上报 music_finished，
+    // 也不参与歌单连播。换台/停止都走同一个覆盖路径。
+    std::atomic<bool> is_radio_{false};
+
+    // 起播是否真的连上：StartStreaming 只保证线程起了，MCP 却据此回「已开始播放」。
+    // 实测 20ms 就回成功，HTTP 还在握手；用户等到的是「说播了但没声」。
+    std::atomic<bool> first_audio_ready_{false};
+
     // 私有方法
     void DownloadAudioStream(const std::string& music_url);
+    // 单次连接读到结尾/断流；live_stream 为 true 时外层会自己连回来（电台用）
+    void StreamSession(const std::string& music_url, size_t& round_bytes, size_t& total_downloaded, bool& live_stream);
     void PlayAudioStream();
     void ClearAudioBuffer();
     bool InitializeMp3Decoder();
@@ -146,6 +159,17 @@ public:
     // songs_json: [{"audio_url":..,"lyric_text":..,"title":..,"artist":..}, ...]
     // 整张歌单一次下发，设备自己按顺序连播；手动停下/换歌即清队列。
     bool PlayQueue(const std::string& songs_json);
+
+    // 电台：station 走内置台表（支持别名/中文），url 非空则直接用它（用户自己给地址）。
+    // index 是 BrowseRadio 返回的序号（1 起），传了它就不用再靠台名匹配。
+    // 返回 false 表示查不到这个台，或者用户只是泛泛说了句「放广播」——后者要去先给用户挑。
+    bool PlayRadio(const std::string& station, const std::string& url, int index = 0);
+    // 按用户需求（「学习的时候」「开车」「睡前」）挑候选台，只返回 JSON 不播放。
+    static std::string BrowseRadio(const std::string& want);
+    // station 里有没有具体台名：剥掉「电台/广播/听/放」这些泛称词后什么都不剩就是没有
+    static bool IsGenericRadioName(const std::string& station);
+    // 内置台名清单，AI 拿它给用户挑
+    static std::string RadioStationNames();
     virtual bool StopStreaming() override;  // 停止流式播放
     virtual size_t GetBufferSize() const override { return buffer_size_; }
     virtual bool IsDownloading() const override { return is_downloading_; }

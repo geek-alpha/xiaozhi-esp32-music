@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_pthread.h>
 #include <esp_timer.h>
+#include <esp_wifi.h>
 #include <mbedtls/sha256.h>
 #include <cJSON.h>
 #include <cstring>
@@ -22,7 +23,46 @@
 #include <freertos/task.h>
 #include <sdkconfig.h>
 
+#include <utility>
+
 #define TAG "Esp32Music"
+
+// 内部 RAM 见底时 std::thread 构造会抛 system_error，没人接就是 terminate→abort→整机重启
+// （radio7.log:346：播放中说完一句「换个电台」就重启了）。这些后台线程都是锦上添花，
+// 栈优先落 PSRAM，再兜一层 catch：建不起来就跳过，绝不拖整机重启。
+template <typename Fn>
+static bool StartBgThread(std::thread &slot, const char *name, Fn &&fn)
+{
+    if (slot.joinable())
+    {
+        ESP_LOGW(TAG, "bg thread %s: previous still joinable, skipped", name);
+        return false;
+    }
+
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.thread_name = name;
+    cfg.prio = 5;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= 64 * 1024)
+    {
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    }
+    esp_pthread_set_cfg(&cfg);
+    // cfg 是线程局部的，会污染本线程后面建的所有线程，用完立刻还原
+    esp_pthread_cfg_t restore = esp_pthread_get_default_config();
+
+    bool ok = false;
+    try
+    {
+        slot = std::thread(std::forward<Fn>(fn));
+        ok = true;
+    }
+    catch (const std::exception &e)
+    {
+        ESP_LOGE(TAG, "bg thread %s failed: %s", name, e.what());
+    }
+    esp_pthread_set_cfg(&restore);
+    return ok;
+}
 
 // 自查接口基地址：默认留空 —— 设备不再绑任何服务器 IP，播歌靠 MCP 接入点下发直链。
 // 菜单里手动填了 XZ_MUSIC_API_BASE 才会启用旧的自查路径（保留给离线调试）。
@@ -543,7 +583,34 @@ bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &l
     ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
     ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
     song_name_displayed_ = false; // 重置歌名显示标志
-    StartStreaming(current_music_url_);
+    first_audio_ready_ = false;
+    if (!StartStreaming(current_music_url_))
+    {
+        // 线程起不来（内部 RAM 耗尽）时以前照样往上报成功，界面显示在播、耳朵里一点声音都没有
+        ESP_LOGE(TAG, "StartStreaming failed for: %s", audio_url.c_str());
+        current_song_name_.clear();
+        is_radio_ = false;
+        return false;
+    }
+
+    // 线程起来不等于有声音：HTTP 可能还在握手、DNS 不通、被墙、服务器 5xx。
+    // 以前这里直接 return true，MCP 回「已开始播放」，用户面对的是一片静默——
+    // 播放失败的唯一可靠判据是「首块音频真的进了缓冲区」。
+    const int kFirstAudioTimeoutMs = 4000;
+    int waited_ms = 0;
+    while (!first_audio_ready_ && is_downloading_ && waited_ms < kFirstAudioTimeoutMs)
+    {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited_ms += 50;
+    }
+    if (!first_audio_ready_)
+    {
+        ESP_LOGE(TAG, "No audio within %d ms, start failed: %s", kFirstAudioTimeoutMs, audio_url.c_str());
+        StopStreaming();
+        current_song_name_.clear();
+        is_radio_ = false;
+        return false;
+    }
 
     if (lyric_url.empty())
     {
@@ -571,7 +638,7 @@ bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &l
     is_lyric_running_ = true;
     current_lyric_index_ = -1;
     lyrics_.clear();
-    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); });
     return true;
 }
 
@@ -606,6 +673,9 @@ bool Esp32Music::PlayDirect(const std::string &audio_url, const std::string &lyr
                             const std::string &lyric_text, const std::string &title,
                             const std::string &artist)
 {
+    // 点播就不是电台了：先清掉电台语义，否则这条歌放完会被当成直播流不上报
+    is_radio_ = false;
+
     if (audio_url.empty())
     {
         ESP_LOGE(TAG, "PlayDirect called without audio_url");
@@ -629,9 +699,372 @@ bool Esp32Music::PlayDirect(const std::string &audio_url, const std::string &lyr
     return PlayResolved(audio_url, lyric_url, name);
 }
 
+// 内置电台表：全是 http 明文 MP3 流。解码链路只认 MP3，HLS/AAC 的台放不了，别往里加。
+struct RadioStation
+{
+    const char *aliases; // 用 | 分隔：用户和大模型可能喊的各种叫法
+    const char *name;
+    const char *url;
+    // scene：品类/使用场景标签，用 | 分隔。AI 拿用户的需求（「学习」「开车」「睡前」）跟它对齐，
+    // 所以这里写的是「人话」而不是台名里出现的字。
+    const char *scene;
+    // desc：一句话风格，候选清单直接念给用户听，别让大模型自己编。
+    const char *desc;
+};
+
+// 全部国内源、全部 MP3 直链（固件只解 MP3，不支持 HLS/AAC）。
+// 实测每家 14~16KB/s、首字节 0.2~1.8s，64k 流留了一倍余量；换源前先量，别凭台名挑。
+// 下表里 2026-11 新增的 26 个台，都经 tools/probe_all.py 实测：audio/mpeg、首字节 <1s、瞬时 ≥30KB/s。
+// 顺序有语义：同分时排前面的赢，音乐台故意排在交通/新闻台之前。
+// 想加台：先用 tools/probe_all.py 实测（audio/mpeg、首字节 <1s、瞬时 ≥12KB/s），过了再进表。
+static const RadioStation RADIO_STATIONS[] = {
+    {"华语|金曲|经典|老歌|中文歌", "华语金曲500", "https://lhttp.qtfm.cn/live/5022308/64k.mp3",
+     "华语|金曲|老歌|怀旧|流行|随便听|背景音|无脑听", "华语金曲一直连播，不用挑歌，当背景音最省心"},
+    {"中国之声|新闻|cnr|中央台", "中国之声", "https://lhttp.qtfm.cn/live/15318317/64k.mp3",
+     "新闻|时事|资讯|央媒|严肃|了解大事", "央广中国之声，全天新闻和评论，想知道发生了什么就听它"},
+    {"广东|粤语|gd", "广东音乐之声", "https://lhttp.qtfm.cn/live/1260/64k.mp3",
+     "粤语|广东|流行|音乐", "粤语流行歌为主，广东本地音乐台"},
+    {"江苏|南京|js", "江苏经典流行音乐广播", "https://lhttp.qtfm.cn/live/4938/64k.mp3",
+     "江苏|南京|流行|经典|音乐", "江苏本地流行金曲频道"},
+    {"两广|广西", "两广之声音乐台", "https://lhttp.qtfm.cn/live/20500149/64k.mp3",
+     "两广|广西|音乐|方言", "两广地区音乐台，带点南方式口味"},
+    {"清晨|早晨|早安", "清晨音乐台", "http://lhttp.qingting.fm/live/4915/64k.mp3",
+     "清晨|早晨|起床|通勤|轻快|上班路上", "早晨轻快音乐，起床和上班路上听刚好"},
+    {"怀集", "怀集音乐之声", "https://lhttp.qingting.fm/live/4804/64k.mp3",
+     "怀集|小城|本地|音乐", "怀集本地音乐广播"},
+    {"动听", "动听音乐台", "https://lhttp-hw.qtfm.cn/live/5022107/64k.mp3",
+     "流行|音乐|动听|好歌", "流行好歌连播"},
+    {"星空|star", "星空电台", "https://lhttp-hw.qtfm.cn/live/5022379/64k.mp3",
+     "夜间|放松|助眠|安静|星空|一个人", "夜里慢慢播的音乐，适合放松和睡前"},
+    {"国际新闻|环球新闻|国际台", "国际新闻", "https://lhttp.qtfm.cn/live/20500172/64k.mp3",
+     "国际|环球|新闻|时事|国外", "国际新闻资讯，关注外面的世界"},
+    {"粤语台|港澳|亚洲粤语|asia", "亚洲粤语台", "https://lhttp.qtfm.cn/live/15318569/64k.mp3",
+     "粤语|港澳|老歌|亚洲", "粤语歌和港味内容"},
+    {"浙江音乐|浙江音乐调频|浙江", "浙江音乐调频", "https://lhttp.qtfm.cn/live/4866/64k.mp3",
+     "浙江|杭州|音乐|流行", "浙江音乐调频，本地收听率很高"},
+    {"山东音乐|山东经典|山东", "山东经典音乐广播", "https://lhttp.qtfm.cn/live/20240/64k.mp3",
+     "山东|经典|音乐|老歌", "山东经典音乐广播"},
+    {"辽宁音乐|辽宁经典|辽宁", "辽宁经典音乐广播", "https://lhttp.qtfm.cn/live/20021/64k.mp3",
+     "辽宁|经典|音乐|老歌", "辽宁经典音乐广播"},
+    {"重庆音乐|重庆", "重庆音乐广播", "https://lhttp.qtfm.cn/live/647/64k.mp3",
+     "重庆|音乐|流行", "重庆音乐广播"},
+    {"海南音乐|海南", "海南音乐广播", "https://lhttp.qtfm.cn/live/4878/64k.mp3",
+     "海南|音乐|轻松|海边", "海南音乐广播，调子轻快"},
+    {"上海音乐|沸点|上海", "上海沸点100音乐广播", "https://lhttp.qtfm.cn/live/5022341/64k.mp3",
+     "上海|流行|音乐|潮流|新歌", "上海流行音乐台，新歌跟得紧"},
+    {"城市音乐|cityfm|city", "CityFM城市音乐台", "https://lhttp.qtfm.cn/live/20500153/64k.mp3",
+     "城市|流行|音乐|通勤", "城市流行音乐，适合通勤时听"},
+    {"怀旧|怀旧金曲|964", "怀旧金曲964", "https://lhttp.qtfm.cn/live/5021555/64k.mp3",
+     "怀旧|老歌|回忆|年代|经典", "怀旧老歌，听的都是以前的旋律"},
+    {"年代音乐|年代|1022", "年代音乐1022", "https://lhttp.qtfm.cn/live/20500066/64k.mp3",
+     "年代|老歌|经典|回忆", "年代金曲，按年代排歌"},
+    {"芒果|芒果音乐|湖南音乐|湖南", "芒果音乐台", "https://lhttp.qtfm.cn/live/4979/64k.mp3",
+     "湖南|芒果|流行|音乐|综艺", "湖南芒果音乐台，流行和综艺感"},
+    {"欧美音乐|欧美|英文歌|外文", "欧美音乐88.7", "https://lhttp.qtfm.cn/live/15318703/64k.mp3",
+     "欧美|英文|外文|外语|西式", "欧美流行音乐，练耳朵也能听"},
+    {"经典905|经典音乐|905", "经典音乐FM90.5", "https://lhttp.qtfm.cn/live/20212269/64k.mp3",
+     "古典|纯音乐|轻音乐|学习|专注|工作|安静|不吵", "纯音乐和古典为主，学习工作时听它不抢注意力"},
+    {"太原音乐|太原", "太原音乐广播", "https://lhttp.qtfm.cn/live/1185/64k.mp3",
+     "太原|山西|音乐", "太原音乐广播"},
+    {"南通音乐|南通", "南通音乐广播", "https://lhttp.qtfm.cn/live/21275/64k.mp3",
+     "南通|江苏|音乐", "南通音乐广播"},
+    {"宜昌音乐|宜昌", "宜昌音乐广播", "https://lhttp.qtfm.cn/live/20567/64k.mp3",
+     "宜昌|湖北|音乐", "宜昌音乐广播"},
+    {"安阳音乐|安阳", "安阳音乐广播", "https://lhttp.qtfm.cn/live/2123/64k.mp3",
+     "安阳|河南|音乐", "安阳音乐广播"},
+    {"好音乐|濮阳", "濮阳好音乐1023", "https://lhttp.qtfm.cn/live/5021461/64k.mp3",
+     "濮阳|河南|音乐", "濮阳好音乐频道"},
+    {"珠江|珠江之声", "珠江之声", "https://lhttp.qtfm.cn/live/470/64k.mp3",
+     "珠江|广东|粤语|综合|新闻", "珠江经济台，粤语综合内容加新闻"},
+    {"四川交通|四川", "四川交通广播FM101.7", "https://lhttp.qtfm.cn/live/4886/64k.mp3",
+     "四川|成都|交通|路况|开车|堵车", "四川路况和交通资讯，开车时听"},
+    {"广东交通|广东交通之声", "广东交通之声", "https://lhttp.qtfm.cn/live/1262/64k.mp3",
+     "广东|交通|路况|开车|堵车", "广东路况和交通资讯"},
+    {"深圳交通|深圳", "深圳交通频率", "https://lhttp.qtfm.cn/live/1272/64k.mp3",
+     "深圳|交通|路况|开车|堵车", "深圳路况和交通资讯"},
+    {"杭州交通|杭州", "杭州交通91.8", "https://lhttp.qtfm.cn/live/1133/64k.mp3",
+     "杭州|交通|路况|开车|堵车", "杭州路况，开车通勤用得上"},
+    {"无锡交通|无锡", "无锡交通广播", "https://lhttp.qtfm.cn/live/2780/64k.mp3",
+     "无锡|交通|路况|开车|堵车", "无锡路况和交通资讯"},
+    {"重庆之声|重庆新闻", "重庆之声", "https://lhttp.qtfm.cn/live/1498/64k.mp3",
+     "重庆|新闻|综合|民生", "重庆本地新闻和民生话题"},
+    {"北京新闻|北京", "北京新闻广播", "https://lhttp.qtfm.cn/live/339/64k.mp3",
+     "北京|新闻|民生|本地", "北京本地新闻，早晚高峰有路况"},
+    {"广州新闻|广州", "广州新闻电台", "https://lhttp.qtfm.cn/live/4848/64k.mp3",
+     "广州|新闻|民生|粤语", "广州本地新闻台"},
+};
+
+static std::string ToLowerAscii(const std::string &in)
+{
+    std::string out = in;
+    for (char &c : out)
+    {
+        if (c >= 'A' && c <= 'Z')
+        {
+            c = (char)(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+// 打分制：谁跟用户说的话重合得更具体，谁赢。
+// 不能用「命中就返回」：中国之声的别名是「新闻」，会把「北京新闻广播」这种点名抢走。
+static int StationScore(const std::string &want, const RadioStation &station)
+{
+    std::string keyword = ToLowerAscii(want);
+    if (keyword.size() < 2)
+    { // 单字符会把所有台都匹配上
+        return 0;
+    }
+
+    std::string name = ToLowerAscii(station.name);
+    if (name == keyword)
+    {
+        return 1000;
+    }
+
+    int best = 0;
+    if (name.find(keyword) != std::string::npos)
+    {
+        best = (int)keyword.size(); // 用户说的词完整落在台名里
+    }
+    if (keyword.find(name) != std::string::npos)
+    {
+        best = std::max(best, (int)name.size()); // 用户说了台名的超集（「放广州新闻电台」）
+    }
+
+    std::string aliases = station.aliases;
+    size_t start = 0;
+    while (start < aliases.size())
+    {
+        size_t bar = aliases.find('|', start);
+        std::string alias = ToLowerAscii(aliases.substr(start, bar == std::string::npos ? std::string::npos : bar - start));
+        if (alias.size() >= 2 && keyword.find(alias) != std::string::npos)
+        {
+            // 别名一模一样（用户就喊了这个名字）高分，仅仅包含则按长度比
+            best = std::max(best, (int)(alias == keyword ? 900 : alias.size()));
+        }
+        if (bar == std::string::npos)
+        {
+            break;
+        }
+        start = bar + 1;
+    }
+    return best;
+}
+
+// 「放广播」「听电台」和「北京新闻广播」都带"电台/广播"，前者是泛称、后者是点名。
+// 把泛称词剥干再判长度：剥空了才是泛称，否则拿剩下的实义词去匹配，避免泛称被名字长的台抢走。
+static bool IsGenericRadioRequest(const std::string &station)
+{
+    static const char *GENERIC_WORDS[] = {
+        "广播电台", "收音机", "电台", "广播", "radio", "listen", "music",
+        "音乐", "听", "放", "点", "个", "首", "一", "下", "来", "我", "想", "要", "台",
+        "随便", "什么", "啥", "好听", "帮我", "给我", "现在", "就", "吧", "啊", "呢", "了", "的", "些",
+    };
+    std::string rest = ToLowerAscii(station);
+    for (bool changed = true; changed;)
+    {
+        changed = false;
+        for (const char *w : GENERIC_WORDS)
+        {
+            size_t pos = rest.find(w);
+            if (pos != std::string::npos)
+            {
+                rest.erase(pos, strlen(w));
+                changed = true;
+            }
+        }
+    }
+    return rest.size() < 2; // 剥完只剩空或单字节标点，说明用户没点名
+}
+
+
+// 用户说的是需求而不是台名（「想学习的时候听点」「开车路上」）时用这个跟 scene 对齐。
+// 设备端只做字面兜底，真正的语义判断交给云端大模型——它拿到候选清单自己挑。
+static int StationWantScore(const std::string &want, const RadioStation &station)
+{
+    int best = StationScore(want, station) * 10;
+    std::string list = ToLowerAscii(station.scene);
+    size_t start = 0;
+    while (start < list.size())
+    {
+        size_t bar = list.find('|', start);
+        std::string tag = list.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+        // UTF-8 中文词至少 6 字节，短于 3 字节的单字会把什么都匹配上
+        if (tag.size() >= 3 && ToLowerAscii(want).find(tag) != std::string::npos)
+        {
+            best = std::max(best, (int)tag.size() * 10);
+        }
+        if (bar == std::string::npos)
+        {
+            break;
+        }
+        start = bar + 1;
+    }
+    return best;
+}
+
+// 把用户的需求变成候选台清单（JSON），只查不播。
+// 用户选哪个，再由大模型回传 index 或台名——选择权在用户手上，设备不替他定。
+std::string Esp32Music::BrowseRadio(const std::string &want)
+{
+    const int kCount = (int)(sizeof(RADIO_STATIONS) / sizeof(RADIO_STATIONS[0]));
+    const int kMax = 6;
+    int hit[kMax];
+    int hit_score[kMax];
+    int hits = 0;
+
+    for (int i = 0; i < kCount; i++)
+    {
+        int score = want.empty() ? 1 : StationWantScore(want, RADIO_STATIONS[i]);
+        if (score <= 0)
+        {
+            continue;
+        }
+        // 插入排序维护前 kMax 名，比全部排一遍便宜，也不用 STL 容器
+        int pos = (hits < kMax) ? hits : kMax - 1;
+        if (hits < kMax)
+        {
+            hits++;
+        }
+        else if (score <= hit_score[kMax - 1])
+        {
+            continue;
+        }
+        while (pos > 0 && hit_score[pos - 1] < score)
+        {
+            hit_score[pos] = hit_score[pos - 1];
+            hit[pos] = hit[pos - 1];
+            pos--;
+        }
+        hit_score[pos] = score;
+        hit[pos] = i;
+    }
+
+    // 字面一个都没对上：退回前几个通用台，清单绝不能空。
+    // 空清单等于把「哪种台合适」全推给大模型猜，它会自己编台名出来。
+    bool fallback = false;
+    if (hits == 0)
+    {
+        fallback = true;
+        for (int i = 0; i < kMax && i < kCount; i++)
+        {
+            hit[hits++] = i;
+        }
+    }
+
+    std::string json = "{\"count\":" + std::to_string(hits) + ",\"fallback\":" + (fallback ? "true" : "false") +
+                       ",\"stations\":[";
+    for (int i = 0; i < hits; i++)
+    {
+        const RadioStation &s = RADIO_STATIONS[hit[i]];
+        if (i)
+        {
+            json += ",";
+        }
+        json += "{\"index\":" + std::to_string(hit[i] + 1) + ",\"name\":\"" + s.name + "\",\"desc\":\"" +
+                s.desc + "\",\"scene\":\"" + s.scene + "\"}";
+    }
+    json += "]}";
+    return json;
+}
+
+bool Esp32Music::IsGenericRadioName(const std::string &station)
+{
+    return IsGenericRadioRequest(station);
+}
+
+// 电台和歌是两套语义：点播会紧接着排下一首，电台是无限流，绝不能让它接上歌单
+bool Esp32Music::PlayRadio(const std::string &station, const std::string &url, int index)
+{
+    std::string stream_url = url;
+    std::string name = station;
+
+    const int kCount = (int)(sizeof(RADIO_STATIONS) / sizeof(RADIO_STATIONS[0]));
+
+    // 按序号播：多字台名（「上海沸点100音乐广播」）让大模型复述容易念错，序号最稳
+    if (stream_url.empty() && index > 0)
+    {
+        if (index > kCount)
+        {
+            ESP_LOGW(TAG, "Radio index out of range: %d", index);
+            return false;
+        }
+        stream_url = RADIO_STATIONS[index - 1].url;
+        name = RADIO_STATIONS[index - 1].name;
+    }
+
+    if (stream_url.empty())
+    {
+        // 泛称必须先生效，否则「放广播」会被名字里带「广播」的台（江苏/山东/辽宁…）抢先命中
+        bool generic = IsGenericRadioRequest(station);
+        if (!generic)
+        {
+            int best_score = 0;
+            const RadioStation *best = nullptr;
+            for (const auto &candidate : RADIO_STATIONS)
+            {
+                int score = StationScore(station, candidate);
+                if (score > best_score)
+                {
+                    best_score = score;
+                    best = &candidate;
+                }
+            }
+            if (best)
+            {
+                stream_url = best->url;
+                name = best->name;
+            }
+        }
+        if (stream_url.empty())
+        {
+            // 泛称不再默认播第一个台：那样等于替用户做了选择。
+            // 交给大模型先调 browse_radio 把候选念给用户听，用户选完再回来播。
+            if (!generic)
+            {
+                ESP_LOGW(TAG, "Radio station not found: %s", station.c_str());
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Generic radio request '%s' -> let user choose", station.c_str());
+            }
+            return false;
+        }
+    }
+    else if (name.empty())
+    {
+        name = "电台";
+    }
+
+    ClearQueue();
+    is_radio_ = true;
+    current_song_name_ = name;
+    last_downloaded_data_ = stream_url;
+    ESP_LOGI(TAG, "PlayRadio: %s -> %s", name.c_str(), stream_url.c_str());
+    return PlayResolved(stream_url, "", name);
+}
+
+std::string Esp32Music::RadioStationNames()
+{
+    std::string out;
+    for (const auto &station : RADIO_STATIONS)
+    {
+        if (!out.empty())
+        {
+            out += "、";
+        }
+        out += station.name;
+    }
+    return out;
+}
+
 // 播放队列：一次下发整张歌单，设备自己按顺序连播
 bool Esp32Music::PlayQueueItem(const QueueItem &item)
 {
+    is_radio_ = false;
+
     if (item.audio_url.empty())
     {
         ESP_LOGE(TAG, "Queue item without audio_url: %s", item.title.c_str());
@@ -752,18 +1185,26 @@ bool Esp32Music::PlayNextFromQueue()
 
     // 不能在播放线程里直接起下一首：StartStreaming 会 join play_thread_，那就是当前线程自己。
     // 用独立线程接力，旧线程 return 后这次 join 立即返回。
-    std::thread([this, next]() {
-        vTaskDelay(pdMS_TO_TICKS(300));
-        if (!queue_active_.load())
-        {
-            ESP_LOGI(TAG, "Queue: cancelled before %s started", next.title.c_str());
-            return;
-        }
-        if (!PlayQueueItem(next))
-        {
-            ESP_LOGW(TAG, "Queue: failed to start %s", next.title.c_str());
-        }
-    }).detach();
+    std::thread next_thread;
+    if (StartBgThread(next_thread, "next_track", [this, next]() {
+            vTaskDelay(pdMS_TO_TICKS(300));
+            if (!queue_active_.load())
+            {
+                ESP_LOGI(TAG, "Queue: cancelled before %s started", next.title.c_str());
+                return;
+            }
+            if (!PlayQueueItem(next))
+            {
+                ESP_LOGW(TAG, "Queue: failed to start %s", next.title.c_str());
+            }
+        }))
+    {
+        next_thread.detach();
+    }
+    else
+    {
+        return false;
+    }
 
     return true;
 }
@@ -789,7 +1230,12 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
         return false;
     }
 
-    ESP_LOGD(TAG, "Starting streaming for URL: %s", music_url.c_str());
+    ESP_LOGI(TAG, "Starting streaming for URL: %s", music_url.c_str());
+
+    // 省电模式会把射频周期性停掉，实测拉流 5~6KB/s 且忽高忽低，64k 流(8KB/s)扛不住。
+    // 只在流播放期间关，待机仍按默认省电。
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  try {
 
     // 停止之前的播放和下载
     is_downloading_ = false;
@@ -802,7 +1248,11 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all(); // 通知线程退出
         }
-        download_thread_.join();
+        try {
+            download_thread_.join();
+        } catch (const std::exception& e) {
+            ESP_LOGW(TAG, "join download failed: %s", e.what());
+        }
     }
     if (play_thread_.joinable())
     {
@@ -810,30 +1260,56 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all(); // 通知线程退出
         }
-        play_thread_.join();
+        try {
+            play_thread_.join();
+        } catch (const std::exception& e) {
+            ESP_LOGW(TAG, "join play failed: %s", e.what());
+        }
     }
 
     // 清空缓冲区
     ClearAudioBuffer();
 
-    // 配置线程栈大小以避免栈溢出
-    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = 8192; // 8KB栈大小
-    cfg.prio = 5;          // 中等优先级
-    cfg.thread_name = "audio_stream";
-    esp_pthread_set_cfg(&cfg);
+    // 栈必须放 PSRAM：内部 RAM 常态只剩 10~20KB（AEC+显示+opus 占着），
+    // 线程栈从这里要 8KB 就会 ENOMEM；而 ENOMEM 后 libstdc++ 抛异常自己也要内存，
+    // 抛不出来就 std::terminate → abort → 整机重启（radio6.log:325）。
+    // 有 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y，栈可以直接落 PSRAM。
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < 128 * 1024)
+    {
+        ESP_LOGE(TAG, "PSRAM too low for stream threads: %d bytes",
+                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        return false;
+    }
 
-    // 开始下载线程
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = 12288; // pcm_buffer 一个局部就 4.5KB，12KB 留足余量
+    cfg.prio = 5;           // 中等优先级
+    cfg.thread_name = "audio_stream";
+    cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    esp_err_t cfg_ret = esp_pthread_set_cfg(&cfg);
+    if (cfg_ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_pthread_set_cfg failed: %d", (int)cfg_ret);
+    }
+
+    // 先置两个标志再起线程：下载线程的 while 看的就是这两个，晚一步就会自己退出
     is_downloading_ = true;
+    is_playing_ = true;
     download_thread_ = std::thread(&Esp32Music::DownloadAudioStream, this, music_url);
 
     // 开始播放线程（会等待缓冲区有足够数据）
-    is_playing_ = true;
     play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
+
+    // cfg 挂在调用线程上，用完立刻恢复默认，别让后面别的线程也继承 PSRAM 栈
+    esp_pthread_cfg_t restore = esp_pthread_get_default_config();
+    esp_pthread_set_cfg(&restore);
 
     ESP_LOGI(TAG, "Streaming threads started successfully");
 
     return true;
+  } catch (const std::exception &e) {
+    ESP_LOGE(TAG, "StartStreaming failed: %s", e.what());
+    return false;
+  }
 }
 
 // 停止流式播放
@@ -943,6 +1419,7 @@ bool Esp32Music::StopStreaming()
 }
 
 // 流式下载音频数据
+// 电台这类无尽流被掐断要自己接回来；点播文件读到 EOF 就是正常结束，不重连
 void Esp32Music::DownloadAudioStream(const std::string &music_url)
 {
     ESP_LOGD(TAG, "Starting audio stream download from: %s", music_url.c_str());
@@ -955,6 +1432,62 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
         return;
     }
 
+    const size_t RECONNECT_RESET_BYTES = 512 * 1024; // 一轮拿到这么多数据说明链路通着，失败计数清零
+    const int MAX_RECONNECT_FAILS = 20;              // 断开后重连：20 轮是给“已经出过声”的容忍度
+    // 首连一个字节都没拿到就别用 20 轮：1s→2s→4s→8s 退 20 次 ≈ 2 分钟静音屏。
+    // 连不上就 2 次内认输，让 MCP 把失败回给 AI，用户才知道该换台。
+    const int MAX_FIRST_CONNECT_FAILS = 2;
+    size_t total_downloaded = 0;
+    bool live_stream = false;
+    int reconnect_fails = 0;
+
+    while (is_downloading_ && is_playing_)
+    {
+        size_t round_bytes = 0;
+        StreamSession(music_url, round_bytes, total_downloaded, live_stream);
+
+        if (!is_downloading_ || !is_playing_ || !live_stream)
+        {
+            break;
+        }
+        if (round_bytes >= RECONNECT_RESET_BYTES)
+        {
+            reconnect_fails = 0;
+        }
+        int limit = (total_downloaded == 0) ? MAX_FIRST_CONNECT_FAILS : MAX_RECONNECT_FAILS;
+        if (++reconnect_fails > limit)
+        {
+            ESP_LOGE(TAG, "Live stream unreachable after %d retries, total %u bytes, giving up",
+                     limit, (unsigned)total_downloaded);
+            break;
+        }
+
+        int delay_ms = (total_downloaded == 0)
+                           ? 1000
+                           : (1000 << (reconnect_fails > 3 ? 3 : reconnect_fails - 1)); // 1s→2s→4s→8s封顶
+        ESP_LOGW(TAG, "Live stream dropped after %u bytes, reconnect #%d in %d ms",
+                 (unsigned)round_bytes, reconnect_fails, delay_ms);
+        // 分片睡：用户一按停/切歌，立刻就能退出
+        for (int slept = 0; slept < delay_ms && is_downloading_ && is_playing_; slept += 100)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    is_downloading_ = false;
+
+    // 通知播放线程下载完成
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+
+    ESP_LOGI(TAG, "Audio stream download thread finished");
+}
+
+// 单次连接读到结尾或断流都算这一轮结束，要不要重连由外层决定
+void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes, size_t &total_downloaded, bool &live_stream)
+{
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
 
@@ -969,7 +1502,6 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
     if (!http->Open("GET", music_url))
     {
         ESP_LOGE(TAG, "Failed to connect to music stream URL");
-        is_downloading_ = false;
         return;
     }
 
@@ -978,20 +1510,31 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
     { // 206 for partial content
         ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
         http->Close();
-        is_downloading_ = false;
         return;
     }
 
     ESP_LOGI(TAG, "Started downloading audio stream, status: %d", status_code);
 
+    // 电台（icecast 无限流）不报 Content-Length，读到 EOF 只是被掐断；点播文件报了长度，EOF 就是真的放完了
+    if (http->GetResponseHeader("Content-Length").empty())
+    {
+        live_stream = true;
+        ESP_LOGI(TAG, "No Content-Length, treat as live stream");
+    }
+
     // 分块读取音频数据
     const size_t chunk_size = 4096; // 4KB每块
     char buffer[chunk_size];
-    size_t total_downloaded = 0;
+    bool fatal = false;
 
     while (is_downloading_ && is_playing_)
     {
         int bytes_read = http->Read(buffer, chunk_size);
+        static int dbg_read = 0;
+        if (dbg_read++ < 8)
+        {
+            ESP_LOGI(TAG, "DBG read #%d: %d bytes", dbg_read, bytes_read);
+        }
         if (bytes_read < 0)
         {
             ESP_LOGE(TAG, "Failed to read audio data: error code %d", bytes_read);
@@ -999,8 +1542,36 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
         }
         if (bytes_read == 0)
         {
-            ESP_LOGI(TAG, "Audio stream download completed, total: %d bytes", total_downloaded);
+            if (live_stream)
+            {
+                ESP_LOGI(TAG, "Live stream closed by server, total: %d bytes", (int)total_downloaded);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Audio stream download completed, total: %d bytes", (int)total_downloaded);
+            }
             break;
+        }
+
+        // 首块数据落地才算这条流真的通了：PlayResolved 在等这个标志决定回真成功还是真失败
+        first_audio_ready_ = true;
+
+        // 拉流速率 vs 码率才是电台卡不卡的第一判据：128kbps 需要 16KB/s，供不上就必然周期性断流
+        {
+            static int64_t net_t0 = esp_timer_get_time();
+            static size_t net_bytes = 0;
+            net_bytes += bytes_read;
+            int64_t net_now = esp_timer_get_time();
+            if (net_now - net_t0 >= 2000000)
+            {
+                float kbs = net_bytes / 1024.0f * 1e6f / (net_now - net_t0);
+                wifi_ap_record_t ap = {};
+                int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+                ESP_LOGW(TAG, "DIAG net: %.1f KB/s (128kbps needs 16.0) buf=%dKB rssi=%d",
+                         kbs, (int)(buffer_size_ / 1024), rssi);
+                net_t0 = net_now;
+                net_bytes = 0;
+            }
         }
 
         // 打印数据块信息
@@ -1021,7 +1592,7 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
         }
 
         // 尝试检测文件格式（检查文件头）
-        if (total_downloaded == 0 && bytes_read >= 4)
+        if (round_bytes == 0 && bytes_read >= 4)
         {
             if (memcmp(buffer, "ID3", 3) == 0)
             {
@@ -1056,6 +1627,7 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
         if (!chunk_data)
         {
             ESP_LOGE(TAG, "Failed to allocate memory for audio chunk");
+            fatal = true;
             break;
         }
         memcpy(chunk_data, buffer, bytes_read);
@@ -1071,6 +1643,7 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
                 audio_buffer_.push(AudioChunk(chunk_data, bytes_read));
                 buffer_size_ += bytes_read;
                 total_downloaded += bytes_read;
+                round_bytes += bytes_read;
 
                 // 通知播放线程有新数据
                 buffer_cv_.notify_one();
@@ -1089,15 +1662,16 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
     }
 
     http->Close();
-    is_downloading_ = false;
 
-    // 通知播放线程下载完成
+    if (fatal)
     {
+        is_downloading_ = false;
         std::lock_guard<std::mutex> lock(buffer_mutex_);
         buffer_cv_.notify_all();
     }
 
-    ESP_LOGI(TAG, "Audio stream download thread finished");
+    ESP_LOGI(TAG, "Stream session ended, this round: %u bytes, total: %u bytes",
+             (unsigned)round_bytes, (unsigned)total_downloaded);
 }
 
 // 流式播放音频数据
@@ -1125,12 +1699,15 @@ void Esp32Music::PlayAudioStream()
         return;
     }
 
-    // 等待缓冲区有足够数据开始播放
+    // 等缓冲区攒够数据再开播。谓词必须带 is_playing_：不然停播时 notify 也叫不醒它，
+    // StopStreaming 只能等 1 秒后 detach —— 旧播放线程还活着，下次 StartStreaming 又把
+    // is_playing_ 置回 true，它就跟新线程一起抢 buffer 和解码器。
     {
         std::unique_lock<std::mutex> lock(buffer_mutex_);
         buffer_cv_.wait(lock, [this]
-                        { return buffer_size_ >= MIN_BUFFER_SIZE || (!is_downloading_ && !audio_buffer_.empty()); });
+                        { return buffer_size_ >= MIN_BUFFER_SIZE || !is_playing_ || (!is_downloading_ && !audio_buffer_.empty()); });
     }
+
 
     ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
     ESP_LOGI(TAG, "Starting playback with buffer size: %d", buffer_size_);
@@ -1142,6 +1719,13 @@ void Esp32Music::PlayAudioStream()
     // 等 device 回 idle 的计时。会话续接、服务端握手都可能把它长时间占在非 idle，
     // 闹钟不能被这件事卡死，所以等够就强制抢一次通道。
     int state_wait_ticks = 0;
+
+    // TEMP-DIAG：卡顿到底卡在网络还是卡在解码/写 I2S，靠这三项分得清
+    std::vector<int16_t> mono_buffer;
+    int diag_underruns = 0;
+    int64_t diag_last_write_us = 0;
+    int64_t diag_max_cycle_us = 0;
+    int64_t diag_report_us = esp_timer_get_time();
 
     // 分配MP3输入缓冲区
     mp3_input_buffer = (uint8_t *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
@@ -1205,8 +1789,10 @@ void Esp32Music::PlayAudioStream()
             auto display = board.GetDisplay();
             if (display)
             {
-                // 格式化歌名显示为《歌名》播放中...
-                std::string formatted_song_name = "《" + current_song_name_ + "》播放中...";
+                // 电台不是「歌」：没有《》也不该写「播放中」，它是没有尽头的一条流
+                std::string formatted_song_name = is_radio_.load()
+                                                      ? current_song_name_ + " · 直播中"
+                                                      : "《" + current_song_name_ + "》播放中...";
                 display->SetMusicInfo(formatted_song_name.c_str());
                 ESP_LOGI(TAG, "Displaying song name: %s", formatted_song_name.c_str());
                 song_name_displayed_ = true;
@@ -1243,9 +1829,11 @@ void Esp32Music::PlayAudioStream()
                         ESP_LOGI(TAG, "Playback finished, total played: %d bytes", total_played);
                         break;
                     }
-                    // 等待新数据
+                    // 断流恢复：等回一大段再继续。只等 4KB(0.25s) 就接着放的话，
+                    // 每次网络抖动都变成一次破音，电台听感就是一直在卡。
+                    diag_underruns++;
                     buffer_cv_.wait(lock, [this]
-                                    { return !audio_buffer_.empty() || !is_downloading_; });
+                                    { return buffer_size_ >= RESUME_BUFFER_SIZE || !is_downloading_; });
                     if (audio_buffer_.empty())
                     {
                         continue;
@@ -1350,7 +1938,6 @@ void Esp32Music::PlayAudioStream()
             {
                 int16_t *final_pcm_data = pcm_buffer;
                 int final_sample_count = mp3_frame_info_.outputSamps;
-                std::vector<int16_t> mono_buffer;
 
                 // 如果是双通道，转换为单通道混合
                 if (mp3_frame_info_.nChans == 2)
@@ -1404,17 +1991,54 @@ void Esp32Music::PlayAudioStream()
                         MALLOC_CAP_SPIRAM);
                 }
 
-                memcpy(
-                    final_pcm_data_fft,
-                    final_pcm_data,
-                    final_sample_count * sizeof(int16_t));
+                // 只有频谱模式才有人读这份拷贝：歌词模式下每帧白拷 2KB 进 PSRAM，
+                // 播放线程不该为没人看的画面多干一次活。
+                if (display_mode_ == DISPLAY_MODE_SPECTRUM)
+                {
+                    memcpy(
+                        final_pcm_data_fft,
+                        final_pcm_data,
+                        final_sample_count * sizeof(int16_t));
+                }
 
                 ESP_LOGD(TAG, "Sending %d PCM samples (%d bytes, rate=%d, channels=%d->1) to Application",
                          final_sample_count, pcm_size_bytes, mp3_frame_info_.samprate, mp3_frame_info_.nChans);
 
                 // 发送到Application的音频解码队列
+                if (total_frames_decoded_ <= 6)
+                {
+                    ESP_LOGI(TAG, "DBG push in #%d: samples=%d rate=%d state=%d free=%u",
+                             (int)total_frames_decoded_, final_sample_count, packet.sample_rate,
+                             (int)app.GetDeviceState(),
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                }
                 app.AddAudioData(std::move(packet));
+                if (total_frames_decoded_ <= 6)
+                {
+                    ESP_LOGI(TAG, "DBG push out #%d: total=%d", (int)total_frames_decoded_, (int)total_played);
+                }
                 total_played += pcm_size_bytes;
+
+                // 一次循环 = 一帧(约26ms)：正常应该贴着音频时钟走，
+                // 明显超过一帧就说明这一帧里被别的事挡住了
+                int64_t now_us = esp_timer_get_time();
+                if (diag_last_write_us > 0)
+                {
+                    int64_t cycle = now_us - diag_last_write_us;
+                    if (cycle > diag_max_cycle_us)
+                    {
+                        diag_max_cycle_us = cycle;
+                    }
+                }
+                diag_last_write_us = now_us;
+                if (now_us - diag_report_us > 2000000)
+                {
+                    ESP_LOGI(TAG, "DIAG play: underruns=%d buf=%uKB maxcycle=%dms",
+                             diag_underruns, (unsigned)(buffer_size_ / 1024),
+                             (int)(diag_max_cycle_us / 1000));
+                    diag_report_us = now_us;
+                    diag_max_cycle_us = 0;
+                }
 
                 // 打印播放进度
                 if (total_played % (128 * 1024) == 0)
@@ -1426,6 +2050,13 @@ void Esp32Music::PlayAudioStream()
         else
         {
             // 解码失败
+            static int dbg_fail = 0;
+            if (dbg_fail++ < 6)
+            {
+                ESP_LOGW(TAG, "DBG decode fail %d: err=%d bytes_left=%d off=%d",
+                         dbg_fail, decode_result, bytes_left,
+                         (int)(read_ptr - mp3_input_buffer));
+            }
             ESP_LOGW(TAG, "MP3 decode failed with error: %d", decode_result);
 
             // 跳过一些字节继续尝试
@@ -1527,7 +2158,8 @@ void Esp32Music::PlayAudioStream()
         // "detect is only for wake, don't send long texts"——按协议 detect 的 text 只能是唤醒词。
         // 事情已经由本地 TTS 念出来了，AI 想知道细节就查 self.alarm.list 的 last_fired。
     }
-    else if (reminder_stage == 0)
+    // 电台结束是被掐断/彻底连不上，不是「放完了」：报上去 AI 会开口说《台名》放完了
+    else if (reminder_stage == 0 && !is_radio_.load())
     {
         // 设备是 MCP server，AI 侧没有轮询设备的能力，只能靠上行通知告诉它这首放完了。
         std::string title = json_escape(current_song_name_);
@@ -1960,7 +2592,7 @@ bool Esp32Music::StartLyricsWithContent(const std::string &lrc)
 
     is_lyric_running_ = true;
     current_lyric_index_ = -1;
-    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); });
     return true;
 }
 

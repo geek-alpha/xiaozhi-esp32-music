@@ -13,6 +13,10 @@
 
 #define AUDIO_CODEC_DMA_DESC_NUM 6
 #define AUDIO_CODEC_DMA_FRAME_NUM 240
+// 播放侧单独加厚：6×240 在 44.1kHz 下只有 32.6ms，WiFi 一次调度抖动就够把 DMA 掏空、直接断音。
+// 16×320 = 5120 帧 ≈ 116ms@44.1k，给播放线程留出补数据的余量；麦克风仍用上面的原值，不拖长录音延迟。
+#define AUDIO_CODEC_TX_DMA_DESC_NUM 16
+#define AUDIO_CODEC_TX_DMA_FRAME_NUM 320
 #define AUDIO_CODEC_DEFAULT_MIC_GAIN 30.0
 
 class AudioCodec {

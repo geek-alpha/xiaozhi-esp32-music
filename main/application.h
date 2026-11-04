@@ -98,6 +98,9 @@ private:
     // 为音频让路：closing 只拦紧接着那一次同步回调，wants_resume 记着播完该不该接回
     std::atomic<bool> audio_suspend_closing_{false};
     std::atomic<bool> audio_suspend_wants_resume_{false};
+    // 整段音频播放期间都为 true。closing 只是一次脉冲，挡不住服务端 goodbye 引出的
+    // 第二次 close 回调——第二次会被当成断连去续接，把刚起播的歌直接掐掉。
+    std::atomic<bool> audio_owns_channel_{false};
     std::atomic<int64_t> last_activity_us_{0};
     TaskHandle_t check_new_version_task_handle_ = nullptr;
 

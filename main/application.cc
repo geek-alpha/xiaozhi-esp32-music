@@ -485,12 +485,17 @@ void Application::Start()
         } });
     protocol_->OnAudioChannelClosed([this, &board]()
                                     {
-        board.SetPowerSaveMode(true);
+        // 播放期间不能开 modem sleep：电台是持续收流，省电会把收包攒到 beacon，
+        // 几十毫秒的接收空档正好撞上 I2S 只有 32ms 的硬件缓冲，听感就是一直卡。
+        if (!audio_owns_channel_) {
+            board.SetPowerSaveMode(true);
+        }
         // 服务端 goodbye 只是它收尾这一轮，不等于用户要待机。
         // user_stopped_ 要留到下个会话开始再清：手动待机时服务端会回一条 goodbye，
         bool stopped = user_stopped_;
-        // 是音乐/提醒把通道借走了，不是会话真断：别当成断连去续接
-        bool for_audio = audio_suspend_closing_.exchange(false);
+        // 是音乐/提醒把通道借走了，不是会话真断：别当成断连去续接。
+        // audio_owns_channel_ 覆盖整段播放：goodbye 会引来第二次 close，脉冲挡不住它。
+        bool for_audio = audio_suspend_closing_.exchange(false) || audio_owns_channel_;
         // 通道只活了几秒就被服务端收尾：算一次抖动，退避拉长，别把重连打成攻击
         bool quick = (esp_timer_get_time() - channel_opened_us_) < 3000000;
         Schedule([this, stopped, for_audio, quick]() {
@@ -747,6 +752,21 @@ void Application::MainEventLoop()
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
             }
+
+            // 音乐播放中用户开口 = 要打断。这是唯一能落到「用户意图」的信号：
+            // 唤醒词在音频处理器跑起来后是关着的，想打断只能直接说话。
+            // 但设备自己 TTS 说话时不行：这块板 AEC 参考通道没接上（日志 AEC: ref=109 frames=0），
+            // 扬声器声音直接灌回麦克风，VAD 必然把尾音判成人声 —— AI 一说完「已开播」就把刚起的台停掉，
+            // 实测 radio14.log 里 61 次误停，每次都是 total played 0 bytes。
+            if (device_state_ != kDeviceStateSpeaking && audio_service_.IsVoiceDetected())
+            {
+                auto music = Board::GetInstance().GetMusic();
+                if (music)
+                {
+                    ESP_LOGI(TAG, "Stopping music streaming: user started speaking");
+                    music->StopStreaming();
+                }
+            }
         }
 
         if (bits & MAIN_EVENT_SCHEDULE)
@@ -823,7 +843,10 @@ void Application::SuspendSessionForAudio()
     // 所以这里不能因为 protocol_ 为空、或状态是 connecting 就少走一步。
     bool was_alive = (device_state_ != kDeviceStateIdle);
     audio_suspend_wants_resume_ = was_alive;
+    audio_owns_channel_ = true;
     resume_pending_ = false;
+    // 独占通道这段时间网络要持续供数据，modem sleep 一开就是周期性断供
+    Board::GetInstance().SetPowerSaveMode(false);
     ESP_LOGI(TAG, "Audio needs the channel, session suspended (resume after: %d)", was_alive);
     if (protocol_)
     {
@@ -838,9 +861,12 @@ void Application::ResumeAfterAudio()
 {
     bool wanted = audio_suspend_wants_resume_;
     audio_suspend_wants_resume_ = false;
+    audio_owns_channel_ = false;
     audio_suspend_closing_ = false;
     if (!wanted || user_stopped_)
     {
+        // 播放彻底结束、也不接回会话：把 modem sleep 还给系统
+        Board::GetInstance().SetPowerSaveMode(true);
         return;
     }
     resume_pending_ = true;
@@ -912,17 +938,9 @@ void Application::SetDeviceState(DeviceState state)
     auto led = board.GetLed();
     led->OnStateChanged();
 
-    // 当从idle状态变成其他任何状态时，停止音乐播放
-    if (previous_state == kDeviceStateIdle && state != kDeviceStateIdle)
-    {
-        auto music = board.GetMusic();
-        if (music)
-        {
-            ESP_LOGI(TAG, "Stopping music streaming due to state change: %s -> %s",
-                     STATE_STRINGS[previous_state], STATE_STRINGS[state]);
-            music->StopStreaming();
-        }
-    }
+    // 停音乐只认「用户真开口」这一个信号，见 VAD 事件与 OnWakeWordDetected。
+    // 这里不能按状态停：tts 播完服务端会自己把状态打回 listening，那是系统行为，
+    // 跟着停就等于每句「已经开播啦」都亲手把刚起的歌掐掉。
 
     switch (state)
     {

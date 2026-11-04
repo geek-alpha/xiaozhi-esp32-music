@@ -254,7 +254,7 @@ McpServer::McpServer() {
      auto music = board.GetMusic();
      if (music) {
         AddTool("self.music.play_song",
-            "播放歌曲。有 `audio_url` 就直推直链；没直链只传 `song_name` 也行 —— 设备自己联网解析。\n"
+            "播放一首具体的歌（歌名或歌手明确时用）。用户说“听广播/电台/随便听听/放点背景音乐”时不要用它，改调 self.music.play_radio。\n"
             "参数:\n"
             "  `audio_url`: 可直连的音频直链（有就传，最快）。\n"
             "  `lyric_text`: LRC 歌词正文（强烈建议传）—— 设备本地解析，不必访问任何地址。\n"
@@ -319,6 +319,66 @@ McpServer::McpServer() {
                  return "{\"success\": true, \"message\": \"歌单已开始连播\"}";
              });
  
+
+         AddTool("self.music.browse_radio",
+             "用户说的是想听什么「场景/感觉」而不是具体台名时，用它找候选台"
+             "（“想听点适合学习的”“开车路上听的”“睡前想安静点”“有没有怀旧的”“想听粤语”“想听新闻”）。\n"
+             "只查不播。拿到清单后挑 2~3 个，用地道口语把台名和风格念给用户听，问他要哪个。\n"
+             "参数:\n"
+             "  `want`: 需求关键词（学习、专注、开车、睡前、怀旧、粤语、新闻、某个城市）。留空返回一批通用台。\n"
+             "返回:\n"
+             "  {\"count\":N,\"stations\":[{\"index\":序号,\"name\":台名,\"desc\":一句话风格}]}\n"
+             "  用户定下哪个，用 self.music.play_radio 带 index 播，别自己编台名。清单为空就把需求问细一点。",
+             PropertyList({
+                 Property("want", kPropertyTypeString, "")
+             }),
+             [](const PropertyList& properties) -> ReturnValue {
+                 return Esp32Music::BrowseRadio(properties["want"].value<std::string>());
+             });
+
+         AddTool("self.music.play_radio",
+             "播放某个具体电台（无限直播流）。用户点名了台名、或者从候选里挑定了，用它。\n"
+             "用户只是模糊表达（“放个广播”“随便听点什么”“想听适合学习的”）时先调 self.music.browse_radio，"
+             "把候选念给用户挑，他选完再带 index 回来播——别替用户挑一个就播。\n"
+             "参数:\n"
+             "  `station`: 台名或别名（用户点名时传，如 中国之声、广东、浙江音乐、怀旧、北京新闻）\n"
+             "  `index`: browse_radio 返回的序号（用户从候选里挑定时传，最稳，不会念错台名）\n"
+             "  `url`: 音频流直链（用户自己给了地址才传）\n"
+             "返回:\n"
+             "  success=true 才是真播上了。need_choice=true 说明用户没点名：把 candidates 念成 2~3 个选择给他。\n"
+             "  success=false 且带 available：台名对不上，照 available 让用户重选。",
+             PropertyList({
+                 Property("station", kPropertyTypeString, ""),
+                 Property("index", kPropertyTypeInteger, 0, 0, 999),
+                 Property("url", kPropertyTypeString, "")
+             }),
+             [music](const PropertyList& properties) -> ReturnValue {
+                 auto station = properties["station"].value<std::string>();
+                 auto url = properties["url"].value<std::string>();
+                 auto index = properties["index"].value<int>();
+                 if (url.empty() && index <= 0 && Esp32Music::IsGenericRadioName(station)) {
+                     return "{\"success\": false, \"need_choice\": true, \"candidates\": " +
+                            Esp32Music::BrowseRadio("") +
+                            ", \"message\": \"用户没点名，别替他挑。从 candidates 里挑 2~3 个，连台名带风格念给他，问他要哪个。\"}";
+                 }
+                 auto esp32_music = static_cast<Esp32Music*>(music);
+                 if (!esp32_music->PlayRadio(station, url, index)) {
+                     return "{\"success\": false, \"message\": \"电台没播起来（4 秒内没拉到一个字节音频）。台名对不上就照 available 让用户重选；对得上就是网络或源不可达。要如实说没放出来，绝不能说已开播。\", \"available\": \"" + Esp32Music::RadioStationNames() + "\"}";
+                 }
+                 return "{\"success\": true, \"message\": \"电台已开始播放\"}";
+             });
+
+         AddTool("self.music.stop",
+             "停止当前播放：歌曲、歌单、电台都停，顺带丢掉排队的下一首。\n"
+             "参数: 无。\n"
+             "返回:\n"
+             "  停止结果。用户说“停/别放了/关掉音乐/关掉广播”就用它。",
+             PropertyList(),
+             [music](const PropertyList& properties) -> ReturnValue {
+                 auto esp32_music = static_cast<Esp32Music*>(music);
+                 esp32_music->StopStreaming();
+                 return "{\"success\": true, \"message\": \"已停止播放\"}";
+             });
 
          AddTool("self.music.set_display_mode",
              "设置音乐播放时的显示模式。可以选择显示频谱或歌词，比如用户说‘打开频谱’或者‘显示频谱’，‘打开歌词’或者‘显示歌词’就设置对应的显示模式。\n"
@@ -667,9 +727,14 @@ McpServer::McpServer() {
          return;
      }
  
-     if (next_cursor.empty()) {
-         json += "]}";
-     } else {
+    // 服务器端只会看到这一页里的工具，分页丢了什么必须能从串口看出来
+    ESP_LOGI(TAG, "tools/list: %d tools registered, page payload=%u bytes, next=%s",
+             (int)tools_.size(), (unsigned)json.size(),
+             next_cursor.empty() ? "none" : next_cursor.c_str());
+
+    if (next_cursor.empty()) {
+        json += "]}";
+    } else {
          json += "],\"nextCursor\":\"" + next_cursor + "\"}";
      }
      
@@ -730,23 +795,49 @@ McpServer::McpServer() {
         ESP_LOGI(TAG, "tools/call %s args: (none)", tool_name.c_str());
     }
 
-    // Start a task to receive data with stack size
+    // 播放音频时内部 RAM 会掉到 1.7KB，6KB 内部栈建线程必然失败；
+    // 而 std::thread 失败是抛 system_error，没人接就 terminate→abort 重启。
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-     cfg.thread_name = "tool_call";
-     cfg.stack_size = stack_size;
-     cfg.prio = 1;
-     esp_pthread_set_cfg(&cfg);
- 
-     // Use a thread to call the tool to avoid blocking the main thread
-    tool_call_thread_ = std::thread([this, id, tool_iter, tool_name, arguments = std::move(arguments)]() {
+    cfg.thread_name = "tool_call";
+    cfg.stack_size = stack_size;
+    cfg.prio = 1;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= 64 * 1024) {
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    }
+    esp_pthread_set_cfg(&cfg);
+    // cfg 是线程局部的，会污染本线程后面建的所有线程，用完立刻还原
+    esp_pthread_cfg_t restore = esp_pthread_get_default_config();
+
+    PropertyList fallback_args = arguments;
+    bool started = false;
+    try {
+        // Use a thread to call the tool to avoid blocking the main thread
+        tool_call_thread_ = std::thread([this, id, tool_iter, tool_name, arguments = std::move(arguments)]() {
+            try {
+                std::string result = (*tool_iter)->Call(arguments);
+                ESP_LOGI(TAG, "tools/call %s -> %.220s", tool_name.c_str(), result.c_str());
+                ReplyResult(id, result);
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "tools/call: %s", e.what());
+                ReplyError(id, e.what());
+            }
+        });
+        tool_call_thread_.detach();
+        started = true;
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "tool_call thread failed (%s), running synchronously", e.what());
+    }
+    esp_pthread_set_cfg(&restore);
+
+    // 建不起线程就同步执行：这个线程只是为了不阻塞 MQTT，慢一点也远好过重启
+    if (!started) {
         try {
-            std::string result = (*tool_iter)->Call(arguments);
+            std::string result = (*tool_iter)->Call(fallback_args);
             ESP_LOGI(TAG, "tools/call %s -> %.220s", tool_name.c_str(), result.c_str());
             ReplyResult(id, result);
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
             ReplyError(id, e.what());
         }
-    });
-     tool_call_thread_.detach();
+    }
  }
