@@ -313,9 +313,11 @@ void Weather::Load() {
     city_ = settings.GetString("city");
     lat_text_ = settings.GetString("lat");
     lon_text_ = settings.GetString("lon");
+    // 老版本只存了 IP 定位结果、没有 manual 键：缺省当 auto，让存量设备重新跟网络走
+    manual_ = settings.GetString("manual") == "1";
     // 城市名和坐标是两个来源，靠这行才能看出它们到底对得上不对
-    ESP_LOGI(TAG, "Loaded city=%s lat=%s lon=%s", city_.c_str(), lat_text_.c_str(),
-             lon_text_.c_str());
+    ESP_LOGI(TAG, "Loaded city=%s lat=%s lon=%s manual=%d", city_.c_str(), lat_text_.c_str(),
+             lon_text_.c_str(), manual_ ? 1 : 0);
 }
 
 void Weather::Loop() {
@@ -369,7 +371,8 @@ bool Weather::Locate() {
             settings.SetString("city", name);
             settings.SetString("lat", lat_buf);
             settings.SetString("lon", lon_buf);
-            ESP_LOGI(TAG, "Located: %s (%s, %s)", name.c_str(), lat_buf, lon_buf);
+            settings.SetString("manual", "0");
+            ESP_LOGI(TAG, "Located by IP: %s (%s, %s)", name.c_str(), lat_buf, lon_buf);
             ok = true;
         }
     }
@@ -436,11 +439,15 @@ bool Weather::Refresh() {
         lon_text = lon_text_;
     }
 
-    // 只要没城市就去定位；用户手动报的地名不能拿 IP 坐标盖掉
-    if (city.empty()) {
-        if (!Locate()) {
+    // 手动报过的地名不能被 IP 盖掉；auto 模式下每轮都重新定位，设备换地方城市就跟着变
+    bool located = false;
+    if (!manual_) {
+        located = Locate();
+        if (!located && city.empty()) {
             return false;
         }
+    }
+    if (located || city.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
         city = city_;
         lat_text = lat_text_;
@@ -646,7 +653,13 @@ std::string Weather::SetCity(const std::string& city) {
     settings.SetString("city", name);
     settings.SetString("lat", "");
     settings.SetString("lon", "");
-    ESP_LOGI(TAG, "City set to %s, waiting for refresh", name.c_str());
+    // 用户亲手报的地名：之后 IP 定位再也不能把它换掉，直到用户说跟着网络走
+    settings.SetString("manual", "1");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        manual_ = true;
+    }
+    ESP_LOGI(TAG, "City set to %s (manual), waiting for refresh", name.c_str());
 
     refresh_requested_.exchange(true);
     // 等真拉到天气再回话，否则 AI 会报一个屏幕上根本没有的城市
@@ -659,4 +672,33 @@ std::string Weather::SetCity(const std::string& city) {
     }
     return "{\"success\": false, \"message\": \"没查到「" + name +
            "」的天气，地名可能不对\"}";
+}
+
+std::string Weather::UseIpLocation() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        manual_ = false;
+        city_.clear();
+        lat_text_.clear();
+        lon_text_.clear();
+        text_.clear();
+        detail_.clear();
+        aqi_ = -1;
+    }
+    Settings settings("weather", true);
+    settings.SetString("manual", "0");
+    settings.SetString("city", "");
+    settings.SetString("lat", "");
+    settings.SetString("lon", "");
+    ESP_LOGI(TAG, "Switched back to IP location, waiting for refresh");
+
+    refresh_requested_.exchange(true);
+    for (int i = 0; i < 15; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!text_.empty()) {
+            return "{\"success\": true, \"city\": \"" + city_ + "\", \"now\": \"" + text_ + "\"}";
+        }
+    }
+    return "{\"success\": false, \"message\": \"没定位到，出口 IP 可能是机房或者海外\"}";
 }

@@ -13,8 +13,10 @@
  *
  * 三个免 key 的 http 接口（都支持明文 http，省掉 TLS 证书那一套）：
  * ip-api 给中文城市名 + 经纬度，open-meteo 按坐标给实况 + 今日高低温 + 日落，
- * air-quality-api 给 PM2.5。坐标存 NVS —— 定位一次就不再问 ip-api，
- * 免得出口 IP 漂移把城市悄悄换掉。
+ * air-quality-api 给 PM2.5。
+ *
+ * 定位有两种模式：默认 auto——每次刷新都按出口 IP 重新定位，设备换网络、换地方
+ * 城市就自己跟着变；用户报过地名之后变 manual，IP 再也盖不掉它。
  */
 class Weather {
 public:
@@ -27,6 +29,8 @@ public:
     std::string Detail();
     // 换城市（用户报地名）。等它真拉到天气才返回 success，拉不到就报错回去
     std::string SetCity(const std::string& city);
+    // 丢掉手动设定的城市，回到「跟着出口 IP 走」的模式
+    std::string UseIpLocation();
 
 private:
     Weather() = default;
@@ -45,6 +49,7 @@ private:
     std::string city_;
     std::string lat_text_;
     std::string lon_text_;
+    bool manual_ = false;  // 城市是用户报的还是 IP 定位来的；手动的 IP 不许盖
     int aqi_ = -1;  // -1 = 这个位置拿不到空气质量
     std::atomic<bool> refresh_requested_{false};
     TaskHandle_t task_ = nullptr;

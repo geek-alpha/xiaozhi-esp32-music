@@ -336,6 +336,7 @@ McpServer::McpServer() {
                  return Esp32Music::BrowseRadio(properties["want"].value<std::string>());
              });
 
+
          AddTool("self.music.play_radio",
              "播放某个具体电台（无限直播流）。用户点名了台名、或者从候选里挑定了，用它。\n"
              "用户只是模糊表达（“放个广播”“随便听点什么”“想听适合学习的”）时先调 self.music.browse_radio，"
@@ -521,6 +522,16 @@ McpServer::McpServer() {
          }),
          [](const PropertyList& properties) -> ReturnValue {
              return Weather::GetInstance().SetCity(properties["city"].value<std::string>());
+         });
+
+     // 用户搬家了、或者发现城市不对，说“天气位置跟着网络走”时恢复自动定位
+     AddTool("self.weather.auto",
+         "让待机屏天气重新按网络 IP 定位。用户说“天气位置跟着网络走”“按我的位置显示”"
+         "“别用之前那个城市”时用它。\n"
+         " 不用传参。返回 success 时 now 就是定位好的那行字，把城市念给用户。",
+         PropertyList(),
+         [](const PropertyList&) -> ReturnValue {
+             return Weather::GetInstance().UseIpLocation();
          });
 
      AddTool("self.weather.get",
