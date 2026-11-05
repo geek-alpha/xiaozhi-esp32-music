@@ -42,6 +42,9 @@ private:
     
     // 歌词相关
     std::string current_lyric_url_;
+    // 服务端随消息下发的 LRC 正文，暂存到这里，由 lyric 线程解析——解析吃 3KB+ 栈，
+    // 在 MCP/播放线程里直接解析会把调用者栈顶穿（不一定是 12KB 的大栈线程）。
+    std::string pending_lyric_lrc_;
     std::vector<std::pair<int, std::string>> lyrics_;  // 时间戳和歌词文本
     std::mutex lyrics_mutex_;  // 保护lyrics_数组的互斥锁
     std::atomic<int> current_lyric_index_;

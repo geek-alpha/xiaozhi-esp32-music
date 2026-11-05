@@ -30,8 +30,10 @@
 // 内部 RAM 见底时 std::thread 构造会抛 system_error，没人接就是 terminate→abort→整机重启
 // （radio7.log:346：播放中说完一句「换个电台」就重启了）。这些后台线程都是锦上添花，
 // 栈优先落 PSRAM，再兜一层 catch：建不起来就跳过，绝不拖整机重启。
+// 栈必须显式给足：CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT 只有 3072，而 istringstream/string/
+// stoi 这类 libstdc++ 代码一块就要吃掉几 KB（live_play.log:294 的 task lyric 栈溢出就是这么炸的）。
 template <typename Fn>
-static bool StartBgThread(std::thread &slot, const char *name, Fn &&fn)
+static bool StartBgThread(std::thread &slot, const char *name, Fn &&fn, size_t stack_size = 8 * 1024)
 {
     if (slot.joinable())
     {
@@ -42,10 +44,13 @@ static bool StartBgThread(std::thread &slot, const char *name, Fn &&fn)
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
     cfg.thread_name = name;
     cfg.prio = 5;
+    cfg.stack_size = stack_size;
     if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= 64 * 1024)
     {
         cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     }
+    ESP_LOGI(TAG, "bg thread %s: stack=%u caps=%s", name, (unsigned)stack_size,
+             (cfg.stack_alloc_caps & MALLOC_CAP_SPIRAM) ? "PSRAM" : "IRAM");
     esp_pthread_set_cfg(&cfg);
     // cfg 是线程局部的，会污染本线程后面建的所有线程，用完立刻还原
     esp_pthread_cfg_t restore = esp_pthread_get_default_config();
@@ -152,8 +157,8 @@ static void add_auth_headers(Http *http)
         http->SetHeader("X-Timestamp", std::to_string(timestamp));
         http->SetHeader("X-Dynamic-Key", dynamic_key);
 
-        ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld",
-                 mac.c_str(), chip_id.c_str(), timestamp);
+        ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %s",
+                 mac.c_str(), chip_id.c_str(), std::to_string(timestamp).c_str());
     }
 }
 
@@ -638,8 +643,12 @@ bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &l
 
     is_lyric_running_ = true;
     current_lyric_index_ = -1;
-    lyrics_.clear();
-    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); });
+    {
+        std::lock_guard<std::mutex> lock(lyrics_mutex_);
+        lyrics_.clear();
+        pending_lyric_lrc_.clear();
+    }
+    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); }, 12 * 1024);
     return true;
 }
 
@@ -1506,8 +1515,9 @@ void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes
         ESP_LOGE(TAG, "Failed to connect to music stream URL");
         return;
     }
-    ESP_LOGI(TAG, "起播计时: HTTP 建连(DNS+TCP+TLS) %lld ms",
-             (long long)((esp_timer_get_time() - t_open) / 1000));
+    // newlib-nano 不支持 %lld（CONFIG_NEWLIB_NANO_FORMAT=y）：会打出「ld ms」并把后面的参数读错位
+    ESP_LOGI(TAG, "起播计时: HTTP 建连(DNS+TCP+TLS) %d ms",
+             (int)((esp_timer_get_time() - t_open) / 1000));
 
     int status_code = http->GetStatusCode();
     if (status_code != 200 && status_code != 206)
@@ -1714,8 +1724,8 @@ void Esp32Music::PlayAudioStream()
 
 
     ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
-    ESP_LOGI(TAG, "起播计时: 攒够缓冲 %lld ms (buffer=%d)",
-             (long long)((esp_timer_get_time() - stream_start_us_.load()) / 1000), (int)buffer_size_);
+    ESP_LOGI(TAG, "起播计时: 攒够缓冲 %d ms (buffer=%d)",
+             (int)((esp_timer_get_time() - stream_start_us_.load()) / 1000), (int)buffer_size_);
 
     size_t total_played = 0;
     uint8_t *mp3_input_buffer = nullptr;
@@ -1930,8 +1940,8 @@ void Esp32Music::PlayAudioStream()
             // 更新当前播放时间
             current_play_time_ms_ += frame_duration_ms;
 
-            ESP_LOGD(TAG, "Frame %d: time=%lldms, duration=%dms, rate=%d, ch=%d",
-                     total_frames_decoded_, current_play_time_ms_, frame_duration_ms,
+            ESP_LOGD(TAG, "Frame %d: time=%dms, duration=%dms, rate=%d, ch=%d",
+                     total_frames_decoded_, (int)current_play_time_ms_, frame_duration_ms,
                      mp3_frame_info_.samprate, mp3_frame_info_.nChans);
 
             // 更新歌词显示
@@ -2020,8 +2030,8 @@ void Esp32Music::PlayAudioStream()
                 app.AddAudioData(std::move(packet));
                 if (total_frames_decoded_ == 0)
                 {
-                    ESP_LOGI(TAG, "起播计时: 首帧 PCM 送出 %lld ms",
-                             (long long)((esp_timer_get_time() - stream_start_us_.load()) / 1000));
+                    ESP_LOGI(TAG, "起播计时: 首帧 PCM 送出 %d ms",
+                             (int)((esp_timer_get_time() - stream_start_us_.load()) / 1000));
                 }
                 if (total_frames_decoded_ <= 6)
                 {
@@ -2569,7 +2579,8 @@ bool Esp32Music::ParseLyrics(const std::string &lyric_content)
     // 按时间戳排序
     std::sort(lyrics_.begin(), lyrics_.end());
 
-    ESP_LOGI(TAG, "Parsed %d lyric lines", lyrics_.size());
+    ESP_LOGI(TAG, "Parsed %d lyric lines (stack high-water mark left %u bytes)",
+             (int)lyrics_.size(), (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return !lyrics_.empty();
 }
 
@@ -2594,15 +2605,16 @@ bool Esp32Music::StartLyricsWithContent(const std::string &lrc)
         }
     }
 
-    if (!ParseLyrics(lrc))
+    // 不在调用者线程解析：ParseLyrics 吃掉 3KB+ 栈，MCP handler 线程不保证有这么多
     {
-        ESP_LOGW(TAG, "Inline lyrics have no timestamped lines, ignored");
-        return false;
+        std::lock_guard<std::mutex> lock(lyrics_mutex_);
+        pending_lyric_lrc_ = lrc;
+        lyrics_.clear();
     }
 
     is_lyric_running_ = true;
     current_lyric_index_ = -1;
-    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); });
+    StartBgThread(lyric_thread_, "lyric", [this]() { LyricDisplayThread(); }, 12 * 1024);
     return true;
 }
 
@@ -2613,12 +2625,23 @@ void Esp32Music::LyricDisplayThread()
 
     // 歌词正文已随 MCP 消息下发并解析过（lyrics_ 非空）时不必再拉 URL —— 跨公网场景下
     // current_lyric_url_ 是服务端的局域网地址，设备根本连不上。
+    std::string pending;
     bool need_download;
     {
         std::lock_guard<std::mutex> lock(lyrics_mutex_);
+        pending.swap(pending_lyric_lrc_);
         need_download = lyrics_.empty();
     }
-    if (need_download && !DownloadLyrics(current_lyric_url_))
+    if (!pending.empty())
+    {
+        if (!ParseLyrics(pending))
+        {
+            ESP_LOGW(TAG, "Inline lyrics have no timestamped lines, ignored");
+            is_lyric_running_ = false;
+            return;
+        }
+    }
+    else if (need_download && !DownloadLyrics(current_lyric_url_))
     {
         ESP_LOGE(TAG, "Failed to download or parse lyrics");
         is_lyric_running_ = false;
@@ -2687,8 +2710,8 @@ void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms)
             // 显示歌词
             display->SetChatMessage("lyric", lyric_text.c_str());
 
-            ESP_LOGD(TAG, "Lyric update at %lldms: %s",
-                     current_time_ms,
+            ESP_LOGD(TAG, "Lyric update at %dms: %s",
+                     (int)current_time_ms,
                      lyric_text.empty() ? "(no lyric)" : lyric_text.c_str());
         }
     }

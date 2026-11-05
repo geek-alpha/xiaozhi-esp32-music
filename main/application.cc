@@ -901,7 +901,7 @@ void Application::ResumeSession()
         }
         int64_t backoff_us = ResumeBackoffUs(fails);
         resume_due_us_ = esp_timer_get_time() + backoff_us;
-        ESP_LOGW(TAG, "Resume session failed (%d/%d), retry in %lld ms", fails, 4, (long long)(backoff_us / 1000));
+        ESP_LOGW(TAG, "Resume session failed (%d/%d), retry in %d ms", fails, 4, (int)(backoff_us / 1000));
         SetDeviceState(kDeviceStateIdle);
         return;
     }
