@@ -63,7 +63,10 @@ private:
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
     static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB缓冲区（降低以减少brownout风险）
-    static constexpr size_t MIN_BUFFER_SIZE = 48 * 1024;   // 起播门槛：约3秒(128kbps)，起得稳一点
+    // 起播门槛按「够垫一秒」定，不按「起得稳」定：内置台全是 64k 流(8KB/s)，
+    // 48KB 意味着连上之后还要干等 6 秒才有第一帧，加建连就是十秒静默。
+    // 抗抖交给播放中的 RESUME_BUFFER_SIZE 兜，起播慢本身就是坏体验。
+    static constexpr size_t MIN_BUFFER_SIZE = 16 * 1024;
     // 断流后恢复播放的门槛：实测拉流 13KB/s 略低于 128kbps(16KB/s)，等 64KB 就是每断一次静音 5 秒。
     // 8KB≈0.5 秒，既不会每次抖动都破音，也不会把一次断流拖成一条长静音。
     static constexpr size_t RESUME_BUFFER_SIZE = 8 * 1024;
@@ -90,6 +93,8 @@ private:
     // 起播是否真的连上：StartStreaming 只保证线程起了，MCP 却据此回「已开始播放」。
     // 实测 20ms 就回成功，HTTP 还在握手；用户等到的是「说播了但没声」。
     std::atomic<bool> first_audio_ready_{false};
+    // 起播耗时分解用：PlayResolved 记起点，各阶段打差值，用来分清慢在建连还是在攒缓冲
+    std::atomic<int64_t> stream_start_us_{0};
 
     // 私有方法
     void DownloadAudioStream(const std::string& music_url);

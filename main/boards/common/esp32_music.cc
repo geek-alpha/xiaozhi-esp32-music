@@ -580,6 +580,7 @@ bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &l
     }
 
     current_music_url_ = audio_url;
+    stream_start_us_.store(esp_timer_get_time());
     ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
     ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
     song_name_displayed_ = false; // 重置歌名显示标志
@@ -1499,11 +1500,14 @@ void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes
     // 添加ESP32认证头
     add_auth_headers(http.get());
 
+    int64_t t_open = esp_timer_get_time();
     if (!http->Open("GET", music_url))
     {
         ESP_LOGE(TAG, "Failed to connect to music stream URL");
         return;
     }
+    ESP_LOGI(TAG, "起播计时: HTTP 建连(DNS+TCP+TLS) %lld ms",
+             (long long)((esp_timer_get_time() - t_open) / 1000));
 
     int status_code = http->GetStatusCode();
     if (status_code != 200 && status_code != 206)
@@ -1710,7 +1714,8 @@ void Esp32Music::PlayAudioStream()
 
 
     ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
-    ESP_LOGI(TAG, "Starting playback with buffer size: %d", buffer_size_);
+    ESP_LOGI(TAG, "起播计时: 攒够缓冲 %lld ms (buffer=%d)",
+             (long long)((esp_timer_get_time() - stream_start_us_.load()) / 1000), (int)buffer_size_);
 
     size_t total_played = 0;
     uint8_t *mp3_input_buffer = nullptr;
@@ -2013,6 +2018,11 @@ void Esp32Music::PlayAudioStream()
                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 }
                 app.AddAudioData(std::move(packet));
+                if (total_frames_decoded_ == 0)
+                {
+                    ESP_LOGI(TAG, "起播计时: 首帧 PCM 送出 %lld ms",
+                             (long long)((esp_timer_get_time() - stream_start_us_.load()) / 1000));
+                }
                 if (total_frames_decoded_ <= 6)
                 {
                     ESP_LOGI(TAG, "DBG push out #%d: total=%d", (int)total_frames_decoded_, (int)total_played);

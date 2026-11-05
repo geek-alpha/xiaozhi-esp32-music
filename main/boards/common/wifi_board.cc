@@ -11,6 +11,7 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <esp_wifi.h>
 
 #include <wifi_station.h>
 #include <wifi_configuration_ap.h>
@@ -18,6 +19,9 @@
 #include "afsk_demod.h"
 
 static const char *TAG = "WifiBoard";
+
+// -70dBm 是 2.4G 的分水岭：再往下重传率明显抬头，这时还开 modem sleep 就是在给链路添堵
+static constexpr int kWEAK_RSSI_DBM = -70;
 
 WifiBoard::WifiBoard() {
     Settings settings("wifi", true);
@@ -103,9 +107,30 @@ void WifiBoard::StartNetwork() {
         auto display = Board::GetInstance().GetDisplay();
         std::string notification = Lang::Strings::CONNECTED_TO;
         notification += ssid;
+        notification += "...";
         display->ShowNotification(notification.c_str(), 30000);
+
+        // 每次连上都重设一次：带宽是每次与 AP 协商出来的，断线重连后会被打回 40MHz，
+        // 只在开机设一次等于只保护了第一段连接。
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+        // 链路体检：说「信号差」得有数字。RSSI/信道/带宽才是判据
+        wifi_ap_record_t ap_info = {};
+        uint8_t primary = 0;
+        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        wifi_bandwidth_t bw = WIFI_BW_HT20;
+        esp_wifi_sta_get_ap_info(&ap_info);
+        esp_wifi_get_channel(&primary, &second);
+        esp_wifi_get_bandwidth(WIFI_IF_STA, &bw);
+        ESP_LOGI(TAG, "Link up: ssid=%s rssi=%d ch=%d bw=%s",
+                 ssid.c_str(), ap_info.rssi, primary, bw == WIFI_BW_HT40 ? "HT40" : "HT20");
     });
     wifi_station.Start();
+
+    // 2.4G 只有三段不重叠信道，邻居路由器一多，40MHz 就等于主动把干扰面翻倍。
+    // 实测本机 -62~-72dBm 仍在跑 40MHz：边缘信号下高带宽换不来速度，只换来重传和抖动。
+    esp_err_t bw_err = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+    ESP_LOGI(TAG, "Force HT20: %s", esp_err_to_name(bw_err));
 
     // Try to connect to WiFi, if failed, launch the WiFi configuration AP
     if (!wifi_station.WaitForConnected(60 * 1000)) {
@@ -158,6 +183,17 @@ std::string WifiBoard::GetBoardJson() {
 
 void WifiBoard::SetPowerSaveMode(bool enabled) {
     auto& wifi_station = WifiStation::GetInstance();
+
+    // 弱信号下开 modem sleep 等于自断生路：射频按 beacon 周期停摆，漏包只能靠重传来补，
+    // 而重传又要等下一个醒来的窗口。实测本机在 -70~-79dBm 徘徊，这个区间省电换来的全是断流。
+    if (enabled) {
+        wifi_ap_record_t ap = {};
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi < kWEAK_RSSI_DBM) {
+            ESP_LOGI(TAG, "RSSI %d weak, keep radio awake instead of modem sleep", ap.rssi);
+            wifi_station.SetPowerSaveMode(false);
+            return;
+        }
+    }
     wifi_station.SetPowerSaveMode(enabled);
 }
 
