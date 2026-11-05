@@ -1,0 +1,2 @@
+0eb3651e949220a5eebd10e7b61d5d1c8777309b2c17d89b1b791111ef6b3c48  xiaozhi-music-v2.0.23-full.bin
+071d6f12274c86bbd1554f8eaea25c3bd240820f8dc14fa0e6cb497acb54697f  xiaozhi-music-v2.0.23-app-ota.bin

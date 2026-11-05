@@ -1399,10 +1399,19 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
     // 先置两个标志再起线程：下载线程的 while 看的就是这两个，晚一步就会自己退出
     is_downloading_ = true;
     is_playing_ = true;
-    download_thread_ = std::thread(&Esp32Music::DownloadAudioStream, this, music_url);
+    // 包一层 lambda：线程函数任何返回路径都置完成标志，StopStreaming 才等得到真退出
+    download_done_ = false;
+    play_done_ = false;
+    download_thread_ = std::thread([this, music_url]() {
+        DownloadAudioStream(music_url);
+        download_done_ = true;
+    });
 
     // 开始播放线程（会等待缓冲区有足够数据）
-    play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
+    play_thread_ = std::thread([this]() {
+        PlayAudioStream();
+        play_done_ = true;
+    });
 
     // cfg 挂在调用线程上，用完立刻恢复默认，别让后面别的线程也继承 PSRAM 栈
     esp_pthread_cfg_t restore = esp_pthread_get_default_config();
@@ -1417,8 +1426,9 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
   }
 }
 
-// 停止流式播放
-bool Esp32Music::StopStreaming()
+// 停止流式播放。take_back 只由调用方决定：用户开口打断(false→true)要把通道接回，
+// 按键/MCP 主动停就是不要了
+bool Esp32Music::StopStreaming(bool take_back)
 {
     ESP_LOGI(TAG, "Stopping music streaming - current state: downloading=%d, playing=%d",
              is_downloading_.load(), is_playing_.load());
@@ -1426,14 +1436,9 @@ bool Esp32Music::StopStreaming()
     // 手动停止就是不要歌单了，否则下一首会在 300ms 后自己冒出来
     ClearQueue();
 
-    // 重置采样率到原始值
-    ResetSampleRate();
-
-    // 检查是否有流式播放正在进行
     if (!is_playing_ && !is_downloading_)
     {
         ESP_LOGW(TAG, "No streaming in progress");
-        return true;
     }
 
     // 停止下载和播放标志
@@ -1456,57 +1461,54 @@ bool Esp32Music::StopStreaming()
         buffer_cv_.notify_all();
     }
 
-    // 等待线程结束（避免重复代码，让StopStreaming也能等待线程完全停止）
+    // 等线程真退出再动采样率：以前先 ResetSampleRate 再 join，活着的播放线程下一帧
+    // 就把采样率按音乐的 48k 改回来（日志里 24000→48000 来回跳），停歌后链路停在错误值上。
+    // 也别用 joinable() 轮询：join 之前它恒为 true，原来必然等满 1 秒再 detach。
+    // 等待上限压到 600ms：这里的等待是在按键回调里同步跑的，卡满 3 秒就是
+    // 「按下去没反应，再按一下」——用户看到的两次按键。正常情况 is_playing_ 一清，
+    // 播放线程从 cv 谓词直接退出，几十毫秒就 done，长等只发生在下载卡在网络 read 时。
+    int wait_ticks = 0;
+    while (!download_done_.load() && wait_ticks < 60)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ++wait_ticks;
+    }
     if (download_thread_.joinable())
     {
-        download_thread_.join();
-        ESP_LOGI(TAG, "Download thread joined in StopStreaming");
+        if (download_done_.load())
+        {
+            download_thread_.join();
+            ESP_LOGI(TAG, "Download thread joined in StopStreaming");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Download thread join timeout, detaching thread");
+            download_thread_.detach();
+        }
     }
 
-    // 等待播放线程结束，使用更安全的方式
+    wait_ticks = 0;
+    while (!play_done_.load() && wait_ticks < 60)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ++wait_ticks;
+    }
     if (play_thread_.joinable())
     {
-        // 先设置停止标志
-        is_playing_ = false;
-
-        // 通知条件变量，确保线程能够退出
+        if (play_done_.load())
         {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
-            buffer_cv_.notify_all();
+            play_thread_.join();
+            ESP_LOGI(TAG, "Play thread joined in StopStreaming");
         }
-
-        // 使用超时机制等待线程结束，避免死锁
-        bool thread_finished = false;
-        int wait_count = 0;
-        const int max_wait = 100; // 最多等待1秒
-
-        while (!thread_finished && wait_count < max_wait)
+        else
         {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            wait_count++;
-
-            // 检查线程是否仍然可join
-            if (!play_thread_.joinable())
-            {
-                thread_finished = true;
-                break;
-            }
-        }
-
-        if (play_thread_.joinable())
-        {
-            if (wait_count >= max_wait)
-            {
-                ESP_LOGW(TAG, "Play thread join timeout, detaching thread");
-                play_thread_.detach();
-            }
-            else
-            {
-                play_thread_.join();
-                ESP_LOGI(TAG, "Play thread joined in StopStreaming");
-            }
+            ESP_LOGW(TAG, "Play thread join timeout, detaching thread");
+            play_thread_.detach();
         }
     }
+
+    // 线程退了才收尾：采样率必须最后改，否则又被活着的播放线程改回去
+    ResetSampleRate();
 
     // 在线程完全结束后，只在频谱模式下停止FFT显示
     if (display && display_mode_ == DISPLAY_MODE_SPECTRUM)
@@ -1518,6 +1520,13 @@ bool Esp32Music::StopStreaming()
     {
         ESP_LOGI(TAG, "Not in spectrum mode, skipping FFT stop in StopStreaming");
     }
+
+    // 通道账本得在这里清干净：自然播完那条路靠播放线程尾调 ResumeAfterAudio，
+    // 用户中途停止走不到那里。audio_owns_channel_ 留在 true，之后每次通道关闭
+    // 都被当成「音乐借走了」而不续接——屏幕挂着聆听态，说话却没反应。
+    // take_back 透传：开口打断要接回会话，否则就成了屏幕聆听、实际没声音。
+    Application::GetInstance().Schedule([take_back]()
+                                        { Application::GetInstance().ResumeAfterAudio(take_back); });
 
     ESP_LOGI(TAG, "Music streaming stop signal sent");
     return true;

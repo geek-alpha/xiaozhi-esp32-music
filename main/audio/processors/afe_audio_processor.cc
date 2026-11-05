@@ -2,6 +2,13 @@
 #include <esp_log.h>
 
 #define PROCESSOR_RUNNING 0x01
+// reset 必须由持有 afe_data_ 的本任务来做：Stop() 以前在自己线程里直接调
+// reset_buffer，而 AudioProcessorTask 此时正卡在 fetch_with_delay 里读同一个对象，
+// 两线程同时动 AFE 内部 ringbuffer 与状态索引 → 索引错乱，之后 fetch 永远返回
+// ESP_FAIL。fix20.log 实测：第一次 state=speaking（走 Stop）之后 107999ms 起
+// "Error code: -1" + "Ringbuffer of AFE is empty" 每 200ms 一条刷到日志末尾，
+// 屏幕挂着「聆听中」，用户说话完全没反应。
+#define PROCESSOR_RESET   0x02
 
 #define TAG "AfeAudioProcessor"
 
@@ -166,7 +173,8 @@ void AfeAudioProcessor::Start() {
 void AfeAudioProcessor::Stop() {
     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
     if (afe_data_ != nullptr) {
-        afe_iface_->reset_buffer(afe_data_);
+        // 只登记请求，实际 reset 由 AudioProcessorTask 在 fetch 之外执行
+        xEventGroupSetBits(event_group_, PROCESSOR_RESET);
     }
 }
 
@@ -189,9 +197,28 @@ void AfeAudioProcessor::AudioProcessorTask() {
         feed_size, fetch_size);
 
     while (true) {
-        xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
+        // 等「可运行」或「待重置」任一：Stop 之后若用 portMAX_DELAY 只等 RUNNING，
+        // 任务会永久睡死，挂上的 reset 也没人执行。
+        EventBits_t bits = xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING | PROCESSOR_RESET,
+                                               pdFALSE, pdFALSE, portMAX_DELAY);
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        // 此刻本任务不在 fetch 中，动 afe_data_ 才是安全的
+        if (bits & PROCESSOR_RESET) {
+            xEventGroupClearBits(event_group_, PROCESSOR_RESET);
+            afe_iface_->reset_buffer(afe_data_);
+            is_speaking_ = false;
+            output_buffer_.clear();
+        }
+        if ((bits & PROCESSOR_RUNNING) == 0) {
+            continue;
+        }
+
+        // 绝不能无限等：Stop() 只是清位 + reset_buffer，唤不醒已经卡在 fetch 里的本任务；
+        // Start() 又只置位。任务一旦困在 portMAX_DELAY 就再不出不来，feed 那边继续灌，
+        // AFE(FEED) ringbuffer 每秒刷 31 条 full，麦克风数据全丢——屏幕挂着「聆听中」，
+        // 用户说话却没反应（wire 日志 watch2.log 实测）。有限超时让每轮都能回到循环顶部
+        // 重新检查 PROCESSOR_RUNNING，Stop/Start 才真正生效。
+        auto res = afe_iface_->fetch_with_delay(afe_data_, pdMS_TO_TICKS(200));
         if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
             continue;
         }

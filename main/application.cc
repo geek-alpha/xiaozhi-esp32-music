@@ -25,6 +25,10 @@
 // 否则设备一直空转听着，服务端抢在固件前面开口，用户就听到那句尴尬的再见。
 #define LISTENING_IDLE_STANDBY_SEC 45
 
+// 一轮会话里没有唤醒词、自动接话的上限。真人闲聊几轮就到头，能连刷几十轮的
+// 一定是环境音（游戏语音/电视）在喂它，那就该停下来等唤醒词。
+#define AUTO_ROUND_LIMIT 12
+
 // 续接退避：500ms 起翻倍，封顶 30 秒。服务端反复挂断时按这个节奏重连，
 // 不至于把重连打成攻击，也不至于让用户觉得已经待机了。
 static int64_t ResumeBackoffUs(int fails)
@@ -548,6 +552,21 @@ void Application::Start()
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
+                        } else if (++auto_rounds_ > AUTO_ROUND_LIMIT) {
+                            // 一轮里连续这么多次都没等唤醒词就自己接话：房间里一直有声音
+                            // （游戏/电视/别人聊天），它每轮都抢着答，用户真开口时它正忙着答别人，
+                            // 体感就是「说了没反应」。fix23.log 实测 60 轮全程 wake=0，每轮只隔 2~3 秒。
+                            // 回到待机、关麦、重开唤醒词，把主动权交回用户。
+                            auto_rounds_ = 0;
+                            ESP_LOGI(TAG, "Auto rounds over %d, standby until wake word", AUTO_ROUND_LIMIT);
+                            user_stopped_ = true;
+                            resume_pending_ = false;
+                            resume_fail_count_ = 0;
+                            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                                protocol_->CloseAudioChannel();
+                            } else {
+                                SetDeviceState(kDeviceStateIdle);
+                            }
                         } else {
                             SetDeviceState(kDeviceStateListening);
                         }
@@ -760,13 +779,19 @@ void Application::MainEventLoop()
             // 但设备自己 TTS 说话时不行：这块板 AEC 参考通道没接上（日志 AEC: ref=109 frames=0），
             // 扬声器声音直接灌回麦克风，VAD 必然把尾音判成人声 —— AI 一说完「已开播」就把刚起的台停掉，
             // 实测 radio14.log 里 61 次误停，每次都是 total played 0 bytes。
-            if (device_state_ != kDeviceStateSpeaking && audio_service_.IsVoiceDetected())
+            // 必须确认音乐真占着通道才动手：StopStreaming(true) 会走 ResumeAfterAudio(true)，
+            // 把 resume_pending_ 重新挂上、把 resume 时间推到 500ms 后——在没有音乐的正常对话里
+            // 调它，等于自己把刚建立的会话重启一遍。fix21.log 实测：唤醒后 330ms，唤醒提示音的
+            // 回声被判成人声，第一次触发就把会话搅成 connecting→goodbye→resumed 死循环，
+            // 服务端每轮 1 秒挂断，用户看到屏幕挂着「聆听中」却说什么都没反应。
+            if (device_state_ != kDeviceStateSpeaking && audio_owns_channel_ && audio_service_.IsVoiceDetected())
             {
                 auto music = Board::GetInstance().GetMusic();
                 if (music)
                 {
                     ESP_LOGI(TAG, "Stopping music streaming: user started speaking");
-                    music->StopStreaming();
+                    // true：这条路径是用户开口要说话，停完必须把音频通道重开接回
+                    music->StopStreaming(true);
                 }
             }
         }
@@ -805,6 +830,8 @@ void Application::OnWakeWordDetected()
 
         auto wake_word = audio_service_.GetLastWakeWord();
         ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+        // 用户主动喊了，连续对话的轮次重新从零数
+        auto_rounds_ = 0;
         // 唤醒词只负责唤醒。上行唤醒词音频或 wake_word_detected 事件，都会让服务端
         // 把「你好小智」当成用户说的第一句话去回答，所以这里只切状态进入聆听。
         // 提示音必须排在 SetListeningMode 之后：切 listening 会 EnableVoiceProcessing(true)，
@@ -844,7 +871,6 @@ void Application::SuspendSessionForAudio()
     // 播放线程只认 idle 这一个状态：只要不落到 idle 它就一直等，闹钟就永远不出声。
     // 所以这里不能因为 protocol_ 为空、或状态是 connecting 就少走一步。
     bool was_alive = (device_state_ != kDeviceStateIdle);
-    audio_suspend_wants_resume_ = was_alive;
     audio_owns_channel_ = true;
     resume_pending_ = false;
     // 独占通道这段时间网络要持续供数据，modem sleep 一开就是周期性断供
@@ -859,12 +885,18 @@ void Application::SuspendSessionForAudio()
     SetDeviceState(kDeviceStateIdle);
 }
 
-void Application::ResumeAfterAudio()
+void Application::ResumeAfterAudio(bool take_back)
 {
-    bool wanted = audio_suspend_wants_resume_;
-    audio_suspend_wants_resume_ = false;
+    // 不看 audio_suspend_wants_resume_：设备在 Idle 起播时它是 false，会把这个信号吞掉。
+    // take_back=true 就是调用方明确说「用户要说话」，跟起播前在什么状态无关。
+    bool wanted = take_back;
     audio_owns_channel_ = false;
     audio_suspend_closing_ = false;
+    if (!take_back)
+    {
+        // 用户主动掐断：播放线程尾可能已经排上了 500ms 后的自动续接，得一并取消
+        resume_pending_ = false;
+    }
     if (!wanted || user_stopped_)
     {
         // 播放彻底结束、也不接回会话：把 modem sleep 还给系统
@@ -908,13 +940,16 @@ void Application::ResumeSession()
         return;
     }
 
-    // 音频处理线程还在跑时 SetDeviceState 不会重发 listen start，这里补上
-    bool processor_running = audio_service_.IsAudioProcessorRunning();
+    // listen start 必须在这里无条件发：EnableVoiceProcessing(true) 已经把处理器拉起来了，
+    // 下面 SetDeviceState 里那次 !IsAudioProcessorRunning() 必然是 false，它永远不会补发。
+    // 音乐/电台播完的场景尤其致命——处理器刚被 Stop 过，服务端整轮都收不到 start listening，
+    // 设备却在 listening 状态挂着，用户说话等于说给空气。
     audio_service_.EnableVoiceProcessing(true);
-    if (processor_running)
-    {
-        protocol_->SendStartListening(mode);
-    }
+    // 唤醒词必须让位：AudioInputTask 优先把读到的音频喂给唤醒词然后 continue，两个同时开着
+    // voice processing 一个字节都拿不到。这条路径下 processor 已在跑，下面 SetDeviceState 里那句
+    // false 会被 if 跳过，所以必须在这里补。
+    audio_service_.EnableWakeWordDetection(false);
+    protocol_->SendStartListening(mode);
     SetDeviceState(kDeviceStateListening);
     last_activity_us_ = esp_timer_get_time();
     ESP_LOGI(TAG, "Session resumed without wake word");
@@ -959,13 +994,17 @@ void Application::SetDeviceState(DeviceState state)
         break;
     case kDeviceStateListening:
         display->SetStatus(Lang::Strings::LISTENING);
+        // 唤醒词先让位，绝不能放进下面的 if：AudioInputTask 优先把读到的音频喂给唤醒词然后
+        // continue，两个同时开着 voice processing 就一个字节都拿不到——AFE fetch 空转刷
+        // "Ringbuffer of AFE is empty"，屏幕挂「聆听中」说话毫无反应。音乐停止走 ResumeSession
+        // 时 processor 已经在跑，原来这句 false 正好被这个 if 跳掉，就是这个 bug。
+        audio_service_.EnableWakeWordDetection(false);
         // Make sure the audio processor is running
         if (!audio_service_.IsAudioProcessorRunning())
         {
             // Send the start listening command
             protocol_->SendStartListening(listening_mode_);
             audio_service_.EnableVoiceProcessing(true);
-            audio_service_.EnableWakeWordDetection(false);
         }
         break;
     case kDeviceStateSpeaking:

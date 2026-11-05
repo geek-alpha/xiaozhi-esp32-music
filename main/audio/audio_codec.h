@@ -18,6 +18,9 @@
 #define AUDIO_CODEC_TX_DMA_DESC_NUM 16
 #define AUDIO_CODEC_TX_DMA_FRAME_NUM 320
 #define AUDIO_CODEC_DEFAULT_MIC_GAIN 30.0
+// i2s 读超时：一帧（512 samples @16k）= 32ms，100ms 够容忍调度抖动，又能保证
+// RX 通道真出问题时读调用会返回而不是永久挂住。
+#define AUDIO_CODEC_READ_TIMEOUT_MS 100
 
 class AudioCodec {
 public:
@@ -32,6 +35,8 @@ public:
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);
     virtual void Start();
+    // 输入通道读不到数据时由 AudioService 调用；基类不直接持有通道，默认空实现。
+    virtual void ResetInputChannel() {}
 
     inline bool duplex() const { return duplex_; }
     inline bool input_reference() const { return input_reference_; }

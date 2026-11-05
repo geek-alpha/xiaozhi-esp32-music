@@ -20,6 +20,7 @@ private:
 
 public:
     virtual ~NoAudioCodec();
+    void ResetInputChannel() override;
 };
 
 class NoAudioCodecDuplex : public NoAudioCodec {

@@ -305,12 +305,25 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 }
 
 int NoAudioCodec::Read(int16_t* dest, int samples) {
-    size_t bytes_read;
+    size_t bytes_read = 0;
 
     in32_buf_.resize(samples);
     std::vector<int32_t>& bit32_buffer = in32_buf_;
-    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
-        ESP_LOGE(TAG, "Read Failed!");
+    // 超时必须有。portMAX_DELAY 下 RX 通道只要进过一次坏状态（改时钟/重开通道的窗口期），
+    // 这里就永不返回，AudioInputTask 永久卡死：屏幕照旧挂「聆听中」，说话一个字节上不去，
+    // 只有重启设备才恢复。超时返回 0，交给上层退避重试 + 重开通道自愈。
+    i2s_chan_handle_t rx = rx_handle_;
+    esp_err_t err = i2s_channel_read(rx, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read,
+                                     pdMS_TO_TICKS(AUDIO_CODEC_READ_TIMEOUT_MS));
+    // 判据只看 bytes_read：IDF 的 i2s_channel_read 在环形缓冲凑不满请求量时，会先把已到的
+    // 数据拷进用户缓冲、再返回 ESP_ERR_TIMEOUT。原来把 err != ESP_OK 一律当读失败，输入任务
+    // 读一次就 break 退出——之后永远显示「聆听中」、说话毫无反应，只有重启设备才恢复。
+    // 实测日志：err=ESP_ERR_TIMEOUT bytes=512 req=512。
+    if (bytes_read == 0) {
+        static int read_err_n = 0;
+        if (++read_err_n % 25 == 1) {
+            ESP_LOGW(TAG, "rx read err=%s bytes=0 req=%d", esp_err_to_name(err), samples);
+        }
         return 0;
     }
 
@@ -323,14 +336,29 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
 }
 
 int NoAudioCodecSimplexPdm::Read(int16_t* dest, int samples) {
-    size_t bytes_read;
+    size_t bytes_read = 0;
 
-    // PDM 解调后的数据位宽为 16 位，直接读取到目标缓冲区
-    if (i2s_channel_read(rx_handle_, dest, samples * sizeof(int16_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
-        ESP_LOGE(TAG, "Read Failed!");
+    // PDM 解调后的数据位宽为 16 位，直接读取到目标缓冲区；判定理由同 NoAudioCodec::Read
+    i2s_channel_read(rx_handle_, dest, samples * sizeof(int16_t), &bytes_read,
+                     pdMS_TO_TICKS(AUDIO_CODEC_READ_TIMEOUT_MS));
+    if (bytes_read == 0) {
         return 0;
     }
 
     // 计算实际读取的样本数
     return bytes_read / sizeof(int16_t);
+}
+
+void NoAudioCodec::ResetInputChannel() {
+    if (rx_handle_ == nullptr) {
+        return;
+    }
+    // 只 enable 不会清掉 DMA 里残留的坏状态，先 disable 再 enable 才是真正的重开
+    i2s_channel_disable(rx_handle_);
+    esp_err_t err = i2s_channel_enable(rx_handle_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to reopen I2S RX channel: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGW(TAG, "Reopened I2S RX channel after read failures");
+    }
 }

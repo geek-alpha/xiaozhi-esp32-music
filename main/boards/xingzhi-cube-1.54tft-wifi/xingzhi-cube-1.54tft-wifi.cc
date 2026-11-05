@@ -34,6 +34,8 @@ private:
     PowerManager* power_manager_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
+    // 按下即停的那一下，松手后仍会补发一个 click；用它吃掉，别让同一次按键再走一遍状态切换
+    bool stop_consumed_click_ = false;
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
@@ -83,37 +85,38 @@ private:
     }
 
     void InitializeButtons() {
-        boot_button_.OnClick([this]() {
-            power_save_timer_->WakeUp();
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
-                return;
-            }
-            // 放歌时这一下就是「打断」：直接停音乐。以前落到 ToggleChatState——那是开语音通道，
-            // 歌照放，按几下都像没反应。
-            auto* music = static_cast<Esp32Music*>(GetMusic());
-            if (music != nullptr && music->IsPlaying()) {
-                ESP_LOGI(TAG, "BOOT click: stop music");
-                music->StopStreaming();
-                GetDisplay()->ShowNotification("已停止播放");
-                return;
-            }
-            app.ToggleChatState();
-        });
-
-        boot_button_.OnLongPress([this]() {
+        // 按下就停，不等松手。原来绑在 OnClick 上：按键库要等松手后再数满
+        // CONFIG_BUTTON_SHORT_PRESS_TIME_MS=180ms 才发 click，加上 StopStreaming 收尾
+        // （实测 270ms），按下去到出声变化约 450ms——早过了人的 100ms 反应阈值，用户会补第二下。
+        boot_button_.OnPressDown([this]() {
             power_save_timer_->WakeUp();
             auto* music = static_cast<Esp32Music*>(GetMusic());
             if (music == nullptr || !music->IsPlaying()) {
                 return;
             }
-            // 换歌只在歌单里有下一首时成立；单曲/电台没得换，得告诉用户而不是默默无反应
-            if (music->SkipToNext()) {
-                GetDisplay()->ShowNotification("下一首");
-            } else {
-                GetDisplay()->ShowNotification("只有这一首");
+            ESP_LOGI(TAG, "BOOT press down: stop music");
+            stop_consumed_click_ = true;
+            // 提示必须在 StopStreaming 之前弹：它要等下载/播放线程收尾才返回。
+            GetDisplay()->ShowNotification("已停止播放");
+            // true：这一下的意图是「别放了，我要说话」。传 false 只清通道账本、不接回会话，
+            // 麦克风始终没开，用户停完接着说就是对着关掉的麦说话。
+            music->StopStreaming(true);
+        });
+
+        boot_button_.OnClick([this]() {
+            power_save_timer_->WakeUp();
+            // 停止已在 PressDown 干完，这次 click 是同一按的余波，直接吞掉：
+            // 此时 IsPlaying() 已为 false，落进 ToggleChatState 会把刚接回来的会话又关掉。
+            if (stop_consumed_click_) {
+                stop_consumed_click_ = false;
+                return;
             }
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
+                ResetWifiConfiguration();
+                return;
+            }
+            app.ToggleChatState();
         });
 
         volume_up_button_.OnClick([this]() {
@@ -127,8 +130,15 @@ private:
             GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         });
 
+        // 换歌挪到音量上键长按：BOOT 已经是「按下即停」，长按还没数到 1.5s 歌就停了，
+        // 挂在 BOOT 上的换歌永远等不到。没放歌时这一下仍是原来的「最大音量」。
         volume_up_button_.OnLongPress([this]() {
             power_save_timer_->WakeUp();
+            auto* music = static_cast<Esp32Music*>(GetMusic());
+            if (music != nullptr && music->IsPlaying() && music->SkipToNext()) {
+                GetDisplay()->ShowNotification("下一首");
+                return;
+            }
             GetAudioCodec()->SetOutputVolume(100);
             GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
         });

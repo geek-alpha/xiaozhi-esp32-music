@@ -1,8 +1,15 @@
 #ifndef SETTINGS_H
 #define SETTINGS_H
 
+#include <functional>
 #include <string>
 #include <nvs_flash.h>
+
+// 写 NVS 会短暂关掉 flash cache，IDF 会断言当前任务的栈必须在内部 RAM。
+// 栈在 PSRAM 的任务（音乐播放、网络收发、MCP 回调）直接写会 abort 整机重启
+// （watch3.log:3914 assert esp_task_stack_is_sane_cache_disabled）。
+// 所以所有写路径都必须经过它：自己栈不安全就切到专用 worker 上写。
+void RunNvsWrite(const std::function<void()>& fn);
 
 class Settings {
 public:

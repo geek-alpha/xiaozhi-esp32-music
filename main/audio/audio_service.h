@@ -122,6 +122,7 @@ private:
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
     DebugStatistics debug_statistics_;
+    int input_read_fail_count_ = 0;  // 连续读失败计数，成功后清零
 
     EventGroupHandle_t event_group_;
 

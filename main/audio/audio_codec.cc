@@ -120,6 +120,15 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
         ESP_LOGW(TAG, "Failed to disable I2S TX channel: %s", esp_err_to_name(disable_ret));
     }
     
+    // duplex 的 TX/RX 共用 BCLK/WS/MCLK：只停 TX 就改时钟，RX 的 DMA 状态会跟新时钟对不上，
+    // 下一次 i2s_channel_read 永久阻塞 → AudioInputTask 困死在 read 里（任务不退出、不打日志），
+    // AFE 只剩 fetch 空转。voice1.log 实测：改回 24000 Hz 后 230 条 "Ringbuffer of AFE is empty"
+    // 一直刷到日志末尾，屏幕挂着「聆听中」，说话毫无反应。RX 必须跟着一起停、一起重开。
+    if (duplex_ && rx_handle_ != nullptr) {
+        esp_err_t rx_dis = i2s_channel_disable(rx_handle_);
+        ESP_LOGI(TAG, "Disabled I2S RX channel for clock reconfig: %s", esp_err_to_name(rx_dis));
+    }
+
     // 重新配置 I2S 时钟
     i2s_std_clk_config_t clk_cfg = {
         .sample_rate_hz = (uint32_t)sample_rate,
@@ -132,6 +141,16 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
     
     esp_err_t ret = i2s_channel_reconfig_std_clock(tx_handle_, &clk_cfg);
     
+    // RX 先回来：阻塞在 read 里的输入任务才能立刻拿到新时钟下的数据
+    if (duplex_ && rx_handle_ != nullptr) {
+        esp_err_t rx_en = i2s_channel_enable(rx_handle_);
+        if (rx_en != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to re-enable I2S RX channel: %s", esp_err_to_name(rx_en));
+        } else {
+            ESP_LOGI(TAG, "Re-enabled I2S RX channel after clock change");
+        }
+    }
+
     // 重新启用通道（无论之前是什么状态，现在都需要启用以便播放音频）
     esp_err_t enable_ret = i2s_channel_enable(tx_handle_);
     if (enable_ret != ESP_OK) {

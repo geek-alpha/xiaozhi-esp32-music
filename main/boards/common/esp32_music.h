@@ -100,6 +100,11 @@ private:
     std::atomic<bool> first_audio_ready_{false};
     // 起播耗时分解用：PlayResolved 记起点，各阶段打差值，用来分清慢在建连还是在攒缓冲
     std::atomic<int64_t> stream_start_us_{0};
+    // 线程真退出的标志。std::thread::joinable() 在 join 之前恒为 true，靠它轮询
+    // 必然等满超时再 detach：按键像卡了一秒，旧线程还活着接着抢 I2S 和采样率。
+    // 线程入口包一层 lambda，函数任何返回路径都置位，不用改函数内部的每个 return。
+    std::atomic<bool> play_done_{true};
+    std::atomic<bool> download_done_{true};
 
     // 私有方法
     void DownloadAudioStream(const std::string& music_url);
@@ -190,7 +195,7 @@ public:
     static bool IsGenericRadioName(const std::string& station);
     // 内置台名清单，AI 拿它给用户挑
     static std::string RadioStationNames();
-    virtual bool StopStreaming() override;  // 停止流式播放
+    virtual bool StopStreaming(bool take_back = false) override;  // 停止流式播放
     // 按键换歌：队列里还有下一首就接上（会覆盖当前这首）；单曲/电台没得换时返回 false
     bool SkipToNext();
     virtual size_t GetBufferSize() const override { return buffer_size_; }

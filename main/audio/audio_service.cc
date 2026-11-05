@@ -210,6 +210,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
+    input_read_fail_count_ = 0;
 
 #if CONFIG_USE_AUDIO_DEBUGGER
     // 音频调试：发送原始音频数据
@@ -284,8 +285,17 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        ESP_LOGE(TAG, "Should not be here, bits: %lx", bits);
-        break;
+        // 读失败绝不能 break：任务一退，之后每轮对话都收不到一个字节，屏幕却照旧显示
+        // 「聆听中」，只有重启设备才恢复——用户看到的就是这个。改为退避重试；连续失败
+        // 说明 RX 通道进了坏状态，重开一次再试。
+        if (++input_read_fail_count_ % 10 == 1) {
+            ESP_LOGW(TAG, "Audio input read failed %d times, bits: %lx", input_read_fail_count_, bits);
+        }
+        if (input_read_fail_count_ % 50 == 0) {
+            ESP_LOGW(TAG, "Audio input keeps failing, reopening I2S RX channel");
+            codec_->ResetInputChannel();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");

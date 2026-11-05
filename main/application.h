@@ -63,7 +63,8 @@ public:
     // 音乐/提醒要独占音频：先把会话让出来。这只是借用通道，不等于用户要待机
     void SuspendSessionForAudio();
     // 音频播完了：把刚才让出去的会话接回来
-    void ResumeAfterAudio();
+    // take_back=false：音频是被用户主动掐断的，账本要清但会话不接回
+    void ResumeAfterAudio(bool take_back = true);
 
     // 新增：接收外部音频数据（如音乐播放）
     void AddAudioData(AudioStreamPacket&& packet);
@@ -99,13 +100,14 @@ private:
     std::atomic<int64_t> resume_due_us_{0};
     std::atomic<int64_t> channel_opened_us_{0};
     std::atomic<bool> user_stopped_{false};
-    // 为音频让路：closing 只拦紧接着那一次同步回调，wants_resume 记着播完该不该接回
+    // 为音频让路：closing 只拦紧接着那一次同步回调
     std::atomic<bool> audio_suspend_closing_{false};
-    std::atomic<bool> audio_suspend_wants_resume_{false};
     // 整段音频播放期间都为 true。closing 只是一次脉冲，挡不住服务端 goodbye 引出的
     // 第二次 close 回调——第二次会被当成断连去续接，把刚起播的歌直接掐掉。
     std::atomic<bool> audio_owns_channel_{false};
     std::atomic<int64_t> last_activity_us_{0};
+    // 本次会话里没有唤醒词、自动接话的次数，超过上限就回待机等唤醒词
+    std::atomic<int> auto_rounds_{0};
     TaskHandle_t check_new_version_task_handle_ = nullptr;
 
     void OnWakeWordDetected();

@@ -12,7 +12,8 @@ public:
     
     // 新增流式播放相关方法
     virtual bool StartStreaming(const std::string& music_url) = 0;
-    virtual bool StopStreaming() = 0;  // 停止流式播放
+    // take_back=true 表示这是「用户开口要说话」触发的停歌，停完必须把会话接回来
+    virtual bool StopStreaming(bool take_back = false) = 0;
     virtual size_t GetBufferSize() const = 0;
     virtual bool IsDownloading() const = 0;
     virtual int16_t* GetAudioData() = 0;
