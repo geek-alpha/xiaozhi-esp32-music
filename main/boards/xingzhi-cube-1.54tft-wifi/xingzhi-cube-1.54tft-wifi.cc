@@ -9,6 +9,7 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "boards/common/esp32_music.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -87,8 +88,32 @@ private:
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
                 ResetWifiConfiguration();
+                return;
+            }
+            // 放歌时这一下就是「打断」：直接停音乐。以前落到 ToggleChatState——那是开语音通道，
+            // 歌照放，按几下都像没反应。
+            auto* music = static_cast<Esp32Music*>(GetMusic());
+            if (music != nullptr && music->IsPlaying()) {
+                ESP_LOGI(TAG, "BOOT click: stop music");
+                music->StopStreaming();
+                GetDisplay()->ShowNotification("已停止播放");
+                return;
             }
             app.ToggleChatState();
+        });
+
+        boot_button_.OnLongPress([this]() {
+            power_save_timer_->WakeUp();
+            auto* music = static_cast<Esp32Music*>(GetMusic());
+            if (music == nullptr || !music->IsPlaying()) {
+                return;
+            }
+            // 换歌只在歌单里有下一首时成立；单曲/电台没得换，得告诉用户而不是默默无反应
+            if (music->SkipToNext()) {
+                GetDisplay()->ShowNotification("下一首");
+            } else {
+                GetDisplay()->ShowNotification("只有这一首");
+            }
         });
 
         volume_up_button_.OnClick([this]() {

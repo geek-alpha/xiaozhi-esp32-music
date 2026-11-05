@@ -42,6 +42,8 @@ private:
     
     // 歌词相关
     std::string current_lyric_url_;
+    // 内置曲源那条路没有 lyric_url，只有酷我 rid：歌词按 rid 自己现拉
+    std::string current_lyric_rid_;
     // 服务端随消息下发的 LRC 正文，暂存到这里，由 lyric 线程解析——解析吃 3KB+ 栈，
     // 在 MCP/播放线程里直接解析会把调用者栈顶穿（不一定是 12KB 的大栈线程）。
     std::string pending_lyric_lrc_;
@@ -110,7 +112,9 @@ private:
     void ResetSampleRate();  // 重置采样率到原始值
     
     // 直链+歌词地址都已确定后的统一开播路径（Download 自查、PlayDirect 下发都走它）
-    bool PlayResolved(const std::string& audio_url, const std::string& lyric_url, const std::string& song_name);
+    // lyric_rid：内置曲源只拿得到 rid，歌词靠它现拉（此时 lyric_url 为空）
+    bool PlayResolved(const std::string& audio_url, const std::string& lyric_url, const std::string& song_name,
+                      const std::string& lyric_rid = "");
 
     // 设备侧播放队列：MCP 一次下发整张歌单，自然播完一首就接下一首，
     // 不依赖服务端轮询（官方云不认自定义 MCP 通知，轮询也拿不到播放进度）。
@@ -142,6 +146,8 @@ private:
 
     // 歌词相关私有方法
     bool DownloadLyrics(const std::string& lyric_url);
+    // 内置曲源：酷我按 rid 回 lrclist JSON，边读边抽，不把整块 JSON 塞进内部堆
+    bool DownloadLyricsByRid(const std::string& rid);
     // 歌词正文随消息下发时的入口：直接解析，不走 HTTP
     bool StartLyricsWithContent(const std::string& lrc);
     bool ParseLyrics(const std::string& lyric_content);
@@ -185,6 +191,8 @@ public:
     // 内置台名清单，AI 拿它给用户挑
     static std::string RadioStationNames();
     virtual bool StopStreaming() override;  // 停止流式播放
+    // 按键换歌：队列里还有下一首就接上（会覆盖当前这首）；单曲/电台没得换时返回 false
+    bool SkipToNext();
     virtual size_t GetBufferSize() const override { return buffer_size_; }
     virtual bool IsDownloading() const override { return is_downloading_; }
     // 闹钟要「先说事情再放铃声」：靠它判断那段提醒语音播完了没有

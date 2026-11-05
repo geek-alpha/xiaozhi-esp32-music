@@ -5,6 +5,7 @@
 #include "application.h"
 #include "protocols/protocol.h"
 #include "display/display.h"
+#include "http_client.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -424,7 +425,7 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
     ESP_LOGI(TAG, "Builtin lookup: %s -> rid %s, %ds, score %d, %s",
              song_name.c_str(), best_rid.c_str(), best_duration, best_score, audio_url.c_str());
     last_downloaded_data_ = audio_url;
-    return PlayResolved(audio_url, "", song_name);
+    return PlayResolved(audio_url, "", song_name, best_rid);
 }
 
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
@@ -657,7 +658,8 @@ std::string Esp32Music::GetDownloadResult()
     return last_downloaded_data_;
 }
 
-bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &lyric_url, const std::string &song_name)
+bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &lyric_url, const std::string &song_name,
+                                const std::string &lyric_rid)
 {
     if (audio_url.empty())
     {
@@ -699,16 +701,18 @@ bool Esp32Music::PlayResolved(const std::string &audio_url, const std::string &l
         return false;
     }
 
-    if (lyric_url.empty())
+    current_lyric_url_ = lyric_url;
+    current_lyric_rid_ = lyric_rid;
+    // 两条路只要有一条拿得到词源就继续：MCP 下发的是 URL，内置自搜只有 rid
+    if (lyric_url.empty() && lyric_rid.empty())
     {
-        ESP_LOGW(TAG, "No lyric URL found for this song");
+        ESP_LOGW(TAG, "No lyric source for this song");
         return true;
     }
 
-    current_lyric_url_ = lyric_url;
     if (display_mode_ != DISPLAY_MODE_LYRICS)
     {
-        ESP_LOGI(TAG, "Lyric URL found but spectrum display mode is active, skipping lyrics");
+        ESP_LOGI(TAG, "Lyric source ready but spectrum display mode is active, skipping lyrics");
         return true;
     }
 
@@ -1298,6 +1302,16 @@ bool Esp32Music::PlayNextFromQueue()
     }
 
     return true;
+}
+
+bool Esp32Music::SkipToNext()
+{
+    // 队列只在「整张歌单」下发时存在；单曲/电台没得换，由调用方提示用户
+    if (!queue_active_.load())
+    {
+        return false;
+    }
+    return PlayNextFromQueue();
 }
 
 void Esp32Music::ClearQueue()
@@ -2376,6 +2390,168 @@ size_t Esp32Music::SkipId3Tag(uint8_t *data, size_t size)
     return total_skip;
 }
 
+// 内置曲源的歌词：MCP 下发那条路有 lyric_url，自搜只拿到酷我 rid，词得自己拉。
+// 接口回 15KB 左右 JSON（内部 RAM 常态只剩 30~40KB，整块读进 std::string 会和 PCM 抢到 bad_alloc），
+// 所以 body 落 PSRAM，只把 lineLyric/time 两个字段抽成歌词表。
+bool Esp32Music::DownloadLyricsByRid(const std::string &rid)
+{
+    if (rid.empty())
+    {
+        return false;
+    }
+
+    try
+    {
+        auto network = Board::GetInstance().GetNetwork();
+        auto http = network->CreateHttp(0);
+        if (!http)
+        {
+            ESP_LOGE(TAG, "Lyric fetch: no http client");
+            return false;
+        }
+        http->SetTimeout(15000);
+        http->SetHeader("User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        http->SetHeader("Referer", "http://www.kuwo.cn/");
+        http->SetHeader("Accept", "*/*");
+
+        std::string url = "http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=" + rid + "&httpsStatus=1";
+        if (!http->Open("GET", url))
+        {
+            ESP_LOGE(TAG, "Lyric fetch: connect failed");
+            return false;
+        }
+        if (http->GetStatusCode() != 200)
+        {
+            ESP_LOGE(TAG, "Lyric fetch: HTTP %d", http->GetStatusCode());
+            http->Close();
+            return false;
+        }
+
+        PsramString body;
+        char chunk[512];
+        int n;
+        while ((n = http->Read(chunk, sizeof(chunk))) > 0)
+        {
+            if (body.size() + n > 96 * 1024)
+            {
+                ESP_LOGW(TAG, "Lyric fetch: body over 96KB, stopped");
+                break;
+            }
+            body.append(chunk, n);
+        }
+        http->Close();
+
+        if (body.empty())
+        {
+            ESP_LOGW(TAG, "Lyric fetch: empty body for rid %s", rid.c_str());
+            return false;
+        }
+
+        const size_t kMaxLines = 260;   // 一首歌实际 40~190 行，封顶只为兜住异常源
+        const size_t kMaxChars = 96;    // 屏幕一行就能显下这么多，再长只浪费内部堆
+        std::vector<std::pair<int, std::string>> parsed;
+        parsed.reserve(96);
+
+        const char *const kTextKey = "\"lineLyric\":\"";
+        const char *const kTimeKey = "\"time\":\"";
+        size_t pos = 0;
+        while (parsed.size() < kMaxLines)
+        {
+            size_t tp = body.find(kTextKey, pos);
+            if (tp == PsramString::npos)
+            {
+                break;
+            }
+            size_t i = tp + strlen(kTextKey);
+            std::string line;
+            line.reserve(32);
+            while (i < body.size() && body[i] != '"')
+            {
+                if (body[i] == '\\' && i + 1 < body.size())
+                {
+                    char e = body[i + 1];
+                    i += 2;
+                    if (e == 'u')
+                    {
+                        i += 4; // \uXXXX 这类转义设备用不上，跳过
+                        continue;
+                    }
+                    if (line.size() < kMaxChars)
+                    {
+                        line.push_back(e);
+                    }
+                    continue;
+                }
+                if (line.size() < kMaxChars)
+                {
+                    line.push_back(body[i]);
+                }
+                i++;
+            }
+
+            size_t tsp = body.find(kTimeKey, i);
+            if (tsp == PsramString::npos || tsp > i + 64)
+            {
+                pos = i + 1;
+                continue;
+            }
+            size_t j = tsp + strlen(kTimeKey);
+            int seconds = 0;
+            int frac = 0;
+            int frac_digits = 0;
+            bool dot = false;
+            while (j < body.size() && body[j] != '"')
+            {
+                char c = body[j++];
+                if (c == '.')
+                {
+                    dot = true;
+                }
+                else if (c >= '0' && c <= '9')
+                {
+                    if (!dot)
+                    {
+                        seconds = seconds * 10 + (c - '0');
+                    }
+                    else if (frac_digits < 2)
+                    {
+                        frac = frac * 10 + (c - '0');
+                        frac_digits++;
+                    }
+                }
+            }
+            pos = j;
+            if (line.empty())
+            {
+                continue;
+            }
+            int ms = seconds * 1000 + (frac_digits == 0 ? 0 : (frac_digits == 1 ? frac * 100 : frac * 10));
+            parsed.push_back({ms, line});
+        }
+
+        if (parsed.empty())
+        {
+            ESP_LOGW(TAG, "Lyric fetch: no timed lines for rid %s", rid.c_str());
+            return false;
+        }
+
+        int count = (int)parsed.size();
+        {
+            std::lock_guard<std::mutex> lock(lyrics_mutex_);
+            lyrics_.swap(parsed);
+        }
+        ESP_LOGI(TAG, "Lyrics ready: %d lines from rid %s", count, rid.c_str());
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        ESP_LOGE(TAG, "Lyric fetch failed: %s", e.what());
+        return false;
+    }
+}
+
 // 下载歌词
 bool Esp32Music::DownloadLyrics(const std::string &lyric_url)
 {
@@ -2716,11 +2892,16 @@ void Esp32Music::LyricDisplayThread()
             return;
         }
     }
-    else if (need_download && !DownloadLyrics(current_lyric_url_))
+    else if (need_download)
     {
-        ESP_LOGE(TAG, "Failed to download or parse lyrics");
-        is_lyric_running_ = false;
-        return;
+        bool ok = current_lyric_rid_.empty() ? DownloadLyrics(current_lyric_url_)
+                                             : DownloadLyricsByRid(current_lyric_rid_);
+        if (!ok)
+        {
+            ESP_LOGE(TAG, "Failed to download or parse lyrics");
+            is_lyric_running_ = false;
+            return;
+        }
     }
 
     // 定期检查是否需要更新显示(频率可以降低)
@@ -2769,6 +2950,7 @@ void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms)
     // 如果歌词索引发生变化，更新显示
     if (new_lyric_index != current_lyric_index_)
     {
+        const int prev_index = current_lyric_index_.load();
         current_lyric_index_ = new_lyric_index;
 
         auto &board = Board::GetInstance();
@@ -2784,6 +2966,13 @@ void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms)
 
             // 显示歌词
             display->SetChatMessage("lyric", lyric_text.c_str());
+
+            // 第一句上屏记一次 INFO：否则「歌词到底有没有真画出来」只能靠盯屏幕
+            if (prev_index < 0 && !lyric_text.empty())
+            {
+                ESP_LOGI(TAG, "Lyric on screen [%d/%d]: %s", current_lyric_index_.load(),
+                         (int)lyrics_.size(), lyric_text.c_str());
+            }
 
             ESP_LOGD(TAG, "Lyric update at %dms: %s",
                      (int)current_time_ms,
