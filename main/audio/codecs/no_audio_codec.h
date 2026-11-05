@@ -11,6 +11,13 @@ private:
     virtual int Write(const int16_t* data, int samples) override;
     virtual int Read(int16_t* dest, int samples) override;
 
+    // I2S 是 32 位，写入/读取前要转一道。这两块缓冲必须复用：每帧现建 vector
+    // 在内部 RAM 只有 30KB 时每秒要抖 76 次 4.6KB，碎片到 operator new 抛
+    // bad_alloc 而输入任务上没人接 —— std::terminate → abort → 整机重启。
+    // 输入输出跑在不同任务上，所以两个方向各用一块，不能共。
+    std::vector<int32_t> out32_buf_;
+    std::vector<int32_t> in32_buf_;
+
 public:
     virtual ~NoAudioCodec();
 };

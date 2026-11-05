@@ -204,7 +204,12 @@ static std::string http_get_text(const std::string &url)
     {
         return "";
     }
-    http->SetHeader("User-Agent", "Mozilla/5.0");
+    // 酷我 r.s 只对浏览器 UA + kuwo Referer 吐结果：短 UA（Mozilla/5.0）实测 HIT=0，
+    // 拿到的是空 abslist，内置自搜等于形同虚设。这条 UA 是能稳定出结果的最低要求。
+    http->SetHeader("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+    http->SetHeader("Referer", "http://www.kuwo.cn/");
     http->SetHeader("Accept", "*/*");
     if (!http->Open("GET", url))
     {
@@ -236,16 +241,67 @@ static bool all_digits(const std::string &s)
     return true;
 }
 
+// 噪声词按 UTF-8 字面量做字节子串比对：源站返回 UTF-8，本文件也是 UTF-8，
+// 设备端没有码表，这样不转码也能认出「伴奏」「翻唱」。分两档性质不同：
+// 硬剔除 = 放出来不是听歌（人声被抽掉、根本不是这首）；软降分 = 只是不是原版。
+static const char *const kNoiseHard[] = {
+    "伴奏", "伴唱", "KTV", "卡拉OK", "纯音乐", "清唱", "铃声", "试听", "抢听",
+    "搞笑", "恶搞", "鬼畜", "彩铃", "相声", "小品", "instrumental", "karaoke"};
+static const char *const kNoiseSoft[] = {
+    "DJ", "dj", "remix", "Remix", "混音", "抖音", "翻唱", "cover", "Cover",
+    "女声版", "男声版", "钢琴版", "吉他版", "童声", "live", "Live", "现场",
+    "演唱会", "串烧", "改编", "片段", "版)", "版）"};
+
+static const size_t kNoiseHardN = sizeof(kNoiseHard) / sizeof(kNoiseHard[0]);
+static const size_t kNoiseSoftN = sizeof(kNoiseSoft) / sizeof(kNoiseSoft[0]);
+
+static bool contains_any(const std::string &hay, const char *const *terms, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        if (hay.find(terms[i]) != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int count_any(const std::string &hay, const char *const *terms, size_t n)
+{
+    int hits = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (hay.find(terms[i]) != std::string::npos)
+        {
+            hits++;
+        }
+    }
+    return hits;
+}
+
+// 设备没装 CA 证书包，https 握手必失败（stream 端只认 200/206）；
+// 酷我 CDN 同一路径 http 也回 206，所以统一降到 http。
+static std::string force_http(std::string url)
+{
+    if (url.rfind("https://", 0) == 0)
+    {
+        url.replace(0, 8, "http://");
+    }
+    return url;
+}
+
 bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::string &artist_name)
 {
-    (void)artist_name; // 只用歌名搜：带上歌手名反而把原唱挤下去
     if (song_name.empty())
     {
         return false;
     }
 
+    // 只拿歌名搜：拼上歌手会让结果偏向「该歌手其他歌」——搜「晴天 周杰伦」前八条
+    // 里一条原唱都没有，全是伴奏/串烧/别人的歌。歌手名只用来给候选打分。
     std::string search_url = "http://search.kuwo.cn/r.s?all=" + url_encode(song_name) +
-                             "&ft=music&itemset=web_2013&client=kt&pn=0&rn=8&rformat=json";
+                             "&ft=music&client=kt&itemset=web_2013&pn=0&rn=8&rformat=json&encoding=utf8";
     ESP_LOGI(TAG, "Builtin lookup search: %s", search_url.c_str());
 
     std::string body = http_get_text(search_url);
@@ -255,40 +311,95 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
         return false;
     }
 
-    // 同名翻唱、十几秒的抖音切片经常排在搜索结果前面，一次取 8 条挑时长最长的那条
-    std::string best_rid;
-    int best_duration = 0;
-    size_t pos = 0;
-    while ((pos = body.find("'DC_TARGETID':'", pos)) != std::string::npos)
+    // 记录以 DC_TARGETID 分界，但 ARTIST 排在它前面，切片得从上一条的
+    // DC_TARGETID 起算，否则歌手字段永远落在片区之外。
+    std::vector<size_t> marks;
+    for (size_t p = body.find("'DC_TARGETID':'"); p != std::string::npos;
+         p = body.find("'DC_TARGETID':'", p + 1))
     {
-        size_t start = pos + 15;
-        size_t end = body.find('\'', start);
-        if (end == std::string::npos)
-        {
-            break;
-        }
-        std::string rid = body.substr(start, end - start);
-
-        int duration = 0;
-        size_t dpos = body.find("'DURATION':'", end);
-        if (dpos != std::string::npos && dpos - end < 4096)
-        {
-            size_t dstart = dpos + 12;
-            size_t dend = body.find('\'', dstart);
-            if (dend != std::string::npos && dend > dstart && dend - dstart <= 5)
-            {
-                duration = atoi(body.substr(dstart, dend - dstart).c_str());
-            }
-        }
-
-        if (all_digits(rid) && duration > best_duration && duration <= 600)
-        {
-            best_rid = rid;
-            best_duration = duration;
-        }
-        pos = end;
+        marks.push_back(p);
     }
 
+    std::string best_rid;
+    int best_duration = 0;
+    int best_score = -1000;
+
+    // strict=false 时不再硬剔除：八条全是伴奏也得挑一条，空手而归等于「放不了歌」，
+    // 比放个伴奏更糟。
+    auto scan = [&](bool strict) {
+        best_rid.clear();
+        best_score = -1000;
+        for (size_t i = 0; i < marks.size(); i++)
+        {
+            size_t seg_end = (i + 1 < marks.size()) ? marks[i + 1] : body.size();
+            size_t rid_start = marks[i] + 15;
+            size_t rid_end = body.find('\'', rid_start);
+            if (rid_end == std::string::npos || rid_end >= seg_end)
+            {
+                continue;
+            }
+            std::string rid = body.substr(rid_start, rid_end - rid_start);
+            if (!all_digits(rid))
+            {
+                continue;
+            }
+
+            size_t seg_start = (i == 0) ? 0 : marks[i - 1];
+            std::string seg = body.substr(seg_start, seg_end - seg_start);
+            if (strict && contains_any(seg, kNoiseHard, kNoiseHardN))
+            {
+                continue;
+            }
+
+            int duration = 0;
+            size_t dpos = seg.find("'DURATION':'");
+            if (dpos != std::string::npos)
+            {
+                size_t dstart = dpos + 12;
+                size_t dend = seg.find('\'', dstart);
+                if (dend != std::string::npos && dend > dstart && dend - dstart <= 5)
+                {
+                    duration = atoi(seg.substr(dstart, dend - dstart).c_str());
+                }
+            }
+
+            int score = 0;
+            if (seg.find(song_name) != std::string::npos)
+            {
+                score += 8;
+            }
+            if (!artist_name.empty() && seg.find(artist_name) != std::string::npos)
+            {
+                score += 6;
+            }
+            score -= 3 * count_any(seg, kNoiseSoft, kNoiseSoftN);
+            if (duration >= 90 && duration <= 420)
+            {
+                score += 3;
+            }
+            else if (duration > 420)
+            {
+                score -= 4;
+            }
+            else
+            {
+                score -= 6;
+            }
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_rid = rid;
+                best_duration = duration;
+            }
+        }
+    };
+
+    scan(true);
+    if (best_rid.empty())
+    {
+        scan(false);
+    }
     if (best_rid.empty())
     {
         ESP_LOGE(TAG, "Builtin lookup: no usable track for '%s'", song_name.c_str());
@@ -298,7 +409,8 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
     std::string audio_url = http_get_text(
         "http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_" + best_rid);
     while (!audio_url.empty() &&
-           (audio_url.back() == '\r' || audio_url.back() == '\n' || audio_url.back() == ' '))
+           (audio_url.back() == '\r' || audio_url.back() == '\n' || audio_url.back() == ' ' ||
+            audio_url.back() == '"'))
     {
         audio_url.pop_back();
     }
@@ -307,9 +419,10 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
         ESP_LOGE(TAG, "Builtin lookup: no direct url for rid %s", best_rid.c_str());
         return false;
     }
+    audio_url = force_http(audio_url);
 
-    ESP_LOGI(TAG, "Builtin lookup: %s -> rid %s, %ds, %s",
-             song_name.c_str(), best_rid.c_str(), best_duration, audio_url.c_str());
+    ESP_LOGI(TAG, "Builtin lookup: %s -> rid %s, %ds, score %d, %s",
+             song_name.c_str(), best_rid.c_str(), best_duration, best_score, audio_url.c_str());
     last_downloaded_data_ = audio_url;
     return PlayResolved(audio_url, "", song_name);
 }
@@ -324,6 +437,16 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
 {
     ESP_LOGI(TAG, "Music player initialized with default spectrum display mode");
     InitializeMp3Decoder();
+
+#ifdef XZ_MUSIC_SELFTEST
+    // 诊断用：真机到底能不能自己搜到，只能靠设备自己跑一次回答
+    StartBgThread(selftest_thread_, "selftest", [this]() {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        ESP_LOGI(TAG, "SELFTEST: start builtin lookup");
+        bool ok = PlayByBuiltinLookup("晴天", "周杰伦");
+        ESP_LOGI(TAG, "SELFTEST: done ok=%d", (int)ok);
+    }, 16 * 1024);
+#endif
 }
 
 Esp32Music::~Esp32Music()
@@ -451,124 +574,82 @@ Esp32Music::~Esp32Music()
 
 bool Esp32Music::Download(const std::string &song_name, const std::string &artist_name)
 {
-    ESP_LOGI(TAG, "小智开源音乐固件qq交流群:826072986");
     ESP_LOGI(TAG, "Starting to get music details for: %s", song_name.c_str());
 
-    // 清空之前的下载数据
     last_downloaded_data_.clear();
-
-    // 保存歌名用于后续显示
     current_song_name_ = song_name;
 
-    // 第一步：向大白的兼容接口要曲目信息（返回 artist/title/audio_url/lyric_url）
+    // 主路径：大白兼容接口（质量最好，能拿到原唱直链 + 歌词）。
+    // 但它一挂设备就彻底放不出歌——所以下面每条失败分支都必须落到内置自搜。
+    // 内置那条只依赖公网酷我，和电台同级，不需要任何自建服务活着。
     std::string base_url = CONFIG_XZ_MUSIC_API_BASE;
     if (base_url.empty())
     {
-        // 没配自查地址：设备自己走内置曲源解析，不依赖任何自建服务
-        ESP_LOGW(TAG, "No self-lookup base configured, falling back to builtin music source");
+        ESP_LOGW(TAG, "No self-lookup base configured, use builtin music source");
         return PlayByBuiltinLookup(song_name, artist_name);
     }
-    std::string full_url = base_url + "/api/music/xz/song?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
 
+    std::string full_url = base_url + "/api/music/xz/song?song=" + url_encode(song_name) + "&artist=" + url_encode(artist_name);
     ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
 
-    // 使用Board提供的HTTP客户端
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
-
-    // 设置基本请求头
     http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
     http->SetHeader("Accept", "application/json");
-
-    // 添加ESP32认证头
     add_auth_headers(http.get());
 
-    // 打开GET连接
     if (!http->Open("GET", full_url))
     {
-        ESP_LOGE(TAG, "Failed to connect to music API");
-        return false;
+        ESP_LOGE(TAG, "Failed to connect to music API, falling back to builtin");
+        return PlayByBuiltinLookup(song_name, artist_name);
     }
 
-    // 检查响应状态码
     int status_code = http->GetStatusCode();
     if (status_code != 200)
     {
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+        ESP_LOGE(TAG, "Music API HTTP %d, falling back to builtin", status_code);
         http->Close();
-        return false;
+        return PlayByBuiltinLookup(song_name, artist_name);
     }
 
-    // 读取响应数据
-    last_downloaded_data_ = http->ReadAll();
+    std::string payload = http->ReadAll();
     http->Close();
+    ESP_LOGI(TAG, "Music API status %d, content_length %d", status_code, (int)payload.length());
 
-    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, last_downloaded_data_.length());
-    ESP_LOGD(TAG, "Complete music details response: %s", last_downloaded_data_.c_str());
-
-    // 简单的认证响应检查（可选）
-    if (last_downloaded_data_.find("ESP32动态密钥验证失败") != std::string::npos)
+    if (payload.find("ESP32动态密钥验证失败") != std::string::npos)
     {
-        ESP_LOGE(TAG, "Authentication failed for song: %s", song_name.c_str());
-        return false;
+        ESP_LOGE(TAG, "Auth failed for song: %s, falling back to builtin", song_name.c_str());
+        return PlayByBuiltinLookup(song_name, artist_name);
     }
 
-    if (!last_downloaded_data_.empty())
+    cJSON *response_json = payload.empty() ? nullptr : cJSON_Parse(payload.c_str());
+    if (response_json == nullptr)
     {
-        // 解析响应JSON以提取音频URL
-        cJSON *response_json = cJSON_Parse(last_downloaded_data_.c_str());
-        if (response_json)
-        {
-            // 提取关键信息
-            cJSON *artist = cJSON_GetObjectItem(response_json, "artist");
-            cJSON *title = cJSON_GetObjectItem(response_json, "title");
-            cJSON *audio_url = cJSON_GetObjectItem(response_json, "audio_url");
-            cJSON *lyric_url = cJSON_GetObjectItem(response_json, "lyric_url");
-
-            if (cJSON_IsString(artist))
-            {
-                ESP_LOGI(TAG, "Artist: %s", artist->valuestring);
-            }
-            if (cJSON_IsString(title))
-            {
-                ESP_LOGI(TAG, "Title: %s", title->valuestring);
-            }
-
-            // 检查audio_url是否有效
-            if (cJSON_IsString(audio_url) && audio_url->valuestring && strlen(audio_url->valuestring) > 0)
-            {
-                ESP_LOGI(TAG, "Audio URL path: %s", audio_url->valuestring);
-
-                std::string lyric_path;
-                if (cJSON_IsString(lyric_url) && lyric_url->valuestring)
-                {
-                    lyric_path = lyric_url->valuestring;
-                }
-
-                bool played = PlayResolved(audio_url->valuestring, lyric_path, song_name);
-                cJSON_Delete(response_json);
-                return played;
-            }
-            else
-            {
-                // audio_url为空或无效
-                ESP_LOGE(TAG, "Audio URL not found or empty for song: %s", song_name.c_str());
-                ESP_LOGE(TAG, "Failed to find music: 没有找到歌曲 '%s'", song_name.c_str());
-                cJSON_Delete(response_json);
-                return false;
-            }
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to parse JSON response");
-        }
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Empty response from music API");
+        ESP_LOGE(TAG, "Music API gave no parsable JSON, falling back to builtin");
+        return PlayByBuiltinLookup(song_name, artist_name);
     }
 
-    return false;
+    cJSON *audio_item = cJSON_GetObjectItem(response_json, "audio_url");
+    cJSON *lyric_item = cJSON_GetObjectItem(response_json, "lyric_url");
+    std::string audio = (cJSON_IsString(audio_item) && audio_item->valuestring) ? audio_item->valuestring : "";
+    std::string lyric = (cJSON_IsString(lyric_item) && lyric_item->valuestring) ? lyric_item->valuestring : "";
+    cJSON_Delete(response_json);
+
+    if (audio.empty())
+    {
+        ESP_LOGE(TAG, "Music API returned no audio_url for '%s', falling back to builtin", song_name.c_str());
+        return PlayByBuiltinLookup(song_name, artist_name);
+    }
+    audio = force_http(audio);
+
+    if (!PlayResolved(audio, lyric, song_name))
+    {
+        ESP_LOGE(TAG, "Primary audio failed to start, falling back to builtin");
+        return PlayByBuiltinLookup(song_name, artist_name);
+    }
+
+    last_downloaded_data_ = audio;
+    return true;
 }
 
 std::string Esp32Music::GetDownloadResult()
@@ -1988,16 +2069,7 @@ void Esp32Music::PlayAudioStream()
                              mp3_frame_info_.nChans);
                 }
 
-                // 创建AudioStreamPacket
-                AudioStreamPacket packet;
-                packet.sample_rate = mp3_frame_info_.samprate;
-                packet.frame_duration = 60; // 使用Application默认的帧时长
-                packet.timestamp = 0;
-
-                // 将int16_t PCM数据转换为uint8_t字节数组
                 size_t pcm_size_bytes = final_sample_count * sizeof(int16_t);
-                packet.payload.resize(pcm_size_bytes);
-                memcpy(packet.payload.data(), final_pcm_data, pcm_size_bytes);
 
                 if (final_pcm_data_fft == nullptr)
                 {
@@ -2023,11 +2095,14 @@ void Esp32Music::PlayAudioStream()
                 if (total_frames_decoded_ <= 6)
                 {
                     ESP_LOGI(TAG, "DBG push in #%d: samples=%d rate=%d state=%d free=%u",
-                             (int)total_frames_decoded_, final_sample_count, packet.sample_rate,
+                             (int)total_frames_decoded_, final_sample_count, mp3_frame_info_.samprate,
                              (int)app.GetDeviceState(),
                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 }
-                app.AddAudioData(std::move(packet));
+                // 直接给指针：AudioStreamPacket 的 payload 每帧都要现分配 2.3KB，
+                // 和 Application 里那次分配叠在一起，内部 RAM 每秒抖 76 次 ——
+                // 碎片到 operator new 抛 bad_alloc，整机就 abort 重启
+                app.AddAudioData(final_pcm_data, (size_t)final_sample_count, mp3_frame_info_.samprate);
                 if (total_frames_decoded_ == 0)
                 {
                     ESP_LOGI(TAG, "起播计时: 首帧 PCM 送出 %d ms",

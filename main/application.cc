@@ -11,6 +11,8 @@
 #include "weather.h"
 
 #include <cstring>
+#include <new>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -1082,122 +1084,120 @@ void Application::SetAecMode(AecMode mode)
 // 新增：接收外部音频数据（如音乐播放）
 void Application::AddAudioData(AudioStreamPacket &&packet)
 {
-    auto codec = Board::GetInstance().GetAudioCodec();
-    if (device_state_ == kDeviceStateIdle)
+    if (packet.payload.size() >= sizeof(int16_t))
     {
-        // packet.payload包含的是原始PCM数据（int16_t）
-        if (packet.payload.size() >= 2)
+        AddAudioData(reinterpret_cast<const int16_t *>(packet.payload.data()),
+                     packet.payload.size() / sizeof(int16_t), packet.sample_rate);
+    }
+}
+
+// 传裸指针 + 复用成员缓冲，播放线程每帧零分配。
+// 原先每帧现建 vector：内部 RAM 只有 30KB 出头，每秒要抖 76 次 2.3KB 的分配
+// （音乐侧 payload 一次 + 这里一次），碎片到 operator new 抛 bad_alloc，
+// 没人接就是 std::terminate → abort → 整机重启，实测连播 51 秒必现。
+void Application::AddAudioData(const int16_t *samples, size_t num_samples, int sample_rate)
+{
+    if (samples == nullptr || num_samples == 0)
+    {
+        return;
+    }
+
+    try
+    {
+        auto codec = Board::GetInstance().GetAudioCodec();
+        if (device_state_ != kDeviceStateIdle)
         {
-            size_t num_samples = packet.payload.size() / sizeof(int16_t);
-            std::vector<int16_t> pcm_data(num_samples);
-            memcpy(pcm_data.data(), packet.payload.data(), packet.payload.size());
+            return;
+        }
 
-            // 检查采样率是否匹配，如果不匹配则进行简单重采样
-            if (packet.sample_rate != codec->output_sample_rate())
+        // resize 到同一容量不再分配，这才是消除碎片的关键
+        std::vector<int16_t> &pcm_data = music_pcm_buf_;
+        pcm_data.resize(num_samples);
+        memcpy(pcm_data.data(), samples, num_samples * sizeof(int16_t));
+
+        // 采样率不一致才重采样：一致时这条路径完全不该有分配
+        if (sample_rate != codec->output_sample_rate())
+        {
+            if (sample_rate <= 0 || codec->output_sample_rate() <= 0)
             {
-                // ESP_LOGI(TAG, "Resampling music audio from %d to %d Hz",
-                //         packet.sample_rate, codec->output_sample_rate());
+                ESP_LOGE(TAG, "Invalid sample rates: %d -> %d",
+                         sample_rate, codec->output_sample_rate());
+                return;
+            }
 
-                // 验证采样率参数
-                if (packet.sample_rate <= 0 || codec->output_sample_rate() <= 0)
+            if (sample_rate > codec->output_sample_rate())
+            {
+                // 能直接改硬件采样率就不用插值，重采样只做兜底
+                ESP_LOGI(TAG, "Music Player: Adjust the sampling rate from %d Hz to %d Hz",
+                         codec->output_sample_rate(), sample_rate);
+                if (codec->SetOutputSampleRate(sample_rate))
                 {
-                    ESP_LOGE(TAG, "Invalid sample rates: %d -> %d",
-                             packet.sample_rate, codec->output_sample_rate());
-                    return;
-                }
-
-                std::vector<int16_t> resampled;
-
-                if (packet.sample_rate > codec->output_sample_rate())
-                {
-                    ESP_LOGI(TAG, "Music Player: Adjust the sampling rate from %d Hz to %d Hz",
-                             codec->output_sample_rate(), packet.sample_rate);
-
-                    // 尝试动态切换采样率
-                    if (codec->SetOutputSampleRate(packet.sample_rate))
-                    {
-                        ESP_LOGI(TAG, "Successfully switched to music playback sampling rate: %d Hz", packet.sample_rate);
-                    }
-                    else
-                    {
-                        ESP_LOGW(TAG, "Unable to switch sampling rate, continue using current sampling rate: %d Hz", codec->output_sample_rate());
-                    }
+                    ESP_LOGI(TAG, "Successfully switched to music playback sampling rate: %d Hz", sample_rate);
                 }
                 else
                 {
-                    if (packet.sample_rate > codec->output_sample_rate())
+                    ESP_LOGW(TAG, "Unable to switch sampling rate, continue using current sampling rate: %d Hz", codec->output_sample_rate());
+                }
+            }
+            else
+            {
+                // 上采样：线性插值
+                float upsample_ratio = codec->output_sample_rate() / static_cast<float>(sample_rate);
+                size_t expected_size = static_cast<size_t>(pcm_data.size() * upsample_ratio + 0.5f);
+                std::vector<int16_t> resampled;
+                resampled.reserve(expected_size);
+
+                for (size_t i = 0; i < pcm_data.size(); ++i)
+                {
+                    resampled.push_back(pcm_data[i]);
+
+                    int interpolation_count = static_cast<int>(upsample_ratio) - 1;
+                    if (interpolation_count > 0 && i + 1 < pcm_data.size())
                     {
-                        // 下采样：简单丢弃部分样本
-                        float downsample_ratio = static_cast<float>(packet.sample_rate) / codec->output_sample_rate();
-                        size_t expected_size = static_cast<size_t>(pcm_data.size() / downsample_ratio + 0.5f);
-                        std::vector<int16_t> resampled(expected_size);
-                        size_t resampled_index = 0;
-
-                        for (size_t i = 0; i < pcm_data.size(); ++i)
+                        int16_t current = pcm_data[i];
+                        int16_t next = pcm_data[i + 1];
+                        for (int j = 1; j <= interpolation_count; ++j)
                         {
-                            if (i % static_cast<size_t>(downsample_ratio) == 0)
-                            {
-                                resampled[resampled_index++] = pcm_data[i];
-                            }
+                            float t = static_cast<float>(j) / (interpolation_count + 1);
+                            int16_t interpolated = static_cast<int16_t>(current + (next - current) * t);
+                            resampled.push_back(interpolated);
                         }
-
-                        pcm_data = std::move(resampled);
-                        ESP_LOGI(TAG, "Downsampled %d -> %d samples (ratio: %.2f)",
-                                 pcm_data.size(), resampled.size(), downsample_ratio);
                     }
-                    else if (packet.sample_rate < codec->output_sample_rate())
+                    else if (interpolation_count > 0)
                     {
-                        // 上采样：线性插值
-                        float upsample_ratio = codec->output_sample_rate() / static_cast<float>(packet.sample_rate);
-                        size_t expected_size = static_cast<size_t>(pcm_data.size() * upsample_ratio + 0.5f);
-                        resampled.reserve(expected_size);
-
-                        for (size_t i = 0; i < pcm_data.size(); ++i)
+                        for (int j = 1; j <= interpolation_count; ++j)
                         {
-                            // 添加原始样本
                             resampled.push_back(pcm_data[i]);
-
-                            // 计算需要插值的样本数
-                            int interpolation_count = static_cast<int>(upsample_ratio) - 1;
-                            if (interpolation_count > 0 && i + 1 < pcm_data.size())
-                            {
-                                int16_t current = pcm_data[i];
-                                int16_t next = pcm_data[i + 1];
-                                for (int j = 1; j <= interpolation_count; ++j)
-                                {
-                                    float t = static_cast<float>(j) / (interpolation_count + 1);
-                                    int16_t interpolated = static_cast<int16_t>(current + (next - current) * t);
-                                    resampled.push_back(interpolated);
-                                }
-                            }
-                            else if (interpolation_count > 0)
-                            {
-                                // 最后一个样本，直接重复
-                                for (int j = 1; j <= interpolation_count; ++j)
-                                {
-                                    resampled.push_back(pcm_data[i]);
-                                }
-                            }
                         }
-
-                        ESP_LOGI(TAG, "Upsampled %d -> %d samples (ratio: %.2f)",
-                                 pcm_data.size(), resampled.size(), upsample_ratio);
                     }
                 }
 
+                ESP_LOGI(TAG, "Upsampled %d -> %d samples (ratio: %.2f)",
+                         (int)pcm_data.size(), (int)resampled.size(), upsample_ratio);
                 pcm_data = std::move(resampled);
             }
+        }
 
-            // 确保音频输出已启用
-            if (!codec->output_enabled())
-            {
-                codec->EnableOutput(true);
-            }
+        // 确保音频输出已启用
+        if (!codec->output_enabled())
+        {
+            codec->EnableOutput(true);
+        }
 
-            // 发送PCM数据到音频编解码器
-            codec->OutputData(pcm_data);
-
-            audio_service_.UpdateOutputTimestamp();
+        codec->OutputData(pcm_data);
+        audio_service_.UpdateOutputTimestamp();
+    }
+    catch (const std::bad_alloc &)
+    {
+        // 每帧都刷日志会让情况更糟（日志本身也要内存），只记前几次现场
+        static int drops = 0;
+        if (drops++ < 5)
+        {
+            ESP_LOGW(TAG, "AddAudioData drop: n=%u cap=%u int_free=%u int_largest=%u psram_free=%u",
+                     (unsigned)num_samples, (unsigned)music_pcm_buf_.capacity(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         }
     }
 }

@@ -254,16 +254,16 @@ McpServer::McpServer() {
      auto music = board.GetMusic();
      if (music) {
         AddTool("self.music.play_song",
-            "播放一首具体的歌（歌名或歌手明确时用）。用户说“听广播/电台/随便听听/放点背景音乐”时不要用它，改调 self.music.play_radio。\n"
-            "参数:\n"
-            "  `audio_url`: 可直连的音频直链（有就传，最快）。\n"
-            "  `lyric_text`: LRC 歌词正文（强烈建议传）—— 设备本地解析，不必访问任何地址。\n"
-            "  `lyric_url`: LRC 歌词地址（可选，仅当服务端和设备同在局域网时才连得上）。\n"
-            "  `title`: 歌名（可选，屏幕显示与歌词同步用）。\n"
-            "  `artist`: 歌手（可选）。\n"
-            "  `song_name`: 歌名（没传 audio_url 时必填，设备自己搜曲拿直链）。\n"
-            "返回:\n"
-            "  播放状态信息，不需确认，立刻播放歌曲。",
+             "播放一首具体的歌（歌名或歌手明确时用）。用户说“听广播/电台/随便听听/放点背景音乐”时不要用它，改调 self.music.play_radio。\n"
+             "参数:\n"
+             "  `song_name`: 歌名（必传）。设备自己联网搜曲、自己解析直链、自己播，不需要你去找地址。\n"
+             "  `artist`: 歌手（可选，帮你选中正确版本）。\n"
+             "  `audio_url`: 仅在用户自己报了一个直链时才传。不要为了“提速”自己上网搜地址——设备端解析比转述更准，你搜来的链接还可能是 VIP 受限的。\n"
+             "  `lyric_text`: LRC 歌词正文（可选，你手上已经有时才传，设备本地解析，不必访问任何地址）。\n"
+             "  `lyric_url`: LRC 歌词地址（可选，仅当服务端和设备同在局域网时才连得上）。\n"
+             "  `title`: 歌名（可选，屏幕显示与歌词同步用；不传就用 song_name）。\n"
+             "返回:\n"
+             "  播放状态。success=false 就是真没放出来（搜不到/网络不通），如实告诉用户，别说已开播。",
             PropertyList({
                 Property("audio_url", kPropertyTypeString, ""),
                 Property("lyric_text", kPropertyTypeString, ""),

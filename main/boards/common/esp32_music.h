@@ -134,6 +134,12 @@ private:
     // 内置曲源：设备自己按歌名联网解析出直链（不经过任何自建服务）
     bool PlayByBuiltinLookup(const std::string& song_name, const std::string& artist_name);
 
+#ifdef XZ_MUSIC_SELFTEST
+    // 上电自检：不经过语音/服务端，直接跑一次内置曲源解析，用来分辨
+    // 「设备自己搜不到」和「指令压根没到设备」两种截然不同的故障
+    std::thread selftest_thread_;
+#endif
+
     // 歌词相关私有方法
     bool DownloadLyrics(const std::string& lyric_url);
     // 歌词正文随消息下发时的入口：直接解析，不走 HTTP

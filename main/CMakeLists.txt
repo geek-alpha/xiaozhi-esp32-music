@@ -282,6 +282,13 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     )
 
+# 真机自检开关（默认关）：用环境变量 XZ_MUSIC_SELFTEST=1 开，
+# 用来在上电后不靠语音跑一次内置曲源解析
+if(DEFINED ENV{XZ_MUSIC_SELFTEST})
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE XZ_MUSIC_SELFTEST)
+    message(STATUS "XZ_MUSIC_SELFTEST enabled")
+endif()
+
 # 添加生成规则
 add_custom_command(
     OUTPUT ${LANG_HEADER}

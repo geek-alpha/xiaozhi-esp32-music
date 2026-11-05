@@ -141,5 +141,10 @@ void SystemInfo::PrintTaskList() {
 void SystemInfo::PrintHeapStats() {
     int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+    // psram 两列一起打：只打内部堆看不出音乐播放期间 PSRAM 从 7.7MB 滑到 380KB，
+    // 得靠这条曲线定位是谁在吃（free 下滑 + largest 变小 = 碎片而非泄漏）。
+    ESP_LOGI(TAG, "free sram: %u minimal sram: %u psram: %u psram_largest: %u",
+             free_sram, min_free_sram,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }

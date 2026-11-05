@@ -3,6 +3,7 @@
 
 #include <esp_log.h>
 #include <sstream>
+#include <cstring>
 
 #define DETECTION_RUNNING_EVENT 1
 
@@ -135,8 +136,12 @@ void AfeWakeWord::AudioDetectionTask() {
             continue;;
         }
 
-        // Store the wake word data for voice recognition, like who is speaking
-        StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
+        // 唤醒词数据丢了只是这次识别少一截，但异常没人接就是整机重启，所以兜住
+        try {
+            StoreWakeWordData(res->data, res->data_size / sizeof(int16_t));
+        } catch (const std::bad_alloc&) {
+            ESP_LOGW(TAG, "StoreWakeWordData: out of memory, dropped one chunk");
+        }
 
         if (res->wakeup_state == WAKENET_DETECTED) {
             Stop();
@@ -150,12 +155,22 @@ void AfeWakeWord::AudioDetectionTask() {
 }
 
 void AfeWakeWord::StoreWakeWordData(const int16_t* data, size_t samples) {
-    // store audio data to wake_word_pcm_
-    wake_word_pcm_.emplace_back(std::vector<int16_t>(data, data + samples));
-    // keep about 2 seconds of data, detect duration is 30ms (sample_rate == 16000, chunksize == 512)
-    while (wake_word_pcm_.size() > 2000 / 30) {
+    // 窗口 2 秒、每块 30ms = 66 块。原来是每 30ms 新建一个 vector，而这块板子
+    // 播放音乐时 PSRAM 只剩 380KB，反复 malloc/free 1KB 把堆打到碎片，
+    // AudioDetectionTask 上没人接 bad_alloc —— terminate → abort（真机 113 秒实测）。
+    // 改成槽位复用：块数到上限后把最老的一块搬到末尾接着用，稳态零分配。
+    constexpr size_t kMaxChunks = 2000 / 30;
+    if (wake_word_pcm_.size() < kMaxChunks) {
+        wake_word_pcm_.emplace_back(samples, 0);
+    } else {
+        wake_word_pcm_.push_back(std::move(wake_word_pcm_.front()));
         wake_word_pcm_.pop_front();
     }
+    auto& chunk = wake_word_pcm_.back();
+    if (chunk.size() != samples) {
+        chunk.resize(samples);
+    }
+    memcpy(chunk.data(), data, samples * sizeof(int16_t));
 }
 
 void AfeWakeWord::EncodeWakeWordData() {

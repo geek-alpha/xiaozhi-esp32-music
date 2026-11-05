@@ -67,6 +67,8 @@ public:
 
     // 新增：接收外部音频数据（如音乐播放）
     void AddAudioData(AudioStreamPacket&& packet);
+    // 零拷贝版：直接给 PCM 指针，内部复用一块缓冲（播放线程每帧零分配）
+    void AddAudioData(const int16_t* samples, size_t num_samples, int sample_rate);
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
 
@@ -84,6 +86,8 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+    // 音乐 PCM 复用缓冲：容量稳定后 resize 不再分配，只在音乐播放线程里用
+    std::vector<int16_t> music_pcm_buf_;
 
     bool has_server_time_ = false;
     bool aborted_ = false;
