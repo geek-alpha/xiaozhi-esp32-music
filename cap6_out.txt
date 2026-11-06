@@ -1,0 +1,1 @@
+captured 340.0s of COM19 -> fix3.log

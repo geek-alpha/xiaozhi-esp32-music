@@ -1,0 +1,1 @@
+{'ARTISTPIC':'','HIT':'0','HITMODE':'nores','HIT_BUT_OFFLINE':'0','MSHOW':'0','NEW':'0','PN':'0','RN':'8','SHOW':'0','TOTAL':'0','abslist':[]}

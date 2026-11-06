@@ -1,0 +1,1 @@
+captured 45.0s of COM20 -> boot_2014.log

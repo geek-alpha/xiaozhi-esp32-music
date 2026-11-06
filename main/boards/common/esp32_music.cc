@@ -397,6 +397,27 @@ static std::string quoted_field(const std::string &seg, const char *key)
     return seg.substr(s, e - s);
 }
 
+// 歌名比对前归一化：只保留汉字和字母数字，大写转小写。
+// 「野狼disco」和「野狼Disco」、「起风了 (Live)」和「起风了」必须算同一首，
+// 否则硬淘汰会误伤；反过来不归一化就分不清「孤岛」和「小半」这种搜错歌。
+static std::string norm_key(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        if (c >= 'A' && c <= 'Z')
+        {
+            out.push_back((char)(c - 'A' + 'a'));
+        }
+        else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (unsigned char)c >= 0x80)
+        {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
 // 三家字段名不同，判据是同一套：像不像用户点的那首。
 static int score_candidate(const std::string &name, const std::string &artist_field,
                            const std::string &want_song, const std::string &want_artist, int dur_sec)
@@ -406,18 +427,22 @@ static int score_candidate(const std::string &name, const std::string &artist_fi
     {
         return -1000;
     }
+    std::string n_name = norm_key(name);
+    std::string n_want = norm_key(want_song);
     int score = 0;
-    if (name.find(want_song) != std::string::npos)
+    if (!n_want.empty() && n_name.find(n_want) != std::string::npos)
     {
         score += 40;
     }
-    else if (!name.empty() && want_song.find(name) != std::string::npos)
+    else if (!n_name.empty() && n_want.find(n_name) != std::string::npos)
     {
         score += 10;
     }
     else
     {
-        score -= 20;
+        // 歌名完全不是这首就淘汰，不给分让它排后面：酷狗搜「孤岛」第一页全是
+        // 同歌手的其他歌，原来扣 20 分照样能选中，用户点 A 却响 B。
+        return -1000;
     }
     if (!want_artist.empty() && artist_field.find(want_artist) != std::string::npos)
     {
@@ -578,9 +603,26 @@ static bool kuwo_lookup(const std::string &song_name, const std::string &artist_
 static bool netease_lookup(const std::string &song_name, const std::string &artist_name, std::string &out_url)
 {
     out_url.clear();
-    std::string search_url = "https://music.163.com/api/search/get/web?s=" + url_encode(song_name) +
-                             "&type=1&offset=0&limit=6";
-    std::string body = http_get_text_ex(search_url, "https://music.163.com/");
+    // 云音乐按 IP 限流：/api/search/get/web 被盯上后回 HTTP 200 + {"code":405,
+    // "msg":"操作频繁"}（body 仅 94 字节，没有 songs），设备上表现为整源静默失效。
+    // 不带 /web 的同名接口和 cloudsearch 走的是另一套配额，实测未被限，按顺序试。
+    static const char *const kSearchBases[] = {
+        "https://interface.music.163.com/api/search/get?s=",
+        "https://music.163.com/api/cloudsearch/pc?s=",
+        "https://music.163.com/api/search/get/web?s=",
+    };
+    std::string body;
+    for (auto base : kSearchBases)
+    {
+        body = http_get_text_ex(std::string(base) + url_encode(song_name) + "&type=1&offset=0&limit=6",
+                               "https://music.163.com/");
+        if (body.find("\"songs\"") != std::string::npos)
+        {
+            break;
+        }
+        ESP_LOGW(TAG, "netease: %s no songs (%d bytes), next endpoint", base, (int)body.size());
+        body.clear();
+    }
     if (body.empty())
     {
         ESP_LOGE(TAG, "netease: search returned nothing");
@@ -949,9 +991,21 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
     // 诊断用：真机到底能不能自己搜到，只能靠设备自己跑一次回答
     StartBgThread(selftest_thread_, "selftest", [this]() {
         std::this_thread::sleep_for(std::chrono::seconds(30));
-        ESP_LOGI(TAG, "SELFTEST: start builtin lookup");
-        bool ok = PlayByBuiltinLookup("孤勇者", "陈奕迅");
-        ESP_LOGI(TAG, "SELFTEST: done ok=%d", (int)ok);
+        // 三首各验一件事：正常命中、大小写归一化不误伤、源里没有就必须认怂
+        const char *cases[][2] = {
+            {"起风了", "买辣椒也用券"},
+            {"野狼disco", "宝石Gem"},
+            {"孤岛", "陈粒"},
+        };
+        for (auto &c : cases)
+        {
+            ESP_LOGI(TAG, "SELFTEST: lookup %s/%s", c[0], c[1]);
+            bool ok = PlayByBuiltinLookup(c[0], c[1]);
+            std::string u = last_downloaded_data_;
+            ESP_LOGI(TAG, "SELFTEST: %s ok=%d url=%.90s", c[0], (int)ok, u.c_str());
+            std::this_thread::sleep_for(std::chrono::seconds(45));
+        }
+        ESP_LOGI(TAG, "SELFTEST: done");
     }, 16 * 1024);
 #endif
 }

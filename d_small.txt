@@ -1,0 +1,254 @@
+diff --git a/main/application.cc b/main/application.cc
+index 656968f..b01902a 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -488 +488,5 @@ void Application::Start()
+-        board.SetPowerSaveMode(true);
++        // 播放期间不能开 modem sleep：电台是持续收流，省电会把收包攒到 beacon，
++        // 几十毫秒的接收空档正好撞上 I2S 只有 32ms 的硬件缓冲，听感就是一直卡。
++        if (!audio_owns_channel_) {
++            board.SetPowerSaveMode(true);
++        }
+@@ -492,2 +496,3 @@ void Application::Start()
+-        // 是音乐/提醒把通道借走了，不是会话真断：别当成断连去续接
+-        bool for_audio = audio_suspend_closing_.exchange(false);
++        // 是音乐/提醒把通道借走了，不是会话真断：别当成断连去续接。
++        // audio_owns_channel_ 覆盖整段播放：goodbye 会引来第二次 close，脉冲挡不住它。
++        bool for_audio = audio_suspend_closing_.exchange(false) || audio_owns_channel_;
+@@ -749,0 +755,15 @@ void Application::MainEventLoop()
++
++            // 音乐播放中用户开口 = 要打断。这是唯一能落到「用户意图」的信号：
++            // 唤醒词在音频处理器跑起来后是关着的，想打断只能直接说话。
++            // 但设备自己 TTS 说话时不行：这块板 AEC 参考通道没接上（日志 AEC: ref=109 frames=0），
++            // 扬声器声音直接灌回麦克风，VAD 必然把尾音判成人声 —— AI 一说完「已开播」就把刚起的台停掉，
++            // 实测 radio14.log 里 61 次误停，每次都是 total played 0 bytes。
++            if (device_state_ != kDeviceStateSpeaking && audio_service_.IsVoiceDetected())
++            {
++                auto music = Board::GetInstance().GetMusic();
++                if (music)
++                {
++                    ESP_LOGI(TAG, "Stopping music streaming: user started speaking");
++                    music->StopStreaming();
++                }
++            }
+@@ -825,0 +846 @@ void Application::SuspendSessionForAudio()
++    audio_owns_channel_ = true;
+@@ -826,0 +848,2 @@ void Application::SuspendSessionForAudio()
++    // 独占通道这段时间网络要持续供数据，modem sleep 一开就是周期性断供
++    Board::GetInstance().SetPowerSaveMode(false);
+@@ -840,0 +864 @@ void Application::ResumeAfterAudio()
++    audio_owns_channel_ = false;
+@@ -843,0 +868,2 @@ void Application::ResumeAfterAudio()
++        // 播放彻底结束、也不接回会话：把 modem sleep 还给系统
++        Board::GetInstance().SetPowerSaveMode(true);
+@@ -915,11 +941,3 @@ void Application::SetDeviceState(DeviceState state)
+-    // 当从idle状态变成其他任何状态时，停止音乐播放
+-    if (previous_state == kDeviceStateIdle && state != kDeviceStateIdle)
+-    {
+-        auto music = board.GetMusic();
+-        if (music)
+-        {
+-            ESP_LOGI(TAG, "Stopping music streaming due to state change: %s -> %s",
+-                     STATE_STRINGS[previous_state], STATE_STRINGS[state]);
+-            music->StopStreaming();
+-        }
+-    }
++    // 停音乐只认「用户真开口」这一个信号，见 VAD 事件与 OnWakeWordDetected。
++    // 这里不能按状态停：tts 播完服务端会自己把状态打回 listening，那是系统行为，
++    // 跟着停就等于每句「已经开播啦」都亲手把刚起的歌掐掉。
+diff --git a/main/application.h b/main/application.h
+index 57a76ab..445a92c 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -100,0 +101,3 @@ private:
++    // 整段音频播放期间都为 true。closing 只是一次脉冲，挡不住服务端 goodbye 引出的
++    // 第二次 close 回调——第二次会被当成断连去续接，把刚起播的歌直接掐掉。
++    std::atomic<bool> audio_owns_channel_{false};
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index 56b54c8..9a8592d 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -15,0 +16,4 @@
++// 播放侧单独加厚：6×240 在 44.1kHz 下只有 32.6ms，WiFi 一次调度抖动就够把 DMA 掏空、直接断音。
++// 16×320 = 5120 帧 ≈ 116ms@44.1k，给播放线程留出补数据的余量；麦克风仍用上面的原值，不拖长录音延迟。
++#define AUDIO_CODEC_TX_DMA_DESC_NUM 16
++#define AUDIO_CODEC_TX_DMA_FRAME_NUM 320
+diff --git a/main/audio/codecs/no_audio_codec.cc b/main/audio/codecs/no_audio_codec.cc
+index eea3309..eb72418 100644
+--- a/main/audio/codecs/no_audio_codec.cc
++++ b/main/audio/codecs/no_audio_codec.cc
+@@ -87,2 +87,2 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
+-        .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
+-        .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
++        .dma_desc_num = AUDIO_CODEC_TX_DMA_DESC_NUM,
++        .dma_frame_num = AUDIO_CODEC_TX_DMA_FRAME_NUM,
+@@ -205,0 +206,3 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
++    // 麦克风走原配置：录音延迟直接决定唤醒和 AEC 表现，别跟着扬声器一起变厚
++    chan_cfg.dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM;
++    chan_cfg.dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM;
+diff --git a/main/boards/common/esp32_music.h b/main/boards/common/esp32_music.h
+index 65bf031..3d37c2f 100644
+--- a/main/boards/common/esp32_music.h
++++ b/main/boards/common/esp32_music.h
+@@ -66 +66,4 @@ private:
+-    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）
++    static constexpr size_t MIN_BUFFER_SIZE = 48 * 1024;   // 起播门槛：约3秒(128kbps)，起得稳一点
++    // 断流后恢复播放的门槛：实测拉流 13KB/s 略低于 128kbps(16KB/s)，等 64KB 就是每断一次静音 5 秒。
++    // 8KB≈0.5 秒，既不会每次抖动都破音，也不会把一次断流拖成一条长静音。
++    static constexpr size_t RESUME_BUFFER_SIZE = 8 * 1024;
+@@ -82,0 +86,8 @@ private:
++    // 电台是无限流：断了自动重连、永远没有「播完」那一刻，所以不上报 music_finished，
++    // 也不参与歌单连播。换台/停止都走同一个覆盖路径。
++    std::atomic<bool> is_radio_{false};
++
++    // 起播是否真的连上：StartStreaming 只保证线程起了，MCP 却据此回「已开始播放」。
++    // 实测 20ms 就回成功，HTTP 还在握手；用户等到的是「说播了但没声」。
++    std::atomic<bool> first_audio_ready_{false};
++
+@@ -84,0 +96,2 @@ private:
++    // 单次连接读到结尾/断流；live_stream 为 true 时外层会自己连回来（电台用）
++    void StreamSession(const std::string& music_url, size_t& round_bytes, size_t& total_downloaded, bool& live_stream);
+@@ -148,0 +162,11 @@ public:
++
++    // 电台：station 走内置台表（支持别名/中文），url 非空则直接用它（用户自己给地址）。
++    // index 是 BrowseRadio 返回的序号（1 起），传了它就不用再靠台名匹配。
++    // 返回 false 表示查不到这个台，或者用户只是泛泛说了句「放广播」——后者要去先给用户挑。
++    bool PlayRadio(const std::string& station, const std::string& url, int index = 0);
++    // 按用户需求（「学习的时候」「开车」「睡前」）挑候选台，只返回 JSON 不播放。
++    static std::string BrowseRadio(const std::string& want);
++    // station 里有没有具体台名：剥掉「电台/广播/听/放」这些泛称词后什么都不剩就是没有
++    static bool IsGenericRadioName(const std::string& station);
++    // 内置台名清单，AI 拿它给用户挑
++    static std::string RadioStationNames();
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index 2cdfe87..9c5613f 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -257 +257 @@ McpServer::McpServer() {
+-            "播放歌曲。有 `audio_url` 就直推直链；没直链只传 `song_name` 也行 —— 设备自己联网解析。\n"
++            "播放一首具体的歌（歌名或歌手明确时用）。用户说“听广播/电台/随便听听/放点背景音乐”时不要用它，改调 self.music.play_radio。\n"
+@@ -322,0 +323,60 @@ McpServer::McpServer() {
++         AddTool("self.music.browse_radio",
++             "用户说的是想听什么「场景/感觉」而不是具体台名时，用它找候选台"
++             "（“想听点适合学习的”“开车路上听的”“睡前想安静点”“有没有怀旧的”“想听粤语”“想听新闻”）。\n"
++             "只查不播。拿到清单后挑 2~3 个，用地道口语把台名和风格念给用户听，问他要哪个。\n"
++             "参数:\n"
++             "  `want`: 需求关键词（学习、专注、开车、睡前、怀旧、粤语、新闻、某个城市）。留空返回一批通用台。\n"
++             "返回:\n"
++             "  {\"count\":N,\"stations\":[{\"index\":序号,\"name\":台名,\"desc\":一句话风格}]}\n"
++             "  用户定下哪个，用 self.music.play_radio 带 index 播，别自己编台名。清单为空就把需求问细一点。",
++             PropertyList({
++                 Property("want", kPropertyTypeString, "")
++             }),
++             [](const PropertyList& properties) -> ReturnValue {
++                 return Esp32Music::BrowseRadio(properties["want"].value<std::string>());
++             });
++
++         AddTool("self.music.play_radio",
++             "播放某个具体电台（无限直播流）。用户点名了台名、或者从候选里挑定了，用它。\n"
++             "用户只是模糊表达（“放个广播”“随便听点什么”“想听适合学习的”）时先调 self.music.browse_radio，"
++             "把候选念给用户挑，他选完再带 index 回来播——别替用户挑一个就播。\n"
++             "参数:\n"
++             "  `station`: 台名或别名（用户点名时传，如 中国之声、广东、浙江音乐、怀旧、北京新闻）\n"
++             "  `index`: browse_radio 返回的序号（用户从候选里挑定时传，最稳，不会念错台名）\n"
++             "  `url`: 音频流直链（用户自己给了地址才传）\n"
++             "返回:\n"
++             "  success=true 才是真播上了。need_choice=true 说明用户没点名：把 candidates 念成 2~3 个选择给他。\n"
++             "  success=false 且带 available：台名对不上，照 available 让用户重选。",
++             PropertyList({
++                 Property("station", kPropertyTypeString, ""),
++                 Property("index", kPropertyTypeInteger, 0, 0, 999),
++                 Property("url", kPropertyTypeString, "")
++             }),
++             [music](const PropertyList& properties) -> ReturnValue {
++                 auto station = properties["station"].value<std::string>();
++                 auto url = properties["url"].value<std::string>();
++                 auto index = properties["index"].value<int>();
++                 if (url.empty() && index <= 0 && Esp32Music::IsGenericRadioName(station)) {
++                     return "{\"success\": false, \"need_choice\": true, \"candidates\": " +
++                            Esp32Music::BrowseRadio("") +
++                            ", \"message\": \"用户没点名，别替他挑。从 candidates 里挑 2~3 个，连台名带风格念给他，问他要哪个。\"}";
++                 }
++                 auto esp32_music = static_cast<Esp32Music*>(music);
++                 if (!esp32_music->PlayRadio(station, url, index)) {
++                     return "{\"success\": false, \"message\": \"电台没播起来（4 秒内没拉到一个字节音频）。台名对不上就照 available 让用户重选；对得上就是网络或源不可达。要如实说没放出来，绝不能说已开播。\", \"available\": \"" + Esp32Music::RadioStationNames() + "\"}";
++                 }
++                 return "{\"success\": true, \"message\": \"电台已开始播放\"}";
++             });
++
++         AddTool("self.music.stop",
++             "停止当前播放：歌曲、歌单、电台都停，顺带丢掉排队的下一首。\n"
++             "参数: 无。\n"
++             "返回:\n"
++             "  停止结果。用户说“停/别放了/关掉音乐/关掉广播”就用它。",
++             PropertyList(),
++             [music](const PropertyList& properties) -> ReturnValue {
++                 auto esp32_music = static_cast<Esp32Music*>(music);
++                 esp32_music->StopStreaming();
++                 return "{\"success\": true, \"message\": \"已停止播放\"}";
++             });
++
+@@ -670,3 +730,8 @@ McpServer::McpServer() {
+-     if (next_cursor.empty()) {
+-         json += "]}";
+-     } else {
++    // 服务器端只会看到这一页里的工具，分页丢了什么必须能从串口看出来
++    ESP_LOGI(TAG, "tools/list: %d tools registered, page payload=%u bytes, next=%s",
++             (int)tools_.size(), (unsigned)json.size(),
++             next_cursor.empty() ? "none" : next_cursor.c_str());
++
++    if (next_cursor.empty()) {
++        json += "]}";
++    } else {
+@@ -733 +798,2 @@ McpServer::McpServer() {
+-    // Start a task to receive data with stack size
++    // 播放音频时内部 RAM 会掉到 1.7KB，6KB 内部栈建线程必然失败；
++    // 而 std::thread 失败是抛 system_error，没人接就 terminate→abort 重启。
+@@ -735,7 +801,33 @@ McpServer::McpServer() {
+-     cfg.thread_name = "tool_call";
+-     cfg.stack_size = stack_size;
+-     cfg.prio = 1;
+-     esp_pthread_set_cfg(&cfg);
+- 
+-     // Use a thread to call the tool to avoid blocking the main thread
+-    tool_call_thread_ = std::thread([this, id, tool_iter, tool_name, arguments = std::move(arguments)]() {
++    cfg.thread_name = "tool_call";
++    cfg.stack_size = stack_size;
++    cfg.prio = 1;
++    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= 64 * 1024) {
++        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
++    }
++    esp_pthread_set_cfg(&cfg);
++    // cfg 是线程局部的，会污染本线程后面建的所有线程，用完立刻还原
++    esp_pthread_cfg_t restore = esp_pthread_get_default_config();
++
++    PropertyList fallback_args = arguments;
++    bool started = false;
++    try {
++        // Use a thread to call the tool to avoid blocking the main thread
++        tool_call_thread_ = std::thread([this, id, tool_iter, tool_name, arguments = std::move(arguments)]() {
++            try {
++                std::string result = (*tool_iter)->Call(arguments);
++                ESP_LOGI(TAG, "tools/call %s -> %.220s", tool_name.c_str(), result.c_str());
++                ReplyResult(id, result);
++            } catch (const std::exception& e) {
++                ESP_LOGE(TAG, "tools/call: %s", e.what());
++                ReplyError(id, e.what());
++            }
++        });
++        tool_call_thread_.detach();
++        started = true;
++    } catch (const std::exception& e) {
++        ESP_LOGE(TAG, "tool_call thread failed (%s), running synchronously", e.what());
++    }
++    esp_pthread_set_cfg(&restore);
++
++    // 建不起线程就同步执行：这个线程只是为了不阻塞 MQTT，慢一点也远好过重启
++    if (!started) {
+@@ -743 +835 @@ McpServer::McpServer() {
+-            std::string result = (*tool_iter)->Call(arguments);
++            std::string result = (*tool_iter)->Call(fallback_args);
+@@ -750,2 +842 @@ McpServer::McpServer() {
+-    });
+-     tool_call_thread_.detach();
++    }

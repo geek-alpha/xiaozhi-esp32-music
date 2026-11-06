@@ -1,0 +1,1 @@
+captured 240.0s of COM19 -> badalloc_fix.log

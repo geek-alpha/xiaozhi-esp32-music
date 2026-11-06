@@ -1,0 +1,1 @@
+captured 60.0s of COM20 -> diag_stop.log
