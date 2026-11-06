@@ -20,8 +20,17 @@
 
 static const char *TAG = "WifiBoard";
 
-// -70dBm 是 2.4G 的分水岭：再往下重传率明显抬头，这时还开 modem sleep 就是在给链路添堵
-static constexpr int kWEAK_RSSI_DBM = -70;
+// 这设备是插电桌面音箱，modem sleep 省的那几十 mA 不值得拿实时音频的抖动去换。
+// 实测待机 -63dBm 时仍在开 sleep，射频按 beacon 窗口间歇停摆，RSSI 采样跟着来回跳。
+// 只有信号极好（-55 以上）时才允许睡眠，其余一律保持射频常醒。
+static constexpr int kNoSleepRssiDbm = -55;
+
+// 单次 RSSI 采样受 beacon 窗口影响会抖，显示口径用指数平滑；判据仍按真实范围。
+static int8_t SmoothRssi(int8_t rssi) {
+    static int smooth = rssi;
+    smooth = (smooth * 3 + rssi) / 4;
+    return (int8_t)smooth;
+}
 
 WifiBoard::WifiBoard() {
     Settings settings("wifi", true);
@@ -122,8 +131,15 @@ void WifiBoard::StartNetwork() {
         esp_wifi_sta_get_ap_info(&ap_info);
         esp_wifi_get_channel(&primary, &second);
         esp_wifi_get_bandwidth(WIFI_IF_STA, &bw);
-        ESP_LOGI(TAG, "Link up: ssid=%s rssi=%d ch=%d bw=%s",
-                 ssid.c_str(), ap_info.rssi, primary, bw == WIFI_BW_HT40 ? "HT40" : "HT20");
+        wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+        esp_wifi_get_ps(&ps);
+        ESP_LOGI(TAG, "Link up: ssid=%s rssi=%d ch=%d bw=%s ps=%s",
+                 ssid.c_str(), ap_info.rssi, primary, bw == WIFI_BW_HT40 ? "HT40" : "HT20",
+                 ps == WIFI_PS_NONE ? "none" : "modem");
+
+        // IDF 默认就是 modem sleep，不主动跑一次判定，待机省电状态就是随机的：
+        // 实测 -63dBm 时 ps 还停在 modem，射频间歇停摆，图标跟着一格两格乱跳。
+        SetPowerSaveMode(true);
     });
     wifi_station.Start();
 
@@ -154,10 +170,10 @@ const char* WifiBoard::GetNetworkStateIcon() {
     if (!wifi_station.IsConnected()) {
         return FONT_AWESOME_WIFI_OFF;
     }
-    int8_t rssi = wifi_station.GetRssi();
-    if (rssi >= -60) {
+    int8_t rssi = SmoothRssi(wifi_station.GetRssi());
+    if (rssi >= -65) {
         return FONT_AWESOME_WIFI;
-    } else if (rssi >= -70) {
+    } else if (rssi >= -78) {
         return FONT_AWESOME_WIFI_FAIR;
     } else {
         return FONT_AWESOME_WIFI_WEAK;
@@ -184,13 +200,16 @@ std::string WifiBoard::GetBoardJson() {
 void WifiBoard::SetPowerSaveMode(bool enabled) {
     auto& wifi_station = WifiStation::GetInstance();
 
-    // 弱信号下开 modem sleep 等于自断生路：射频按 beacon 周期停摆，漏包只能靠重传来补，
-    // 而重传又要等下一个醒来的窗口。实测本机在 -70~-79dBm 徘徊，这个区间省电换来的全是断流。
+    // 开 modem sleep 等于让射频按 beacon 周期停摆，漏包只能等下一个唤醒窗口重传。
+    // 音频要的是稳定供流不是省电：拿不到链路信息也当弱信号处理，宁可不睡。
     if (enabled) {
         wifi_ap_record_t ap = {};
-        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK && ap.rssi < kWEAK_RSSI_DBM) {
-            ESP_LOGI(TAG, "RSSI %d weak, keep radio awake instead of modem sleep", ap.rssi);
+        if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK || ap.rssi < kNoSleepRssiDbm) {
             wifi_station.SetPowerSaveMode(false);
+            wifi_ps_type_t keep = WIFI_PS_MIN_MODEM;
+            esp_wifi_get_ps(&keep);
+            ESP_LOGI(TAG, "rssi=%d (<%d or unknown), keep radio awake: ps=%s", ap.rssi, kNoSleepRssiDbm,
+                     keep == WIFI_PS_NONE ? "none" : "modem");
             return;
         }
     }
@@ -276,9 +295,11 @@ std::string WifiBoard::GetDeviceStatusJson() {
     cJSON_AddStringToObject(network, "type", "wifi");
     cJSON_AddStringToObject(network, "ssid", wifi_station.GetSsid().c_str());
     int rssi = wifi_station.GetRssi();
-    if (rssi >= -60) {
+    // 数字要能查到：说信号差不能只给 strong/weak 这种形容词，-63 和 -80 是两回事
+    cJSON_AddNumberToObject(network, "rssi", rssi);
+    if (rssi >= -65) {
         cJSON_AddStringToObject(network, "signal", "strong");
-    } else if (rssi >= -70) {
+    } else if (rssi >= -78) {
         cJSON_AddStringToObject(network, "signal", "medium");
     } else {
         cJSON_AddStringToObject(network, "signal", "weak");

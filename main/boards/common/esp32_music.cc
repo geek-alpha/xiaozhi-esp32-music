@@ -1338,8 +1338,8 @@ bool Esp32Music::StartStreaming(const std::string &music_url)
     ESP_LOGI(TAG, "Starting streaming for URL: %s", music_url.c_str());
 
     // 省电模式会把射频周期性停掉，实测拉流 5~6KB/s 且忽高忽低，64k 流(8KB/s)扛不住。
-    // 只在流播放期间关，待机仍按默认省电。
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    // 走 board 的统一入口，别绕过策略裸调 esp_wifi_set_ps：停止播放后的恢复会漏掉。
+    Board::GetInstance().SetPowerSaveMode(false);
   try {
 
     // 停止之前的播放和下载
