@@ -292,23 +292,102 @@ static std::string force_http(std::string url)
     return url;
 }
 
-bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::string &artist_name)
+// 曲库 = 三源并集。三家各有各的版权盲区：VIP 原版谁都不给，但冷门歌、独立音乐、
+// 曲源各有各的门槛：网易云要 Referer，酷狗不要。UA 统一给桌面浏览器——
+// 短 UA 在几家都会被判成爬虫，直接吐空结果。
+static const char *kBrowserUa =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+static std::string http_get_text_ex(const std::string &url, const char *referer, int timeout_ms = 10000)
 {
-    if (song_name.empty())
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (!http)
     {
-        return false;
+        return "";
     }
+    http->SetHeader("User-Agent", kBrowserUa);
+    if (referer != nullptr && referer[0] != '\0')
+    {
+        http->SetHeader("Referer", referer);
+    }
+    http->SetHeader("Accept", "*/*");
+    http->SetTimeout(timeout_ms);
+    if (!http->Open("GET", url))
+    {
+        return "";
+    }
+    if (http->GetStatusCode() != 200)
+    {
+        http->Close();
+        return "";
+    }
+    std::string body = http->ReadAll();
+    http->Close();
+    return body;
+}
+
+// 三家字段名不同，判据是同一套：像不像用户点的那首。
+static int score_candidate(const std::string &name, const std::string &artist_field,
+                           const std::string &want_song, const std::string &want_artist, int dur_sec)
+{
+    std::string seg = name + " " + artist_field;
+    if (contains_any(seg, kNoiseHard, kNoiseHardN))
+    {
+        return -1000;
+    }
+    int score = 0;
+    if (name.find(want_song) != std::string::npos)
+    {
+        score += 40;
+    }
+    else if (!name.empty() && want_song.find(name) != std::string::npos)
+    {
+        score += 10;
+    }
+    else
+    {
+        score -= 20;
+    }
+    if (!want_artist.empty() && artist_field.find(want_artist) != std::string::npos)
+    {
+        score += 30;
+    }
+    score -= 10 * count_any(seg, kNoiseSoft, kNoiseSoftN);
+    if (dur_sec >= 120 && dur_sec <= 420)
+    {
+        score += 10;
+    }
+    else if (dur_sec > 420)
+    {
+        score -= 10;
+    }
+    else if (dur_sec > 0)
+    {
+        score -= 15;
+    }
+    return score;
+}
+
+// 酷我：搜索接口返回 GBK 编码的单引号伪 JSON，设备端没有码表做转码 ——
+// 歌名歌手只用调用方传来的 UTF-8，返回里只抽数字字段（rid/时长）。
+static bool kuwo_lookup(const std::string &song_name, const std::string &artist_name,
+                        std::string &out_url, std::string &out_rid)
+{
+    out_url.clear();
+    out_rid.clear();
 
     // 只拿歌名搜：拼上歌手会让结果偏向「该歌手其他歌」——搜「晴天 周杰伦」前八条
     // 里一条原唱都没有，全是伴奏/串烧/别人的歌。歌手名只用来给候选打分。
     std::string search_url = "http://search.kuwo.cn/r.s?all=" + url_encode(song_name) +
                              "&ft=music&client=kt&itemset=web_2013&pn=0&rn=8&rformat=json&encoding=utf8";
-    ESP_LOGI(TAG, "Builtin lookup search: %s", search_url.c_str());
+    ESP_LOGI(TAG, "kuwo search: %s", search_url.c_str());
 
     std::string body = http_get_text(search_url);
     if (body.empty())
     {
-        ESP_LOGE(TAG, "Builtin lookup: search returned nothing");
+        ESP_LOGE(TAG, "kuwo: search returned nothing");
         return false;
     }
 
@@ -403,7 +482,19 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
     }
     if (best_rid.empty())
     {
-        ESP_LOGE(TAG, "Builtin lookup: no usable track for '%s'", song_name.c_str());
+        ESP_LOGE(TAG, "kuwo: no usable track for '%s'", song_name.c_str());
+        return false;
+    }
+
+    // 短片段等于没有这首歌：酷我对无版权的歌常回 100~130s 的试听片段
+    // （实测「孤勇者」116s、「晴天」126s，原曲都在 250s 以上），放出来半首就断。
+    // 让给下一源，它给的完整版通常就在网易云/酷狗那边。
+    if (best_duration > 0 && best_duration < 150)
+    {
+        ESP_LOGW(TAG, "kuwo: only a %ds clip for '%s', defer to other sources", best_duration,
+                 song_name.c_str());
+        out_url.clear();
+        out_rid.clear();
         return false;
     }
 
@@ -417,15 +508,328 @@ bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::st
     }
     if (audio_url.rfind("http", 0) != 0)
     {
-        ESP_LOGE(TAG, "Builtin lookup: no direct url for rid %s", best_rid.c_str());
+        ESP_LOGE(TAG, "kuwo: no direct url for rid %s", best_rid.c_str());
         return false;
     }
-    audio_url = force_http(audio_url);
 
-    ESP_LOGI(TAG, "Builtin lookup: %s -> rid %s, %ds, score %d, %s",
-             song_name.c_str(), best_rid.c_str(), best_duration, best_score, audio_url.c_str());
-    last_downloaded_data_ = audio_url;
-    return PlayResolved(audio_url, "", song_name, best_rid);
+    out_url = force_http(audio_url);
+    out_rid = best_rid;
+    ESP_LOGI(TAG, "kuwo: rid %s, %ds, score %d", best_rid.c_str(), best_duration, best_score);
+    return true;
+}
+
+
+// 网易云：搜索接口是明文 JSON，外链 media/outer 会 302 到 CDN 上的 mp3。
+// 无版权的歌也回 302，但跳去 /404（HTML 页面），靠 Location 认出来。
+static bool netease_lookup(const std::string &song_name, const std::string &artist_name, std::string &out_url)
+{
+    out_url.clear();
+    std::string search_url = "https://music.163.com/api/search/get/web?s=" + url_encode(song_name) +
+                             "&type=1&offset=0&limit=6";
+    std::string body = http_get_text_ex(search_url, "https://music.163.com/");
+    if (body.empty())
+    {
+        ESP_LOGE(TAG, "netease: search returned nothing");
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(body.c_str());
+    if (root == nullptr)
+    {
+        ESP_LOGE(TAG, "netease: search json unparsable");
+        return false;
+    }
+    cJSON *songs = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "result"), "songs");
+    if (!cJSON_IsArray(songs))
+    {
+        ESP_LOGW(TAG, "netease: no songs in response");
+        cJSON_Delete(root);
+        return false;
+    }
+
+    long best_id = 0;
+    int best_score = -1000;
+    int best_dur = 0;
+    std::string best_name;
+    int count = cJSON_GetArraySize(songs);
+    for (int i = 0; i < count; i++)
+    {
+        cJSON *item = cJSON_GetArrayItem(songs, i);
+        cJSON *id = cJSON_GetObjectItem(item, "id");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        cJSON *dur = cJSON_GetObjectItem(item, "duration"); // 毫秒
+        if (!cJSON_IsNumber(id) || !cJSON_IsString(name))
+        {
+            continue;
+        }
+        std::string artist_field;
+        cJSON *artists = cJSON_GetObjectItem(item, "artists");
+        if (cJSON_IsArray(artists))
+        {
+            int an = cJSON_GetArraySize(artists);
+            for (int j = 0; j < an; j++)
+            {
+                cJSON *a = cJSON_GetObjectItem(cJSON_GetArrayItem(artists, j), "name");
+                if (cJSON_IsString(a))
+                {
+                    if (!artist_field.empty())
+                    {
+                        artist_field += "/";
+                    }
+                    artist_field += a->valuestring;
+                }
+            }
+        }
+        int dur_sec = cJSON_IsNumber(dur) ? (int)(dur->valuedouble / 1000.0) : 0;
+        int score = score_candidate(name->valuestring, artist_field, song_name, artist_name, dur_sec);
+        if (score > best_score)
+        {
+            best_score = score;
+            best_id = (long)id->valuedouble;
+            best_dur = dur_sec;
+            best_name = name->valuestring;
+        }
+    }
+    cJSON_Delete(root);
+
+    if (best_id == 0 || best_score <= -1000)
+    {
+        ESP_LOGE(TAG, "netease: no usable candidate for '%s'", song_name.c_str());
+        return false;
+    }
+
+    // 这层跳转不能交给 StreamSession：那边只认 200/206，302 会被当成失败
+    std::string outer = "https://music.163.com/song/media/outer/url?id=" + std::to_string(best_id) + ".mp3";
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(0);
+    if (!http)
+    {
+        return false;
+    }
+    http->SetHeader("User-Agent", kBrowserUa);
+    http->SetHeader("Referer", "https://music.163.com/");
+    http->SetHeader("Accept", "*/*");
+    http->SetTimeout(8000);
+    if (!http->Open("GET", outer))
+    {
+        ESP_LOGE(TAG, "netease: outer url unreachable");
+        return false;
+    }
+    int code = http->GetStatusCode();
+    std::string location = http->GetResponseHeader("Location");
+    std::string ctype = http->GetResponseHeader("Content-Type");
+    http->Close();
+
+    if (code == 302 && !location.empty() && location.find("/404") == std::string::npos)
+    {
+        out_url = location;
+    }
+    else if (code == 200 && ctype.find("audio") != std::string::npos)
+    {
+        out_url = outer;
+    }
+    else
+    {
+        ESP_LOGW(TAG, "netease: id %ld has no direct link (code=%d)", best_id, code);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "netease: id %ld %s, %ds, score %d", best_id, best_name.c_str(), best_dur, best_score);
+    return true;
+}
+
+// 只取字段值，不建 DOM：设备端内存见底时整份 JSON 进堆两次就会失败。
+static std::string json_str_field(const std::string &seg, const char *key)
+{
+    std::string k = "\"";
+    k += key;
+    k += "\":\"";
+    size_t p = seg.find(k);
+    if (p == std::string::npos)
+    {
+        return "";
+    }
+    size_t s = p + k.size();
+    size_t e = seg.find('"', s);
+    if (e == std::string::npos)
+    {
+        return "";
+    }
+    return seg.substr(s, e - s);
+}
+
+static int json_num_field(const std::string &seg, const char *key)
+{
+    std::string k = "\"";
+    k += key;
+    k += "\":";
+    size_t p = seg.find(k);
+    if (p == std::string::npos)
+    {
+        return 0;
+    }
+    size_t s = p + k.size();
+    size_t e = s;
+    while (e < seg.size() && (isdigit((unsigned char)seg[e]) || seg[e] == '-'))
+    {
+        e++;
+    }
+    return atoi(seg.substr(s, e - s).c_str());
+}
+
+
+// 酷狗：搜索给 hash，getSongInfo 把 hash 换成 CDN 直链。VIP 歌这条接口回
+// "需要付费" 且 url 为空——换下一首候选，不是换源。
+static bool kugou_lookup(const std::string &song_name, const std::string &artist_name, std::string &out_url)
+{
+    out_url.clear();
+    std::string search_url = "http://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword=" +
+                             url_encode(song_name) + "&page=1&pagesize=6";
+    std::string body = http_get_text_ex(search_url, "");
+    if (body.empty())
+    {
+        ESP_LOGE(TAG, "kugou: search returned nothing");
+        return false;
+    }
+
+    // 整块 cJSON 解析经不起内存抖动：搜「漠河舞厅」响应 20~30KB，内部 RAM 只剩
+    // 30KB 时同一首请求会时而成功时而 "unparsable"（实测连跑两次一成一败）。
+    // 改成按记录流式抽取，只留要用的四个字段，不再让整份 JSON 进堆两次。
+    struct Candidate
+    {
+        int score;
+        int dur;
+        std::string hash;
+        std::string name;
+    };
+    std::vector<Candidate> cands;
+    const std::string kMark = "{\"hash\":\"";
+    size_t scan = 0;
+    while ((scan = body.find(kMark, scan)) != std::string::npos)
+    {
+        size_t hash_start = scan + kMark.size();
+        size_t hash_end = body.find('"', hash_start);
+        if (hash_end == std::string::npos)
+        {
+            break;
+        }
+        size_t next = body.find(kMark, hash_end);
+        size_t seg_end = (next == std::string::npos) ? body.size() : next;
+        std::string seg = body.substr(scan, seg_end - scan);
+        std::string hash = body.substr(hash_start, hash_end - hash_start);
+        scan = hash_end;
+        if (hash.empty())
+        {
+            continue;
+        }
+        std::string name = json_str_field(seg, "songname");
+        std::string singer_field = json_str_field(seg, "singername");
+        int dur_sec = json_num_field(seg, "duration");
+        if (name.empty())
+        {
+            continue;
+        }
+        int score = score_candidate(name, singer_field, song_name, artist_name, dur_sec);
+        if (score <= -1000)
+        {
+            continue;
+        }
+        cands.push_back(Candidate{score, dur_sec, hash, name});
+    }
+
+    if (cands.empty())
+    {
+        ESP_LOGE(TAG, "kugou: no usable candidate for '%s'", song_name.c_str());
+        return false;
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
+
+    int tries = std::min<int>(2, (int)cands.size());
+    for (int i = 0; i < tries; i++)
+    {
+        std::string info_url =
+            "http://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=" + cands[i].hash;
+        std::string ibody = http_get_text_ex(info_url, "http://m.kugou.com/");
+        if (ibody.empty())
+        {
+            continue;
+        }
+        cJSON *root2 = cJSON_Parse(ibody.c_str());
+        if (root2 == nullptr)
+        {
+            continue;
+        }
+        cJSON *u = cJSON_GetObjectItem(root2, "url");
+        cJSON *e = cJSON_GetObjectItem(root2, "error");
+        std::string direct = cJSON_IsString(u) ? u->valuestring : "";
+        std::string err = cJSON_IsString(e) ? e->valuestring : "";
+        cJSON_Delete(root2);
+        if (direct.rfind("http", 0) != 0)
+        {
+            ESP_LOGW(TAG, "kugou: %s unavailable (%s)", cands[i].name.c_str(),
+                     err.empty() ? "empty url" : err.c_str());
+            continue;
+        }
+        // 同一路径 http 也回 206，少一次 TLS 握手就少一次内存峰值
+        out_url = force_http(direct);
+        ESP_LOGI(TAG, "kugou: %s, %ds, score %d", cands[i].name.c_str(), cands[i].dur, cands[i].score);
+        return true;
+    }
+
+    ESP_LOGE(TAG, "kugou: no playable url for '%s'", song_name.c_str());
+    return false;
+}
+
+// 曲库 = 三源并集。三家各有各的版权盲区：VIP 原版谁都不给，但冷门歌、
+// 独立音乐、现场版经常这家没有那家有。一家解析不出直链（或直链起播失败）
+// 就换下一家，用户只管听到声，不用知道歌是哪家给的。
+bool Esp32Music::PlayByBuiltinLookup(const std::string &song_name, const std::string &artist_name)
+{
+    if (song_name.empty())
+    {
+        return false;
+    }
+
+    std::string audio_url;
+    std::string lyric_rid;
+
+    // 顺序按「出声前的往返次数」排：酷我两次请求且无跳转，网易云两次，酷狗两次+JSON 解析。
+    if (kuwo_lookup(song_name, artist_name, audio_url, lyric_rid))
+    {
+        last_downloaded_data_ = audio_url;
+        if (PlayResolved(audio_url, "", song_name, lyric_rid))
+        {
+            return true;
+        }
+        ESP_LOGW(TAG, "Builtin: kuwo link dead on playback, next source");
+    }
+
+    audio_url.clear();
+    lyric_rid.clear();
+    if (netease_lookup(song_name, artist_name, audio_url))
+    {
+        last_downloaded_data_ = audio_url;
+        if (PlayResolved(audio_url, "", song_name))
+        {
+            return true;
+        }
+        ESP_LOGW(TAG, "Builtin: netease link dead on playback, next source");
+    }
+
+    audio_url.clear();
+    if (kugou_lookup(song_name, artist_name, audio_url))
+    {
+        last_downloaded_data_ = audio_url;
+        if (PlayResolved(audio_url, "", song_name))
+        {
+            return true;
+        }
+        ESP_LOGW(TAG, "Builtin: kugou link dead on playback, next source");
+    }
+
+    ESP_LOGE(TAG, "Builtin lookup: every source failed for '%s'", song_name.c_str());
+    return false;
 }
 
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
