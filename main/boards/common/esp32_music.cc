@@ -1576,9 +1576,10 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
             break;
         }
 
+        // 已出过声的流断在第一档就直接重连：缓冲只垫了 1 秒，重连多等 700ms 就是多 700ms 静音。
         int delay_ms = (total_downloaded == 0)
                            ? 1000
-                           : (1000 << (reconnect_fails > 3 ? 3 : reconnect_fails - 1)); // 1s→2s→4s→8s封顶
+                           : (300 << (reconnect_fails > 3 ? 3 : reconnect_fails - 1)); // 300ms→600→1200→2400封顶
         ESP_LOGW(TAG, "Live stream dropped after %u bytes, reconnect #%d in %d ms",
                  (unsigned)round_bytes, reconnect_fails, delay_ms);
         // 分片睡：用户一按停/切歌，立刻就能退出
@@ -1599,11 +1600,67 @@ void Esp32Music::DownloadAudioStream(const std::string &music_url)
     ESP_LOGI(TAG, "Audio stream download thread finished");
 }
 
+// 弱信号下 64k 流(8KB/s)扛不住：实测 -70dBm 只有 6~8KB/s，零余量，一抖就欠载。
+// qtfm 同一台有 24k 源(3KB/s)，按 RSSI 换上去就有 2.6 倍余量——宁可降点音质也别卡。
+// 只降不升：本来就是 24k 的源不重复处理，点播歌曲的直链也不碰。
+static std::string AdaptRadioBitrate(const std::string &url, int rssi, int &out_kbps)
+{
+    out_kbps = 0;
+    // 点播走酷我直链，没有码率档位可选，别去猜它的命名
+    if (url.find("qtfm.cn") == std::string::npos && url.find("qingting.fm") == std::string::npos)
+    {
+        return url;
+    }
+    size_t tail = url.find("k.mp3");
+    if (tail == std::string::npos)
+    {
+        return url;
+    }
+    size_t begin = tail;
+    while (begin > 0 && url[begin - 1] >= '0' && url[begin - 1] <= '9')
+    {
+        --begin;
+    }
+    if (begin == tail)
+    {
+        return url;
+    }
+    int kbps = 0;
+    for (size_t i = begin; i < tail; ++i)
+    {
+        kbps = kbps * 10 + (url[i] - '0');
+    }
+    out_kbps = kbps;
+    constexpr int kWeakRssi = -65; // -65 以下 64k(8KB/s) 已经开始吃不饱
+    if (kbps <= 24 || rssi == 0 || rssi > kWeakRssi)
+    {
+        return url;
+    }
+    ESP_LOGW(TAG, "rssi=%d too weak for %dk stream, switch to 24k (needs 2.6x less bandwidth)", rssi, kbps);
+    out_kbps = 24;
+    // tail 指向 "k.mp3" 的 k；从 tail 起切才是 "k.mp3"，写成 tail-1 会拼出 244k.mp3（实测 404）
+    return url.substr(0, begin) + "24" + url.substr(tail);
+}
+
 // 单次连接读到结尾或断流都算这一轮结束，要不要重连由外层决定
 void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes, size_t &total_downloaded, bool &live_stream)
 {
+    // 每轮独立判定：这一轮没连上不等于该放弃这路流，失败路径会把 live_stream 置 true 交给外层退避续连
+    live_stream = false;
+
+    // 每轮重连都重新判一次信号：用户可能挪了位置，码率跟着变
+    wifi_ap_record_t ap_info = {};
+    int link_rssi = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ? ap_info.rssi : 0;
+    int stream_kbps = 0;
+    std::string stream_url = AdaptRadioBitrate(music_url, link_rssi, stream_kbps);
+
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(0);
+
+    // HttpClient 默认 30000ms 是给整包下载用的；套在实时流上，链路一断就要干等满 30 秒
+    // 才认死（_uart_log2.txt:4 那条 "Wait for HTTP content receive timeout" 之后已静音 29 秒）。
+    // 建连阶段宽松一点，读流阶段再把超时收到 5 秒（见下面 Open 成功之后）。
+    http->SetTimeout(15000);
 
     // 设置基本请求头
     http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
@@ -1614,9 +1671,11 @@ void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes
     add_auth_headers(http.get());
 
     int64_t t_open = esp_timer_get_time();
-    if (!http->Open("GET", music_url))
+    if (!http->Open("GET", stream_url))
     {
-        ESP_LOGE(TAG, "Failed to connect to music stream URL");
+        ESP_LOGE(TAG, "Failed to connect to music stream URL: %s", stream_url.c_str());
+        // 连不上要交给外层按 limit 退避重试；这里置 false 会让外层 break，整条流就此永久断掉
+        live_stream = true;
         return;
     }
     // newlib-nano 不支持 %lld（CONFIG_NEWLIB_NANO_FORMAT=y）：会打出「ld ms」并把后面的参数读错位
@@ -1626,12 +1685,17 @@ void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes
     int status_code = http->GetStatusCode();
     if (status_code != 200 && status_code != 206)
     { // 206 for partial content
-        ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
+        ESP_LOGE(TAG, "HTTP GET failed with status code: %d (%s)", status_code, stream_url.c_str());
         http->Close();
+        live_stream = true;
         return;
     }
 
     ESP_LOGI(TAG, "Started downloading audio stream, status: %d", status_code);
+
+    // 实时流每块间隔在百毫秒级：5 秒收不到一个字节就是链路真断了。断流本身救不回已经丢的音频，
+    // 早 25 秒重连就能早 25 秒接回直播，而干等 30 秒只能换来半分钟静音再放错位的流。
+    http->SetTimeout(5000);
 
     // 电台（icecast 无限流）不报 Content-Length，读到 EOF 只是被掐断；点播文件报了长度，EOF 就是真的放完了
     if (http->GetResponseHeader("Content-Length").empty())
@@ -1685,8 +1749,16 @@ void Esp32Music::StreamSession(const std::string &music_url, size_t &round_bytes
                 float kbs = net_bytes / 1024.0f * 1e6f / (net_now - net_t0);
                 wifi_ap_record_t ap = {};
                 int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
-                ESP_LOGW(TAG, "DIAG net: %.1f KB/s (128kbps needs 16.0) buf=%dKB rssi=%d",
-                         kbs, (int)(buffer_size_ / 1024), rssi);
+                // 需求按本轮流真实码率算：写死 128kbps 的那版在 64k 台会一直误报「不够」
+                if (stream_kbps > 0)
+                {
+                    ESP_LOGW(TAG, "DIAG net: %.1f KB/s (stream %dk needs %.1f) buf=%dKB rssi=%d", kbs, stream_kbps,
+                             stream_kbps / 8.0f, (int)(buffer_size_ / 1024), rssi);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "DIAG net: %.1f KB/s buf=%dKB rssi=%d", kbs, (int)(buffer_size_ / 1024), rssi);
+                }
                 net_t0 = net_now;
                 net_bytes = 0;
             }
