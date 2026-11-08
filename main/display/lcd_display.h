@@ -112,7 +112,7 @@ protected:
     // 对话：屏幕上只留最新一句，超出一屏就从这句话的开头裁切
     std::string chat_text_;
     lv_obj_t* chat_view_ = nullptr;
-    // 科幻底图（渐变/网格/角标烘成图 + 扫描带和粒子两层动态）。wechat 样式分支不建
+    // 科幻底图（渐变/网格/角标烘成图 + 核心/环/火星/流光几样小对象动态）。wechat 样式分支不建
     TechBackdrop backdrop_;
     void PlaceChatView(int vh);
     void RefitWeatherView();

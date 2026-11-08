@@ -26,7 +26,7 @@ public:
     virtual void SetEmotion(const char* emotion);
     // 换头像头发颜色：A8 遮罩 + recolor，表情图本身不用重画。没实现的板子自然什么都不做
     virtual void SetHairColor(uint32_t rgb) {}
-    // 换屏幕 HUD 主色（顶栏/扫描带/核心/冲击环/流光），并控制整屏染色强度。0 = 跟随主题默认色
+    // 换屏幕 HUD 主色（顶栏/核心/冲击环/流光），并控制整屏染色强度。0 = 跟随主题默认色
     // strength: 0~10，-1 = 不改当前强度（只换色）
     virtual void SetAccentColor(uint32_t rgb, int strength = -1) {}
     virtual void SetChatMessage(const char* role, const char* content);

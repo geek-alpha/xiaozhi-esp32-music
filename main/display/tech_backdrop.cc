@@ -134,20 +134,8 @@ void TechBackdrop::Create(lv_obj_t* parent, int w, int h, int status_h)
         lv_obj_set_pos(trail_[i], kBladeA[0][0], kBladeA[0][1]);
     }
 
-    // 扫描带：一条半透明楼层上下走，像 CRT 刷屏；颜色用青，跟底图灯管同色系
-    sweep_ = lv_obj_create(root_);
-    lv_obj_remove_style_all(sweep_);
-    lv_obj_add_flag(sweep_, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_clear_flag(sweep_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(sweep_, w, kSweepH);
-    lv_obj_set_style_bg_color(sweep_, lv_color_hex(0x00E5FF), 0);
-    lv_obj_set_style_bg_opa(sweep_, LV_OPA_20, 0);
-    lv_obj_set_style_radius(sweep_, 0, 0);
-    lv_obj_set_style_border_width(sweep_, 0, 0);
-    lv_obj_set_y(sweep_, status_h_);
-
-    ESP_LOGI(TAG, "Neon backdrop: %d rings, %d rain, %d trail, sweep %d px",
-             kRings, kSparks, kTrail, kSweepH);
+    ESP_LOGI(TAG, "Neon backdrop: %d rings, %d rain, %d trail",
+             kRings, kSparks, kTrail);
     SetAnimationsEnabled(true);
 }
 
@@ -180,9 +168,6 @@ void TechBackdrop::ApplyTheme(bool dark, uint32_t accent, int strength)
         lv_obj_set_style_bg_opa(tint_, (lv_opa_t)(accent != 0 ? s * 23 : 0), 0);
     }
 
-    if (sweep_ != nullptr) {
-        lv_obj_set_style_bg_color(sweep_, base, 0);
-    }
     if (core_ != nullptr) {
         lv_obj_set_style_bg_color(core_, base, 0);
     }
@@ -210,14 +195,13 @@ void TechBackdrop::SetAnimationsEnabled(bool on)
         return;
     }
     anim_on_ = on;
-    if (sweep_ == nullptr) {
+    if (core_ == nullptr) {
         return;
     }
     if (!on) {
         StopAnims();
         return;
     }
-    StartSweepAnim();
     StartCoreAnim();
     StartRingAnim();
     StartSparkAnim();
@@ -226,7 +210,6 @@ void TechBackdrop::SetAnimationsEnabled(bool on)
 
 void TechBackdrop::StopAnims()
 {
-    lv_anim_del(sweep_, nullptr);
     lv_anim_del(core_, nullptr);
     for (int i = 0; i < kRings; i++) {
         if (rings_[i] != nullptr) {
@@ -244,33 +227,6 @@ void TechBackdrop::StopAnims()
             lv_anim_del(trail_[i], nullptr);
         }
     }
-}
-
-void TechBackdrop::StartSweepAnim()
-{
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, sweep_);
-    lv_anim_set_exec_cb(&a, SetY);
-    lv_anim_set_values(&a, status_h_ - kSweepH, h_);
-    lv_anim_set_duration(&a, 4600);
-    lv_anim_set_playback_duration(&a, 4600);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_repeat_delay(&a, 260);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_start(&a);
-
-    // 亮度跟着一起呼吸：只有位置变化会显得太机械
-    lv_anim_t o;
-    lv_anim_init(&o);
-    lv_anim_set_var(&o, sweep_);
-    lv_anim_set_exec_cb(&o, SetBgOpa);
-    lv_anim_set_values(&o, LV_OPA_10, LV_OPA_30);
-    lv_anim_set_duration(&o, 1600);
-    lv_anim_set_playback_duration(&o, 1600);
-    lv_anim_set_repeat_count(&o, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&o, lv_anim_path_ease_in_out);
-    lv_anim_start(&o);
 }
 
 void TechBackdrop::StartCoreAnim()

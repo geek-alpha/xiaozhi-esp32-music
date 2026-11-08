@@ -273,7 +273,7 @@ static float avg_power_spectrum[FFT_SIZE/2]={-25.0f};
 #define LIGHT_BORDER_COLOR           lv_color_hex(0xE0E0E0)     // Light gray border
 #define LIGHT_LOW_BATTERY_COLOR      lv_color_black()           // Black for light mode
 
-// 顶栏 HUD 主色，跟 tech_backdrop 的扫描带/核心用同一对颜色，顶栏和底图才不会像两块皮
+// 顶栏 HUD 主色，跟 tech_backdrop 的核心/冲击环用同一对颜色，顶栏和底图才不会像两块皮
 #define HUD_ACCENT_DARK              lv_color_hex(0x00E5FF)
 #define HUD_ACCENT_LIGHT             lv_color_hex(0xD8408C)
 
@@ -1014,7 +1014,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(screen, current_theme_.background, 0);
 
     // 科幻底图垫在最底层：渐变、网格、角标、雷达环、遥测刻度全烘在图上，
-    // 运行时只有 1 次 blit；动态只剩扫描带和粒子，脏区不到 20KB/帧
+    // 运行时只有 1 次 blit；动态只剩核心/环/火星/流光几样小对象，脏区不到 20KB/帧
     backdrop_.Create(screen, LV_HOR_RES, LV_VER_RES, fonts_.text_font->line_height);
     backdrop_.ApplyTheme(current_theme_name_ == "dark", accent_color_, accent_strength_);
 
