@@ -31,13 +31,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
     if (ref_num == 0) {
         ref_num = 1;
         virtual_ref_ = true;
-        if (codec_->output_sample_rate() != 16000) {
-            ref_resampler_.Configure(codec_->output_sample_rate(), 16000);
-        }
-        // 环容量只要盖住「延迟 + 一个 feed 块」，4096 样本 = 8KB
-        ref_ring_.assign(4096, 0);
         // 播放到出声的路径延迟：I2S DMA 6×240 帧 @24k ≈ 60ms，再加功放和声学传播，按 70ms 对齐
-        ref_delay_samples_ = 16000 * 70 / 1000;
+        ref_.Initialize(codec_->output_sample_rate(), 70);
     }
 
     std::string input_format;
@@ -120,50 +115,30 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     // mic 一路 + 参考一路，交错成 [M,R,M,R...]。参考信号按「mic 采样时间轴」定位：
     // 每个播放样本在 PushReference 里被记在「它将被 mic 拾到的那个时刻」，这里只需
     // 取同一时刻，对齐自动成立——不必逐轮猜延迟，也不会因为播放断断续续就错位。
-    size_t n = data.size();
-    int64_t pos = stream_pos_.load(std::memory_order_relaxed);
-    feed_buffer_.resize(n * 2);
-    {
-        std::lock_guard<std::mutex> lock(ref_mutex_);
-        int64_t cap = (int64_t)ref_ring_.size();
-        int64_t valid_lo = last_push_end_ - cap + 1;
-        for (size_t i = 0; i < n; i++) {
-            int64_t idx = pos + (int64_t)i;
-            feed_buffer_[2 * i] = data[i];
-            feed_buffer_[2 * i + 1] =
-                (idx >= 0 && idx >= valid_lo && idx <= last_push_end_) ? ref_ring_[idx % cap] : 0;
-        }
+    ref_.Interleave(data.data(), data.size(), feed_buffer_);
+    if (ref_.TakeUnderrunSamples() > 0) {
+        ref_underrun_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
     }
     afe_iface_->feed(afe_data_, feed_buffer_.data());
-    stream_pos_.store(pos + (int64_t)n, std::memory_order_relaxed);
+}
+
+bool AfeAudioProcessor::EchoRefBroken() const {
+    int64_t t = ref_underrun_us_.load(std::memory_order_relaxed);
+    // 120ms 盖住 AEC 的帧延迟：某帧喂进去的参考是 0，它的后果要到后面几帧的输出里才显现。
+    return t != 0 && (esp_timer_get_time() - t) < 120000;
 }
 
 void AfeAudioProcessor::PushReference(const std::vector<int16_t>& pcm, int sample_rate) {
-    if (!virtual_ref_ || pcm.empty()) {
+    if (!virtual_ref_) {
         return;
     }
-    const int16_t* src = pcm.data();
-    size_t n = pcm.size();
-    if (sample_rate != 16000) {
-        ref_resample_buffer_.resize(ref_resampler_.GetOutputSamples(n));
-        ref_resampler_.Process(pcm.data(), n, ref_resample_buffer_.data());
-        src = ref_resample_buffer_.data();
-        n = ref_resample_buffer_.size();
-    }
-    if (n > ref_ring_.size()) {
-        src += n - ref_ring_.size();
-        n = ref_ring_.size();
-    }
+    ref_.Push(pcm, sample_rate);
+}
 
-    // 这批样本马上送 I2S，会在 ref_delay_samples_ 之后被麦克风拾到，所以记在时间轴的
-    // 「当前位置 + 延迟」处；等 mic 走到那里，Feed 正好读到对齐的参考。
-    std::lock_guard<std::mutex> lock(ref_mutex_);
-    int64_t cap = (int64_t)ref_ring_.size();
-    int64_t base = stream_pos_.load(std::memory_order_relaxed) + ref_delay_samples_;
-    for (size_t i = 0; i < n && (int64_t)i < cap; i++) {
-        ref_ring_[(base + (int64_t)i) % cap] = src[i];
+void AfeAudioProcessor::SetEchoRefAlignMs(int ms) {
+    if (virtual_ref_) {
+        ref_.SetAlignDelayMs(ms);
     }
-    last_push_end_ = std::max(last_push_end_, base + (int64_t)n);
 }
 
 void AfeAudioProcessor::Start() {

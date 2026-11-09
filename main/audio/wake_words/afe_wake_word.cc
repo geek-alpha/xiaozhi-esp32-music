@@ -8,6 +8,9 @@
 #define DETECTION_RUNNING_EVENT 1
 
 #define TAG "AfeWakeWord"
+// 唤醒词走虚拟回声参考：开启后 AFE 格式变 MR、AEC 打开。2.0.30 里唤醒是 M 单通道、无 AEC，
+// 打开这版后待机喊「你好小智」完全不应，先关掉定位原因，别带进主干。
+static constexpr bool kWakeVirtualEchoRef = false;
 
 AfeWakeWord::AfeWakeWord()
     : afe_data_(nullptr),
@@ -39,7 +42,17 @@ AfeWakeWord::~AfeWakeWord() {
 
 bool AfeWakeWord::Initialize(AudioCodec* codec) {
     codec_ = codec;
+    // mic 只算硬件真通道：虚拟参考是额外加的一路，不能从 input_channels() 里扣
+    int mic_num = codec_->input_channels() - (codec_->input_reference() ? 1 : 0);
     int ref_num = codec_->input_reference() ? 1 : 0;
+    if (ref_num == 0 && kWakeVirtualEchoRef) {
+        // 单工板（NoAudioCodecSimplex）硬件只接了 mic。不造参考的话 AFE 的 AEC 是关的，
+        // AI 说话期间喇叭里的 TTS 直接灌进 WakeNet，喊唤醒词永远喊不应，
+        // 彻底没有语音打断——打断只能靠唤醒词，而它是唯一在说话期跑着的引擎。
+        ref_num = 1;
+        virtual_ref_ = true;
+        ref_.Initialize(codec_->output_sample_rate(), 70);
+    }
 
     models_ = esp_srmodel_init("model");
     if (models_ == nullptr || models_->num == -1) {
@@ -61,14 +74,14 @@ bool AfeWakeWord::Initialize(AudioCodec* codec) {
     }
 
     std::string input_format;
-    for (int i = 0; i < codec_->input_channels() - ref_num; i++) {
+    for (int i = 0; i < mic_num; i++) {
         input_format.push_back('M');
     }
     for (int i = 0; i < ref_num; i++) {
         input_format.push_back('R');
     }
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), models_, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
-    afe_config->aec_init = codec_->input_reference();
+    afe_config->aec_init = codec_->input_reference() || virtual_ref_;
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
     afe_config->afe_perferred_core = 1;
     afe_config->afe_perferred_priority = 1;
@@ -112,7 +125,20 @@ void AfeWakeWord::Feed(const std::vector<int16_t>& data) {
     if (afe_data_ == nullptr) {
         return;
     }
-    afe_iface_->feed(afe_data_, data.data());
+    if (!virtual_ref_) {
+        afe_iface_->feed(afe_data_, data.data());
+        return;
+    }
+    // 单通道 mic + 虚拟参考交错成 [M,R,M,R...] 后再喂
+    ref_.Interleave(data.data(), data.size(), feed_buffer_);
+    afe_iface_->feed(afe_data_, feed_buffer_.data());
+}
+
+void AfeWakeWord::PushReference(const std::vector<int16_t>& pcm, int sample_rate) {
+    if (!virtual_ref_) {
+        return;
+    }
+    ref_.Push(pcm, sample_rate);
 }
 
 size_t AfeWakeWord::GetFeedSize() {

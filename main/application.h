@@ -85,6 +85,10 @@ private:
     volatile DeviceState device_state_ = kDeviceStateUnknown;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
+    // TTS 起播时刻：说话期本地 VAD 打断要避开前几百毫秒（首帧爆音、提示音尾巴都会被判成人声）
+    int64_t speaking_started_us_ = 0;
+    // speaking 期的处理器是「静默监听」拉起来的，回到 listening 时必须补发 start listening
+    bool passive_listen_ = false;
     std::string last_error_message_;
     AudioService audio_service_;
     // 音乐 PCM 复用缓冲：容量稳定后 resize 不再分配，只在音乐播放线程里用

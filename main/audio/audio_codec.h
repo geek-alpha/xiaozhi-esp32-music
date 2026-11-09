@@ -11,8 +11,13 @@
 
 #include "board.h"
 
+// RX 侧 dma_frame_num 必须是 AFE 单帧请求量（512 samples）的整除数。原来写 240，
+// 512 / 240 = 2.13，i2s_channel_read 每次都要跨一个半 desc 才凑得满，_boot.log 实测
+// 一半的读调用返回 ESP_ERR_TIMEOUT bytes=0（reql 3043 次失败 / 6122 帧），音频流成了
+// 一半有、一半空的断续信号——AFE 拿这种输入既唤不醒也认不准，现场就是「听不进去」。
+// 256 整除 512，6×256 = 1536 帧 = 96ms，缓冲深度不变。
 #define AUDIO_CODEC_DMA_DESC_NUM 6
-#define AUDIO_CODEC_DMA_FRAME_NUM 240
+#define AUDIO_CODEC_DMA_FRAME_NUM 256
 // 播放侧单独加厚：6×240 在 44.1kHz 下只有 32.6ms，WiFi 一次调度抖动就够把 DMA 掏空、直接断音。
 // 16×320 = 5120 帧 ≈ 116ms@44.1k，给播放线程留出补数据的余量；麦克风仍用上面的原值，不拖长录音延迟。
 #define AUDIO_CODEC_TX_DMA_DESC_NUM 16

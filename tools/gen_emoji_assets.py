@@ -14,28 +14,46 @@ SZ = 240
 W = SZ * S
 
 # 最终输出尺寸（逻辑 240 画布的降采样目标）。
-# 屏只有 240 高，162 是「脸占满 + 给 HUD 留 78px（天气 3 行 72px）」的上限：
-# 再大就得把天气压回 2 行，上 170 后连对话的最小可读高度都被吃掉
+# 屏只有 240 高，162 是「脸占满 + 给 HUD 留 78px（天气 3 行 72px）」的上限
 OUT = 162
 K = OUT / float(SZ)
+
+
+# 静态骨架（头发/发带/蝴蝶结/鳍耳/身体/尾巴）全部来自参考立绘，由
+# tools/_make_base.py 把五官填成皮肤后输出。多边形拼贴永远追不上手绘的质感，
+# 这是唯一能让整体"像"的路；表情仍然由代码画，所以 21 张脸/眨眼/口型全部保留。
+BASE_PNG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tools", "_ref_assets", "base.png")
+# 头部裁切（base.png 像素）：x 0~1000 是整张底板的横向全宽。
+# 不能只裁到头图的 888 宽——两侧长发在 y>700 会向外扩散到 950，
+# 身体图若跟着裁到 888 就在那里留下一条竖直硬切边（上一版小人两侧的矩形块）。
+# 现在头/身同宽同比例（240/1000），拼接边界完全重合。
+HEAD_CROP = (0, 0, 1000, 700)
+HEAD_K = 240.0 / 1000.0  # 整图宽占满 240 逻辑画布
+HEAD_OX = 0
 
 
 def sc(v):
     """逻辑单位 → 输出像素。尺寸/坐标一律过这里，别写死 //2。"""
     return int(round(v * K))
 
-SKIN = (255, 228, 214, 255)
-SKIN_SH = (250, 205, 188, 255)
-LINE = (72, 42, 40, 255)
-HAIR = (118, 166, 255, 255)
-HAIR_DK = (82, 126, 212, 255)
-HAIR_LT = (160, 198, 255, 255)
+SKIN = (255, 240, 231, 255)
+SKIN_SH = (248, 212, 202, 255)
+# 眉毛/睫毛原来用暖棕 (72,42,40)，在蓝发旁边发脏；参考图的线是冷紫黑
+LINE = (58, 44, 68, 255)
+# 三档发色必须同时满足 hair_masks 的判据（b>=140 且 b-r>=40），否则深发根会被判成
+# 「非头发」，换发色时头顶留一块原色，所以深档只能压到 b=178 不能再深。
+# 与参考图对齐的关键不是绝对色值，是明度跨度：深档到亮档拉开 100 级，
+# 上一版只拉开 64 级，整颗头读成一块平涂的浅蓝塑料
+HAIR = (62, 110, 200, 255)
+HAIR_DK = (38, 58, 128, 255)
+HAIR_LT = (140, 220, 252, 255)
 WHITE = (255, 255, 255, 255)
-IRIS_TOP = (58, 38, 92, 255)
-IRIS_BOT = (146, 208, 255, 255)
-MOUTH = (198, 80, 94, 255)
+IRIS_TOP = (30, 52, 124, 255)
+IRIS_BOT = (128, 208, 250, 255)
+MOUTH = (226, 112, 126, 255)
 TONGUE = (255, 142, 152, 255)
-BLUSH = (255, 156, 174, 255)
+BLUSH = (255, 172, 188, 255)
 # 轮廓线专用色：中性深紫黑。不能跟 LINE 共用暖棕，否则在蓝发上发脏；
 # 也不能偏蓝，否则用户把发色改成红/绿后描边和头发打起来。
 # 必须同时满足两个条件：
@@ -43,11 +61,22 @@ BLUSH = (255, 156, 174, 255)
 #      随 image_recolor 跟着发色一起染，改发色时轮廓就消失了
 #   2) 降采样后与发色混出的中间像素要尽量深，才不会被判成头发（见 OUTLINE_W 注释）
 OUTLINE = (46, 38, 52, 255)
-OUTLINE_W = 3.5  # 逻辑单位；最终 120px 画布上约 1.75px
+OUTLINE_W = 5.0  # 逻辑单位；162px 输出上约 3.4px。3.5 时只剩 2.4px，屏上读不出线
 # 最外圈边缘光。屏幕背景是近黑的科技底（_bg_out/bg_0.png 实测），
 # 深色轮廓在黑底上等于隐形——这就是“没线条感”的真正原因。外圈必须用亮色才有对比。
-RIM = (198, 224, 255, 255)
-RIM_GLOW = (110, 164, 255, 255)
+RIM = (168, 200, 246, 255)
+RIM_GLOW = (96, 140, 220, 255)
+
+# 发带/蝴蝶结/鳍耳三组色。刻意不复用 HAIR：它们不跟发色走，用户换发色时要保持原样
+BAND = (247, 251, 255, 255)
+RIBBON = (104, 176, 255, 255)
+RIBBON_DK = (64, 128, 216, 255)
+# 鳍耳刻意压到 b<140：hair_masks 把「b>=140 且 b-r>=40」判成头发，
+# 浅蓝鳍耳会在换发色时跟着一起变色
+# 鳍耳必须同时躲开两条判据：b<118（不然被当成头发染色），且 b-r<55。
+# (78,94,138) 在旧判据 b>=140 下安全，门槛降到 118 后就会被吃进去
+FIN = (72, 84, 118, 255)
+FIN_DK = (46, 58, 96, 255)
 
 
 def canvas():
@@ -66,9 +95,116 @@ def poly(d, pts, fill, outline=None, width=0):
         d.polygon(p, fill=fill)
 
 
+HB_CX, HB_CY, HB_RX, HB_RY = 120, 120, 90, 94
+# 参考图的头发是「一个整体轮廓包住脸 + 两侧垂到腰」，不是「头上一圆球 + 旁边两片」。
+# 拆成三块画出来读成贴片，所以整个头发只能是一条闭合轮廓。
+HAIR_TOP = 24
+HAIR_RX, HAIR_CY = 104, 132
+HAIR_BOT = 210
+
+
+def _hair_grad(t):
+    """0=发根 → 1=发梢，三段线性插值。4x 超采样降采样后色阶差小于 1 个量化级，是连续渐变。"""
+    stops = (HAIR_DK, HAIR, HAIR_LT)
+    t = min(1.0, max(0.0, t))
+    n = len(stops) - 1
+    i = min(int(t * n), n - 1)
+    u = t * n - i
+    a, b = stops[i], stops[i + 1]
+    return tuple(int(a[k] + (b[k] - a[k]) * u) for k in range(3)) + (255,)
+
+
+def _hair_silhouette(n=40, n2=26, n3=22):
+    """头发整体轮廓（逻辑坐标，顺时针）：顶部椭圆弧 → 右外缘下拖 → 波浪发梢 → 左外缘上行。
+    下半部分必须一直垂到 y=230：长发是这颗头一半的识别度，只画到下巴就变成短披肩。"""
+    pts = []
+    for i in range(n + 1):                       # 顶部弧：左太阳穴 → 头顶 → 右太阳穴
+        th = math.pi - math.pi * i / n
+        pts.append((120 + HAIR_RX * math.cos(th),
+                    HAIR_CY - (HAIR_CY - HAIR_TOP) * math.sin(th)))
+
+    def edge_x(t):                               # 侧边外缘：保持体积，上半段收、下半段卷
+        # 三个大 lobe 是参考图那种泳松卷发的最低成本近似。
+        # 幅度必须给到 20：14 时缩到屏上只剩一条直线，上一版就亏在这里
+        return 120 + HAIR_RX * (1.0 - 0.04 * t) + 20 * t ** 0.6 * math.sin(t * math.pi * 2.2)
+
+    for i in range(1, n2 + 1):                   # 右外缘：往下
+        t = i / float(n2)
+        pts.append((edge_x(t), HAIR_CY + (HAIR_BOT - HAIR_CY) * t))
+    xr = pts[-1][0]
+    xl = 240 - xr
+    for i in range(1, n3):                       # 发稍：右 → 左，波浪收尾
+        u = i / float(n3)
+        # 3 个大卷而不是 5 个小波：5 个缩到屏上就是一圈锯齿裙边。
+        # 中段再上提 18（-18*sin）是为了让下巴下方开一个 U 形：
+        # 长发在两侧分开、露出脖子，否则脸下面是一整块蓝，读成围裙
+        pts.append((xr + (xl - xr) * u,
+                    HAIR_BOT - 12 + 18 * (0.5 - 0.5 * math.cos(2 * math.pi * 3 * u)) ** 1.2
+                    - 18 * math.sin(math.pi * u) ** 1.5))
+    for i in range(n2, 0, -1):                   # 左外缘：往上
+        t = i / float(n2)
+        pts.append((240 - edge_x(t), HAIR_CY + (HAIR_BOT - HAIR_CY) * t))
+    return pts
+
+
 def hair_back(d, fill=None, outline=True):
-    el(d, (30 * S, 26 * S, 210 * S, 214 * S), fill=HAIR_DK if fill is None else fill,
-       outline=OUTLINE if outline else None, width=int(OUTLINE_W * S))
+    """头发底座：一条闭合轮廓 + 逐行渐变（发根深、发梢亮）。
+    渐变必须走 mask 而不是「一行一条横线填满宽」：横线填满会把两束垂发之间的脸区也贴上色，
+    脸再盖回来就只剩一条硬边。没有画布引用时（hair_masks 的几何重放）退化成单色。"""
+    ow = int(OUTLINE_W * S)
+    px = [(int(x * S), int(y * S)) for x, y in _hair_silhouette()]
+    if fill is not None:
+        poly(d, px, fill, OUTLINE if outline else None, ow)
+        return
+    img = getattr(d, "_img_ref", None)
+    if img is None:
+        poly(d, px, HAIR, OUTLINE if outline else None, ow)
+        return
+    mask = Image.new("L", (W, W), 0)
+    ImageDraw.Draw(mask).polygon(px, fill=255)
+    grad = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grad)
+    for y in range(HAIR_TOP, HAIR_BOT + 12):
+        # 0.95 次幂：让深色集中在头顶，发梢亮起来更像染的，线性会读成上下两块色
+        grad_row = _hair_grad(((y - HAIR_TOP) / float(HAIR_BOT - HAIR_TOP)) ** 0.78)
+        gd.line([(0, y * S), (W, y * S)], fill=grad_row, width=S + 1)
+    grad.putalpha(mask)
+    img.alpha_composite(grad)
+    if outline:
+        d.polygon(px, outline=OUTLINE, width=ow)
+
+
+def _hair_edge(x):
+    """发际弧。hair_front 和刘海发束共用这一条，改一处两边一起动，不会错位。
+    参考图的刘海垂得很低，额头只露一窄条：脸顶 80、眉区 112~124，
+    所以下缘落在 96~110，既不盖眉也不露出大片脑门。"""
+    return 100 - 9 * math.cos((x - 120) * math.pi / 80.0)
+
+
+def ahoge(d, col, ol, ow):
+    """头顶那根上翘呆毛。参考图里它是整张图的记忆点，必须画成弯钩。
+    不能用 line：单线条会被最外圈边缘光吃光，缩到 162px 就只剩一个白点。
+    所以按二次贝塞尔中心线向两侧扰成一条渐细的面，根部半宽 7.5 逻辑（输出约 10px）。"""
+    # 参考图的呆毛从头顶中央起笔、向左上甩得很长，尖端回钩。
+    # 上一版 (100,28)-(94,-4)-(56,8) 横向只跨 44，缩到屏上是头顶一粒小钩。
+    # 控制点的 y 不能再往负走：贝塞尔中点 = 0.25*24+0.5*(-14)+0.25*2 ≈ 1，已在画布边缘
+    p0, p1, p2 = (114, 24), (98, -14), (46, 2)
+    N = 22
+    left, right = [], []
+    for i in range(N + 1):
+        t = i / float(N)
+        mt = 1.0 - t
+        cx = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0]
+        cy = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]
+        dx = 2 * mt * (p1[0] - p0[0]) + 2 * t * (p2[0] - p1[0])
+        dy = 2 * mt * (p1[1] - p0[1]) + 2 * t * (p2[1] - p1[1])
+        ln = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / ln, dx / ln
+        # 参考图的呆毛是根细钩子（根部约 13 逻辑宽），上一版半宽 21 画出来是一把砍刀
+        w = 11.0 * (1.0 - t) ** 0.55 + 2.4
+        left.append(((cx + nx * w) * S, (cy + ny * w) * S))
+        right.append(((cx - nx * w) * S, (cy - ny * w) * S))
+    poly(d, left + right[::-1], col, ol, ow)
 
 
 def hair_front(d, fill=None, dark=None, highlight=True, outline=True):
@@ -76,109 +212,532 @@ def hair_front(d, fill=None, dark=None, highlight=True, outline=True):
     K = HAIR_DK if dark is None else dark
     ol = OUTLINE if outline else None
     ow = int(OUTLINE_W * S)
-    pts = []
-    # 发际线：中间厚两侧薄（M 形），左 -> 右
-    for i in range(41):
-        x = 40 + 160 * i / 40.0
-        y = 94 - 9 * math.cos((x - 120) * math.pi / 80.0)
-        pts.append((x * S, y * S))
-    # 右太阳穴 -> 右上
-    pts.append((204 * S, 44 * S))
-    # 顶部椭圆弧：右 -> 左
-    for i in range(41):
+    # 刘海下缘：5 缕长度交错的尖发。上一版是一条均匀波浪，缩到屏上
+    # 读成“蓝布边上缝了花边”——参考图的识别点就在发缕一长一短、中间分缝。
+    # 下缘用 sin 包络而不是直线：直线拼出来是一圈齿轮，参考图的发缕是圆润的舌形，
+    # 尖端带弧度。126 是眼睛上缘，发缕最长的只到 124：再长就把眉毛全盖了
+    # 4 缕改为 3 片宽舌，缕与缕之间只回到浅谷 LEAD 而不是回到发根：
+    # 上一版每缕画完回到 y=86，缶下来就是 4 座尖塔夹 3 个大白三角，脸被遮成只剩下巴。
+    # 参考图的刘海是连成一片的，底边只微微起伏
+    # 斜刘海：参考图不是中分也不是齐平，是从左太阳穴到右太阳穴逐渐压低的斜片。
+    # 左侧短（100）露出额头，右侧长（126）盖住右眼外上角
+    LOCKS = ((72, 100, 26), (118, 112, 26), (164, 126, 26))
+    LEAD = 96
+    pts = [(42 * S, 92 * S)]
+    for cx, tip, half in LOCKS:
+        pts.append(((cx - half) * S, LEAD * S))
+        for i in range(1, 11):
+            u = i / 10.0
+            pts.append((((cx - half) + 2 * half * u) * S,
+                        (LEAD + (tip - LEAD) * math.sin(math.pi * u) ** 1.35) * S))
+        pts.append(((cx + half) * S, LEAD * S))
+    pts.append((200 * S, 92 * S))
+    pts.append((212 * S, 40 * S))
+    for i in range(41):                          # 顶部外弧，右 → 左
         t = math.pi * i / 40.0
-        pts.append(((120 + 84 * math.cos(t)) * S, (98 - 74 * math.sin(t)) * S))
-    pts.append((36 * S, 44 * S))
-    poly(d, pts, F, ol, ow)
-    # 刘海分绉尖：三个尖彼此之间靠描边分开，否则同色叠同色就是一块蓝，看不出分绉
-    for tx in (78, 120, 162):
-        tip_y = 104 - 10 * math.cos((tx - 120) * math.pi / 80.0)
-        poly(d, [((tx - 16) * S, (tip_y - 20) * S), ((tx + 16) * S, (tip_y - 20) * S), (tx * S, tip_y * S)],
-             F, ol, ow)
-    # 发丝高光
+        pts.append(((120 + 100 * math.cos(t)) * S, (104 - 84 * math.sin(t)) * S))
+    pts.append((28 * S, 40 * S))
+    # 鬓发：从太阳穴垂到下巴以下。内侧不能压到脸上，外缘带一点弯，
+    # 直上直下的多边形在屏上是个方框
+    side_l = [(26, 84), (52, 108), (50, 140), (40, 172), (26, 196), (18, 168), (20, 132), (22, 100)]
+    side_r = [(214, 84), (188, 108), (190, 140), (200, 172), (214, 196), (222, 168), (220, 132), (218, 100)]
+    shapes = [pts,
+              [(x * S, y * S) for x, y in side_l],
+              [(x * S, y * S) for x, y in side_r]]
+    # 呆毛不在这一层画了：它必须压在喀秋莎外面，画在这里会被发带整根盖掉。
+    # 改到 build() 的 accessories 之后，hair_masks 里单独补一次几何重放
+    #
+    # 刘海和鬓发也必须走「发根深→发梢亮」的渐变：上一版只有 hair_back 有渐变，
+    # 前面这层是纯色 HAIR，屏上读成「一圈平涂的蓝布贴在脸上」。
+    # fill 不为空时是 hair_masks 的几何重放，必须走单色分支
+    img = getattr(d, "_img_ref", None)
+    if fill is not None or img is None:
+        for sh in shapes:
+            poly(d, sh, F, ol, ow)
+    else:
+        mask = Image.new("L", (W, W), 0)
+        md = ImageDraw.Draw(mask)
+        for sh in shapes:
+            md.polygon([(int(x), int(y)) for x, y in sh], fill=255)
+        grad = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grad)
+        for y in range(HAIR_TOP, HAIR_BOT + 12):
+            gd.line([(0, y * S), (W, y * S)],
+                    fill=_hair_grad(((y - HAIR_TOP) / float(HAIR_BOT - HAIR_TOP)) ** 0.78),
+                    width=S + 1)
+        grad.putalpha(mask)
+        img.alpha_composite(grad)
+        for sh in shapes:
+            d.polygon([(int(x), int(y)) for x, y in sh], outline=OUTLINE, width=ow)
     if highlight:
-        d.line([(78 * S, 62 * S), (150 * S, 52 * S)], fill=(255, 255, 255, 110), width=int(3 * S))
-    # 鬃角
-    poly(d, [(38 * S, 96 * S), (58 * S, 102 * S), (52 * S, 168 * S), (34 * S, 150 * S)], K, ol, ow)
-    poly(d, [(202 * S, 96 * S), (182 * S, 102 * S), (188 * S, 168 * S), (206 * S, 150 * S)], K, ol, ow)
-    # 呆毛
-    poly(d, [(118 * S, 36 * S), (140 * S, 10 * S), (152 * S, 20 * S), (134 * S, 42 * S)], F, ol, ow)
+        d.line([(70 * S, 58 * S), (146 * S, 50 * S)], fill=(255, 255, 255, 110), width=int(3 * S))
+
+
+def accessories(d):
+    """荷叶边发带 + 蝴蝶结。
+    刻意不写进 hair_front：hair_masks 把 hair_front 的每一笔重放成"头发几何"，
+    白带子会命中"亮白"那条判据被吞进遮罩，用户换发色时整条发带跟着变色。"""
+    ol, ow = OUTLINE, int(OUTLINE_W * S)
+    # 参考图的喀秋莎是宽大的一片荷叶边裙边，不是一根细头箍：
+    # 外缘 87×60、内缘 73×46，厚度 14 逻辑（屏上 9px）。上一版只有 6 厚，缩下去就是一圈珠子
+    # 参考图的喀秋莎外缘比头还宽（横向盖过头顶两侧），上一版 87×60 只到头顶内侧
+    rx, ry, cy = 88, 44, 52
+    n = 240
+    outer, inner = [], []
+    for i in range(n + 1):
+        t = i / float(n)
+        # 165~375：两侧各垂到太阳穴（y≈70），不是只盖头顶变成一顶小皇冠
+        th = math.radians(165 + 210 * t)
+        # 荷叶瓣必须是圆的：(1-cos)/2 的凸起，瓣顶和瓣谷都是圆角，
+        # 上一版用 |sin| 画出来是一圈尖齿，缩小到屏上直接变荆棘王冠。
+        # 9 瓣 + 凸起 7：参考图的瓣又大又少，13 瓣缩到屏上就是一圈齿
+        wob = (2.0 + 9.0 * (0.5 - 0.5 * math.cos(2 * math.pi * 7 * t))) * math.sin(math.pi * t) ** 0.35
+        outer.append(((120 + (rx + wob) * math.cos(th)) * S,
+                      (cy + (ry + wob) * math.sin(th)) * S))
+        # 内缘用同心缩进 34（rx-34, ry-34 = 54 x 10）：等宽度的带子，
+        # 缩 24 时只有 16px 读成白头箍，把中心下移 39 又变成一整块白帽子。
+        # 34 是两者之间唯一能保持「一条宽荷叶边」的值
+        inner.append(((120 + (rx - 34 + wob * 0.5) * math.cos(th)) * S,
+                      (cy + (ry - 34 + wob * 0.5) * math.sin(th)) * S))
+    poly(d, outer + inner[::-1], BAND, ol, ow)
+    # 蝴蝶结：压在右太阳穴上方。参考图是两只圆瓣 + 中间一个小结，
+    # 用三角形画出来会读成两片叶子，所以瓣也是椭圆
+    # 蝴蝶结只有约 30 逻辑宽（参考图上它占脸宽的 1/4），上一版 68 宽是它的两倍多
+    bx, by = 202, 58
+    el(d, ((bx - 15) * S, (by - 9) * S, (bx - 2) * S, (by + 9) * S), fill=RIBBON, outline=ol, width=ow)
+    el(d, ((bx + 2) * S, (by - 9) * S, (bx + 15) * S, (by + 9) * S), fill=RIBBON, outline=ol, width=ow)
+    d.line([((bx - 14) * S, (by - 4) * S), ((bx - 5) * S, (by - 1) * S)], fill=RIBBON_DK, width=int(2.0 * S))
+    d.line([((bx + 14) * S, (by - 4) * S), ((bx + 5) * S, (by - 1) * S)], fill=RIBBON_DK, width=int(2.0 * S))
+    el(d, ((bx - 6) * S, (by - 6) * S, (bx + 6) * S, (by + 6) * S), fill=RIBBON_DK, outline=ol, width=ow)
+    # 飘带只留很短的两片：给到 17 逻辑时它们从瓣后跟出来，屏上读成一对翅膀
+    poly(d, [((bx - 6) * S, (by + 5) * S), ((bx - 10) * S, (by + 13) * S), ((bx - 1) * S, (by + 12) * S)],
+         RIBBON, ol, ow)
+    poly(d, [((bx + 6) * S, (by + 5) * S), ((bx + 11) * S, (by + 12) * S), ((bx + 2) * S, (by + 12) * S)],
+         RIBBON_DK, ol, ow)
+
+
+def ears(d):
+    """鳍耳：脸两侧的鱼鳍，比头发深一档，读成「另一种材质」。
+    必须「横向长、竖向短」：参考图里耳朵是 x 23~69 / y 106~128 的扁片，
+    上一版 30x42 的竖三角在屏上读成猫耳。尖端三个鳍条缺口是识别点，不能省"""
+    ol, ow = OUTLINE, int(OUTLINE_W * S)
+    for sx, dirn in ((58, -1), (182, 1)):
+        # 一片向外下垂的鳍：前缘一条平滑斜边，后缘三个分叉。
+        # 上一版写成 3 个外尖 + 3 个内凹交替，降采样后只剩一条灰色横杠
+        pts = [(sx * S, 118 * S),
+               ((sx + dirn * 32) * S, 124 * S),
+               ((sx + dirn * 18) * S, 131 * S),
+               ((sx + dirn * 40) * S, 138 * S),
+               ((sx + dirn * 18) * S, 145 * S),
+               ((sx + dirn * 28) * S, 152 * S),
+               (sx * S, 148 * S)]
+        poly(d, pts, FIN, ol, ow)
+        for ty, tx in ((126, 24), (138, 27), (149, 18)):
+            d.line([((sx + dirn * 4) * S, 145 * S), ((sx + dirn * tx) * S, ty * S)],
+                   fill=FIN_DK, width=int(2.2 * S))
+
+
+# 换发色遮罩的排除区（逻辑坐标）。剩蝴蝶结：它压在头顶发区上、颜色和头发一样蓝，
+# 不挖掉就会跟着用户选的颜色一起变。脸、喀秋莎、鳍耳都不再靠矩形排除——
+# 手写矩形是硬边，挖在头发上染色后就是一块原色方块（上一版两侧脸颊旁的蓝块）。
+# 眼区另用椭圆排除，见 hair_masks。
+HAIR_EXCL = (
+    (150, 60, 183, 85),      # 蝴蝶结
+)
+
+# 判据：头发是底板里唯一成片的蓝。但「蓝」不是充分条件——虹膜、蝴蝶结、鳍耳同样蓝，
+# 脸和喀秋莎是近白。旧版按颜色逐像素判，把整张脸和身体都判成头发，
+# 用户一改发色就是「整只人偶变红」；发丝高光那笔亮白又被第二条判据吃进来。
+# 现在：蓝判据 → 开运算切断发区与鳍耳之间那截细桥 → 取最大连通块 → 在宽松判据里
+# 条件膨胀长回（呆毛/鳍耳/发梢都在这一步回来）→ 补发丝白缝。
+# 实测漏染：只取最大块 25.3% → 条件膨胀后 6.8%（剩下的是蝴蝶结和眼睛，故意排除的）。
+HAIR_BR_MIN = 45     # b - r 下限
+HAIR_B_MIN = 90      # b 下限
+# 重建用的宽松判据：发丝暗部、鳍耳（b-r 中位 58）都落在这条线以上。
+# 用它当「allowed」而不用它直接当遮罩——直接当遮罩会连 rim 和虹膜一起吃进来。
+HAIR_LOOSE_BR = 16
+HAIR_LOOSE_B = 70
+HAIR_OPEN = 3        # 开运算核（腐蚀→最大块），切断细桥
+HAIR_HOLE_MAX = 900  # 只补发丝缝这种细洞；喀秋莎白块邻接占比过不了下面的门槛
+HAIR_HOLE_SPAN = 22  # 洞的 bbox 跨度上限：再大就是脸/发带空腔，不是发丝缝
+HAIR_HOLE_FILL = 0.45  # 洞的填充率上限：细缝是长条，圆胖块是脸
+HAIR_HOLE_TOUCH = 0.7
+
+
+def _hair_blue(p):
+    r, g, b, a = p
+    return a > 40 and b - r >= HAIR_BR_MIN and b >= HAIR_B_MIN
+
+
+def _hair_loose(p):
+    r, g, b, a = p
+    return a > 40 and b - r >= HAIR_LOOSE_BR and b >= HAIR_LOOSE_B
+
+
+def _reconstruct(seed_p, allowed_p, w, h):
+    """seed 在 allowed 里做 8 连通条件膨胀（geodesic reconstruction）。
+    拓扑上够不着的区域不会进来：rim 被 b-r≈6 的深紫描边隔开、虹膜被眼白隔开。
+    """
+    out = Image.new("L", (w, h), 0)
+    op = out.load()
+    stack = []
+    for y in range(h):
+        for x in range(w):
+            if seed_p[x, y]:
+                op[x, y] = 255
+                stack.append((x, y))
+    while stack:
+        cx, cy = stack.pop()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < w and 0 <= ny < h and not op[nx, ny] and allowed_p[nx, ny]:
+                    op[nx, ny] = 255
+                    stack.append((nx, ny))
+    return out
+
+
+def _largest_block(mp, w, h):
+    """8 连通，返回像素坐标列表（头发主体）。"""
+    seen = [[False] * w for _ in range(h)]
+    best = []
+    for y in range(h):
+        for x in range(w):
+            if seen[y][x] or not mp[x, y]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            cur = []
+            while stack:
+                cx, cy = stack.pop()
+                cur.append((cx, cy))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and not seen[ny][nx] and mp[nx, ny]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+            if len(cur) > len(best):
+                best = cur
+    return best
+
+
+def _fill_hair_holes(mask):
+    """发丝高光那笔亮白叠在蓝底上不判蓝，会在遮罩里留一道白缝，染色后是条原色线。
+    只补「四周基本被头发包住」的细缝。脸不是细缝——遮罩吃大后它会被彻底围住，
+    旧版只卡面积（<900px）就把它放进来当洞补上，染色后整颗头变绿。
+    """
+    w, h = mask.size
+    mp = mask.load()
+    inv = mask.point(lambda v: 0 if v else 255)
+    ip = inv.load()
+    out = mask.copy()
+    op = out.load()
+    seen = [[False] * w for _ in range(h)]
+    for y in range(h):
+        for x in range(w):
+            if seen[y][x] or not ip[x, y]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            cur = []
+            edge = False
+            while stack:
+                cx, cy = stack.pop()
+                cur.append((cx, cy))
+                if cx in (0, w - 1) or cy in (0, h - 1):
+                    edge = True
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h and not seen[ny][nx] and ip[nx, ny]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+            if edge or len(cur) > HAIR_HOLE_MAX:
+                continue
+            xs = [p[0] for p in cur]
+            ys = [p[1] for p in cur]
+            bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+            # 细缝的填充率必然低；圆胖块是脸/发带被围出的空腔
+            if bw > HAIR_HOLE_SPAN or bh > HAIR_HOLE_SPAN:
+                continue
+            if len(cur) > HAIR_HOLE_FILL * bw * bh:
+                continue
+            touch = total = 0
+            for cx, cy in cur:
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if (dx or dy) and 0 <= nx < w and 0 <= ny < h:
+                            total += 1
+                            if mp[nx, ny]:
+                                touch += 1
+            if total and touch / float(total) >= HAIR_HOLE_TOUCH:
+                for cx, cy in cur:
+                    op[cx, cy] = 255
+    return out
+
+
+def _clip_to_alpha(mask, img):
+    """遮罩最终必须服从底图 alpha：补洞会把发丝之间的透明缝隙一起补成实色，
+    染色后那块透明区就成了一块纯色板（整束头发看着像色块，不再是一缕一缕）。
+    顺带把遮罩值压到原 alpha 以内，发丝边缘才有渐变，不会是硬边。"""
+    w, h = mask.size
+    px, mp = img.load(), mask.load()
+    out = mask.copy()
+    op = out.load()
+    for y in range(h):
+        for x in range(w):
+            if not mp[x, y]:
+                continue
+            a = px[x, y][3]
+            if a < 40:
+                op[x, y] = 0
+            elif a < 255:
+                op[x, y] = min(mp[x, y], a)
+    return out
 
 
 def hair_masks(items):
-    """每张脸各一张遮罩：只在「几何是头发」且「这张脸这里确实是蓝系」的像素上生效。
-    不能 21 张共用一张：闭眼弧、放大眼会盖住刘海，取交集下来刘海就缺一块（实测缺 898 像素）。
-    光靠重放几何也不行：hair_back 是一整个大椭圆，全靠后画的 face 盖住，不减脸就是整颗头全染。"""
-    back = Image.new("L", (W, W), 0)
-    hair_back(ImageDraw.Draw(back), fill=255, outline=False)
-    face_img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
-    face(ImageDraw.Draw(face_img), outline=False)
-    back = ImageChops.subtract(back, face_img.split()[3])
-
-    front = Image.new("L", (W, W), 0)
-    # 几何重放必须关掉描边：outline 是 4 元组 RGBA，画到 L 图上是 46 的灰值，
-    # 会形成一圈 gv>=8 的假几何，把刚加的那圈轮廓线整个拉进遮罩，改发色时轮廓跟着被染
-    hair_front(ImageDraw.Draw(front), fill=255, dark=255, highlight=False, outline=False)
-
-    geo = ImageChops.lighter(back, front).resize((SZ, SZ), Image.LANCZOS).resize((OUT, OUT), Image.LANCZOS)
-    gp = geo.load()
+    """换发色遮罩：蓝判据 → 挖蝴蝶结 → 开运算断细桥 → 最大连通块 → 补发丝白缝。"""
+    ex = Image.new("L", (OUT, OUT), 0)
+    ed = ImageDraw.Draw(ex)
+    for (x0, y0, x1, y1) in HAIR_EXCL:
+        ed.rectangle([sc(x0), sc(y0), sc(x1), sc(y1)], fill=255)
+    # 眼区椭圆排除。虹膜本身是蓝的，降采样后左眼外侧跟垂下来的发丝粘成一团，
+    # 最大连通块顺着这点把整颗虹膜吃进遮罩，染色后眼睛跟着变色。
+    # 用椭圆而不是矩形：矩形会连眼睛上方的刘海一起挖掉，染色后是一条原色横线。
+    for ecx in EYE_CX:
+        ed.ellipse([sc(ecx - 15.2), sc(EYE_CY - 12.4), sc(ecx + 15.2), sc(EYE_CY + 12.4)], fill=255)
+    ep = ex.load()
 
     masks = {}
     for name, im in items.items():
         px = im.load()
-        m = Image.new("L", (OUT, OUT), 0)
-        mp = m.load()
+        blue = Image.new("L", (OUT, OUT), 0)
+        bp = blue.load()
         for y in range(OUT):
             for x in range(OUT):
-                gv = gp[x, y]
-                if gv < 8:
+                if ep[x, y] or not _hair_blue(px[x, y]):
                     continue
-                r, g, b, a = px[x, y]
-                if b - r >= 40 and b >= 140:
-                    mp[x, y] = gv
-                elif min(r, g, b) >= 140 and max(r, g, b) - min(r, g, b) <= 60:
-                    # 发丝高光那笔白叠在蓝底上变成亮白，旧的「蓝系」判据把它当非头发，遮罩留成洞。
-                    # 这里必须按满值吃干净：给半透明就有等比例的亮白透上来，换完发色就是额头那道白疤。
-                    # 眉毛暗色、腮红高饱和都进不了这条分支；脸部在 geo 里本来就是 0
-                    mp[x, y] = gv
-        masks[name] = m
+                bp[x, y] = 255
+        eroded = blue.filter(ImageFilter.MinFilter(HAIR_OPEN))
+        keep = Image.new("L", (OUT, OUT), 0)
+        kp = keep.load()
+        for cx, cy in _largest_block(eroded.load(), OUT, OUT):
+            kp[cx, cy] = 255
+        # 旧版到这里是「最大块膨胀回原蓝区」：只认颜色不认连通性，
+        # 呆毛、鳍耳、发梢这些不成片的部分整块丢掉，实测漏 25.3% 的蓝像素。
+        # 换成条件膨胀后，跟头发连着的都长回来，隔开的（rim/虹膜）依旧进不来。
+        loose = Image.new("L", (OUT, OUT), 0)
+        lop = loose.load()
+        for y in range(OUT):
+            for x in range(OUT):
+                if not ep[x, y] and _hair_loose(px[x, y]):
+                    lop[x, y] = 255
+        masks[name] = _clip_to_alpha(_fill_hair_holes(_reconstruct(kp, lop, OUT, OUT)), im)
     return masks
 
 
 
+def hair_shade(items, masks, name=None):
+    """染色层只有「新色」一个自由度：纯色 recolor 会把底板里的发丝明暗一起吃平成塑料色。
+    A8 阴影层把比头发中位亮度暗的部分压暗，色相仍取新色 → 亮部纯新色、暗部深新色。
+    头发在底板里、五官补丁不碰发区，所以全表情共用一张。
+    """
+    if name is None:
+        name = "neutral" if "neutral" in items else next(iter(items))
+    img, mask = items[name], masks[name]
+    lum = img.convert("L")
+    lp, mk = lum.load(), mask.load()
+    vals = sorted(lp[x, y] for y in range(OUT) for x in range(OUT) if mk[x, y])
+    mid = vals[len(vals) // 2] if vals else 1
+    mid = mid or 1
+    out = Image.new("L", (OUT, OUT), 0)
+    op = out.load()
+    for y in range(OUT):
+        for x in range(OUT):
+            if not mk[x, y]:
+                continue
+            d = (mid - lp[x, y]) / float(mid)
+            if d > 0:
+                op[x, y] = int(min(1.0, d * 2.4) ** 0.85 * 210)
+    return out
+
+
+
+
+
+
+# 身体图里的下半截长发：脸图只有 162 高，垂到肩/胸以下的发丝画在身体图里，
+# 身体原来没有遮罩，换发色就是「上半截变、下半截还是原蓝」。
+# 身体是参考图裁出来的静态图，蓝判据会把尾巴整条吃进来（实测尾巴 (66,74,120) b-r=54，
+# 头发 (45,73,116) b-r=71，颜色区间完全重叠，靠阈值分不开），所以左右各给一条允许带：
+# 尾巴在带外被整条排除，裙摆/围裙上的零星命中也不在带内。
+BODY_HAIR_REGIONS = (
+    # 左侧垂发：外沿贴到画布左边，内沿到 x≈46
+    ((0, 0), (47, 0), (45, 10), (43, 24), (41, 38), (37, 48), (31, 57), (20, 60), (7, 57), (0, 50)),
+    # 右侧垂发：右边界卡在 127，尾巴尾鳍左沿在 128
+    ((86, 0), (129, 0), (128, 8), (127, 20), (126, 32), (124, 43), (120, 52), (113, 58),
+     (104, 56), (97, 47), (92, 32), (88, 14)),
+)
+
+
+def _poly_mask(poly, w, h):
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).polygon(poly, fill=255)
+    return m
+
+
+def body_hair_mask(body_img):
+    """和 hair_masks 同一套判据，只是画布换成身体图，并且每条发带独立取最大块：
+    左右两束在图上不连通（中间隔着裙子），全图取最大块只会留下一边。
+    """
+    w, h = body_img.size
+    px = body_img.load()
+    out = Image.new("L", (w, h), 0)
+    op = out.load()
+    for poly in BODY_HAIR_REGIONS:
+        ap = _poly_mask(poly, w, h).load()
+        seed = Image.new("L", (w, h), 0)
+        sp = seed.load()
+        loose = Image.new("L", (w, h), 0)
+        lp = loose.load()
+        for y in range(h):
+            for x in range(w):
+                if not ap[x, y]:
+                    continue
+                p = px[x, y]
+                if _hair_blue(p):
+                    sp[x, y] = 255
+                if _hair_loose(p):
+                    lp[x, y] = 255
+        keep = Image.new("L", (w, h), 0)
+        kp = keep.load()
+        for cx, cy in _largest_block(sp, w, h):
+            kp[cx, cy] = 255
+        rp = _reconstruct(kp, lp, w, h).load()
+        for y in range(h):
+            for x in range(w):
+                if rp[x, y]:
+                    op[x, y] = 255
+    return _clip_to_alpha(_fill_hair_holes(out), body_img)
+
+
+def body_hair_shade(body_img, mask):
+    """和 hair_shade 同一个思路，画布是身体图。不压暗的话下半截是一块平涂色，
+    和上半截的发丝层次一刀两断。"""
+    w, h = body_img.size
+    lum = body_img.convert("L")
+    lp, mk = lum.load(), mask.load()
+    vals = sorted(lp[x, y] for y in range(h) for x in range(w) if mk[x, y])
+    if not vals:
+        return Image.new("L", (w, h), 0)
+    mid = vals[len(vals) // 2] or 1
+    out = Image.new("L", (w, h), 0)
+    op = out.load()
+    for y in range(h):
+        for x in range(w):
+            if not mk[x, y]:
+                continue
+            d = (mid - lp[x, y]) / float(mid)
+            if d > 0:
+                op[x, y] = int(min(1.0, d * 2.4) ** 0.85 * 210)
+    return out
+
+
+# 参考图的脸是「扁宽荷包蛋」：脸宽只占头宽的 0.46，四周全是泳松卷发。
+# 上一版脸 132 宽 / 头 192 宽（0.69），头发只剩两条窄边，读成“一张脸贴在帘子上”。
+# 现在脸 116（占 0.58）：比参考图留大一点，因为屏上只有 162px，
+# 脸再小眉毛和嘴就糊成像素点了
+FACE_CX, FACE_CY = 120, 118
+# 实测参考图：脸宽 380 / 脸高 370（1.03）、眼睛宽 200（占脸宽 0.53）。
+# 上一版脸 116×88（1.32）——脸扁了 30%，眼睛只占 0.34，这就是“不像”的根。
+# 脸顶必须提到 69（118-49）：额头在参考图里是可见的一大块，不是一条缝
+FACE_RX, FACE_RYU = 56, 49
+FACE_BOT = 168
+
+
+def _face_silhouette(n=36, m=26):
+    """脸型 = 上半椭圆 + 下半三次贝塞尔。单个椭圆是颗蛋：下巴钝在 206、脸高比脸宽还长，
+    读完像少女不像萝莉。二次元萝莉脸的三个特征是「最宽点靠上、下颊继续撑住（婴儿肥）、
+    最后一段才收成小圆下巴」，只能靠下半段单独给曲线——控制点让 x 先撑到 168 才sag，
+    末段切线接近水平，下巴才是圆的不是锥的。"""
+    pts = []
+    for i in range(n + 1):                       # 上半：左太阳穴 → 头顶 → 右太阳穴
+        th = math.pi - math.pi * i / n
+        pts.append((FACE_CX + FACE_RX * math.cos(th),
+                    FACE_CY - FACE_RYU * math.sin(th)))
+    p0 = (FACE_CX + FACE_RX, FACE_CY)
+    p1 = (FACE_CX + FACE_RX + 3, 148)
+    p2 = (FACE_CX + FACE_RX * 0.76, 160)
+    p3 = (FACE_CX, FACE_BOT)
+    right = []
+    for i in range(1, m + 1):
+        t = i / float(m)
+        mt = 1.0 - t
+        right.append((mt ** 3 * p0[0] + 3 * mt * mt * t * p1[0] + 3 * mt * t * t * p2[0] + t ** 3 * p3[0],
+                      mt ** 3 * p0[1] + 3 * mt * mt * t * p1[1] + 3 * mt * t * t * p2[1] + t ** 3 * p3[1]))
+    pts.extend(right)                            # 颊 → 下巴
+    pts.extend([(2 * FACE_CX - x, y) for x, y in right[::-1]])   # 下巴 → 左颊（镜像上行）
+    return pts
 
 
 def face(d, outline=True):
-    el(d, (52 * S, 58 * S, 188 * S, 206 * S), fill=SKIN,
-       outline=OUTLINE if outline else None, width=int(OUTLINE_W * S))
+    poly(d, [(x * S, y * S) for x, y in _face_silhouette()], SKIN,
+         OUTLINE if outline else None, int(OUTLINE_W * S))
 
 
 def brows(d, style="normal"):
-    for cx in (88, 152):
-        inner = cx > 120
+    # 眉毛在参考图里是被刘海半盖着的短弧，y 112~120 才露在发际下方。
+    # 跟着眼睛下移后不能再往下一分：眼顶在 120.2，压上去就被眼白盖掉
+    for cx in EYE_CX:
+        inner = cx > 96
+        w = 2.3 * S
         if style == "angry":
-            y1 = 80 if inner else 86
-            y2 = 86 if inner else 80
-            d.line([((cx - 17) * S, y1 * S), ((cx + 17) * S, y2 * S)], fill=LINE, width=int(3 * S))
+            y1 = 100.7 if inner else 103.0
+            y2 = 103.0 if inner else 100.7
+            d.line([((cx - 6.6) * S, y1 * S), ((cx + 6.6) * S, y2 * S)], fill=LINE, width=int(w))
         elif style == "sad":
-            y1 = 86 if inner else 80
-            y2 = 80 if inner else 86
-            d.line([((cx - 17) * S, y1 * S), ((cx + 17) * S, y2 * S)], fill=LINE, width=int(3 * S))
+            y1 = 103.0 if inner else 100.7
+            y2 = 100.7 if inner else 103.0
+            d.line([((cx - 6.6) * S, y1 * S), ((cx + 6.6) * S, y2 * S)], fill=LINE, width=int(w))
         elif style == "listen":
-            # 专注：比 raised 再抬 8px，两端略收。差距必须按屏上像素算——
-            # 6px 的微抬在 120px 的脸上根本看不见，不能拿「微妙」当「自然」
-            d.arc([(cx - 17) * S, 50 * S, (cx + 17) * S, 74 * S], 192, 348, fill=LINE, width=int(3 * S))
+            d.arc([(cx - 6.6) * S, 94.1 * S, (cx + 6.6) * S, 103.9 * S], 192, 348,
+                  fill=LINE, width=int(w))
         elif style == "raised":
-            d.arc([(cx - 17) * S, 58 * S, (cx + 17) * S, 80 * S], 195, 345, fill=LINE, width=int(3 * S))
+            d.arc([(cx - 6.6) * S, 92.4 * S, (cx + 6.6) * S, 102.1 * S], 195, 345,
+                  fill=LINE, width=int(w))
         else:
-            d.arc([(cx - 17) * S, 64 * S, (cx + 17) * S, 84 * S], 200, 340, fill=LINE, width=int(3 * S))
+            d.arc([(cx - 6.6) * S, 96.8 * S, (cx + 6.6) * S, 105.7 * S], 212, 328,
+                  fill=LINE, width=int(2.8 * S))
 
 
 BLINK_MODE = False  # True 时所有睁眼改画闭眼，用来出眨眼贴片
 BLINK_STYLE = "flat"
 
 
-def eye(d, cx, cy, rx=31, ry=35, lid=1.0, look=(0, 0), heart=False):
+EYE_CX = (74.4, 118.1)   # 从参考底板实测：原图眼心 310/492 × k=0.24
+EYE_CY = 117.6
+
+
+def _eye_cx(cx):
+    """眼距归一。21 张脸里的 cx 一律写死 88/152（内距 4 逻辑），缩到屏上两眼粘成一团；
+    逐个调用点改容易漏一个，直接在入口掰到 84/156。"""
+    return EYE_CX[0] if cx < 120 else EYE_CX[1]
+
+
+def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0):
+    cx = _eye_cx(cx)
+    cy = EYE_CY
+    # 眼型直接锁死：调用点里散着 rx=29/ry=33、rx=31/ry=36 的旧值，
+    # 那是「竖椭圆大眼」，缩到屏上眼白连成镜片。参考图是横宽、高只有宽的 0.7，
+    # 而且虹膜几乎填满眼白（只留一圈窄白）。逐个改 21 个调用点必漏，在这里一刀切。
+    # 20 是「眼宽占脸宽 0.34」算出来的，跟参考图一致；再大就贴到鬁发上了
+    # big 只给惊讶/震惊用：这两个表情用「瞑目」做信号，参考图里眼睛会大一圈
+    # 从参考底板实测：眼宽 110 / 眼高 90（原图 px）× k=0.24 → rx 13.2 / ry 10.8。
+    # 宽高比 1.22，比上一版 24/21 更圆；再放大 1.8 倍就把整个头读成「一双眼」
+    rx, ry = 13.2 * big, 10.8 * big
     if BLINK_MODE:
         closed_eye(d, cx, cy, BLINK_STYLE)
         return
@@ -186,8 +745,10 @@ def eye(d, cx, cy, rx=31, ry=35, lid=1.0, look=(0, 0), heart=False):
     ry2 = max(ry * lid, 1.0)
     el(d, ((cx - rx) * S, (cy2 - ry2) * S, (cx + rx) * S, (cy2 + ry2) * S), fill=WHITE)
     if lid > 0.4:
-        ixr = rx * 0.80
-        iyr = ry2 * 0.84
+        # 虹膜/眼白 = 0.82：参考图虹膜几乎填满眼白，只留一圈窄白。
+        # 不能给到 0.9：瞳孔还要靠 look 在眼白里平移，余量小于偏移量就会露出白角
+        ixr = rx * 0.82
+        iyr = ry2 * 0.80
         icx, icy = cx + look[0], cy2 + look[1]
         steps = 26
         for i in range(steps):
@@ -199,48 +760,73 @@ def eye(d, cx, cy, rx=31, ry=35, lid=1.0, look=(0, 0), heart=False):
         el(d, ((icx - ixr * 0.44) * S, (icy - iyr * 0.36) * S,
                (icx + ixr * 0.44) * S, (icy + iyr * 0.48) * S), fill=(26, 16, 42, 255))
         if heart:
-            el(d, ((icx - 12) * S, (icy - 15) * S, (icx - 1) * S, (icy - 3) * S), fill=(255, 118, 148, 255))
-            el(d, ((icx + 1) * S, (icy - 15) * S, (icx + 12) * S, (icy - 3) * S), fill=(255, 118, 148, 255))
-            poly(d, [((icx - 12) * S, (icy - 7) * S), ((icx + 12) * S, (icy - 7) * S),
-                     (icx * S, (icy + 15) * S), (icx * S, (icy - 7) * S)], (255, 118, 148, 255))
+            el(d, ((icx - 7.5) * S, (icy - 9.3) * S, (icx - 0.6) * S, (icy - 1.9) * S), fill=(255, 118, 148, 255))
+            el(d, ((icx + 0.6) * S, (icy - 9.3) * S, (icx + 7.5) * S, (icy - 1.9) * S), fill=(255, 118, 148, 255))
+            poly(d, [((icx - 7.5) * S, (icy - 4.3) * S), ((icx + 7.5) * S, (icy - 4.3) * S),
+                     (icx * S, (icy + 9.3) * S), (icx * S, (icy - 4.3) * S)], (255, 118, 148, 255))
         el(d, ((icx - ixr * 0.64) * S, (icy - iyr * 0.68) * S,
                (icx - ixr * 0.12) * S, (icy - iyr * 0.16) * S), fill=(255, 255, 255, 250))
         el(d, ((icx + ixr * 0.18) * S, (icy + iyr * 0.32) * S,
                (icx + ixr * 0.54) * S, (icy + iyr * 0.68) * S), fill=(255, 255, 255, 175))
-    # 上眼睑
+    # 上眼睑：参考图那道睫毛线是整张脸最重的一笔，4.6 逻辑宽缩到屏上是 1px，
+    # 读不出来，必须给到 6.4
     d.arc([(cx - rx) * S, (cy2 - ry2) * S, (cx + rx) * S, (cy2 + ry2) * S], 182, 358,
-          fill=LINE, width=int(4.6 * S))
-    # 睫毛尖
-    poly(d, [((cx - rx * 0.96) * S, (cy2 - ry2 * 0.30) * S),
-             ((cx - rx * 1.30) * S, (cy2 - ry2 * 0.58) * S),
-             ((cx - rx * 0.74) * S, (cy2 - ry2 * 0.90) * S)], LINE)
+          fill=LINE, width=int(3.0 * S))
+    # 睫毛尖朝外：左眼朝左、右眼朝右。原来两边都朝左，右眼看上去像被拉歪
+    sgn = -1 if cx < 96 else 1
+    poly(d, [((cx + sgn * rx * 0.96) * S, (cy2 - ry2 * 0.24) * S),
+             ((cx + sgn * rx * 1.36) * S, (cy2 - ry2 * 0.64) * S),
+             ((cx + sgn * rx * 0.66) * S, (cy2 - ry2 * 0.94) * S)], LINE)
 
 
 def closed_eye(d, cx, cy, kind="happy"):
+    cx = _eye_cx(cx)
+    # cy 必须在入口掰到 EYE_CY：这一支原来直接用调用点传的 118，
+    # 而睁眼那边被 EYE_CY 抬到 140——眨眼贴片会整块错位，眉毛被算进差异区
+    cy = EYE_CY
     if kind == "happy":
-        d.arc([(cx - 30) * S, (cy - 12) * S, (cx + 30) * S, (cy + 30) * S], 190, 350,
-              fill=LINE, width=int(4.6 * S))
+        d.arc([(cx - 14.2) * S, (cy - 5.3) * S, (cx + 14.2) * S, (cy + 14.2) * S], 190, 350,
+              fill=LINE, width=int(3.0 * S))
     elif kind == "flat":
-        # 平静闭眼：眼睑小幅下弯，直线会像两道横杠
-        d.arc([(cx - 26) * S, (cy - 12) * S, (cx + 26) * S, (cy + 14) * S], 15, 165,
-              fill=LINE, width=int(4.4 * S))
+        # 平静闭眼：眼睫小幅下弯，直线会像两道横杠
+        d.arc([(cx - 13.3) * S, (cy - 5.3) * S, (cx + 13.3) * S, (cy + 6.2) * S], 15, 165,
+              fill=LINE, width=int(2.8 * S))
     elif kind == "sad":
-        d.arc([(cx - 28) * S, (cy - 4) * S, (cx + 28) * S, (cy + 30) * S], 20, 160,
-              fill=LINE, width=int(4.4 * S))
+        d.arc([(cx - 13.8) * S, (cy - 2.7) * S, (cx + 13.8) * S, (cy + 14.2) * S], 20, 160,
+              fill=LINE, width=int(2.8 * S))
     # 闭着的眼角也要有睫毛，否则睁眼时的睫毛尖会凭空消失
-    d.line([((cx - 25) * S, (cy - 3) * S), ((cx - 34) * S, (cy - 9) * S)],
-           fill=LINE, width=int(3.2 * S))
+    sgn = -1 if cx < 96 else 1
+    d.line([((cx + sgn * 12.4) * S, (cy - 1.1) * S), ((cx + sgn * 16.9) * S, (cy - 4.4) * S)],
+           fill=LINE, width=int(2.0 * S))
 
 
 def blush(d, alpha=1.0, strength=1.0):
-    for cx in (64, 176):
-        el(d, ((cx - 21 * strength) * S, 138 * S, (cx + 21 * strength) * S, 158 * S), fill=BLUSH)
-        el(d, ((cx - 12 * strength) * S, 143 * S, (cx + 12 * strength) * S, 153 * S),
-           fill=(255, 190, 202, 255))
+    # 腮红必须在眼睛下方一圈：底板上的脸只有 94.6 宽，圆捣出去就画在蓝色头发上。
+    # y 141~152 是眼底（144.6）与嘴顶（150）之间唯一容得下它的带
+    s = min(strength, 1.2)
+    for cx in (67.2, 127.2):
+        el(d, ((cx - 8.4 * s) * S, 125.2 * S, (cx + 8.4 * s) * S, 135.0 * S), fill=BLUSH)
+        el(d, ((cx - 3.9 * s) * S, 127.9 * S, (cx + 3.9 * s) * S, 133.2 * S),
+           fill=(255, 190, 200, 255))
 
 
 TALK_MODE = False  # True 时所有嘴型统一换成张嘴，用来出说话贴片
-MOUTH_BOX = (98, 140, 142, 192)  # 240 逻辑坐标，嘴周边一块纯皮肤区
+# 嘴周边一块纯皮肤区（240 逻辑坐标）。底板上的下巴在 164.9，再往下就是脖子和衣领，
+# 所以下界只能到 166——多留 2 逻辑就会把领口带进口型贴片，说话时下巴跳一下
+MOUTH_BOX = (85, 127, 111, 148)
+
+# 嘴型坐标从旧基准（脸中心 x=120 / 嘴线 y=156）线性变换到参考底板实测位置。
+# 11 个分支各自手算必错，过一次函数既不会算错，以后挪嘴也只改这两个常量。
+MOUTH_C = (97.2, 138.6)
+MOUTH_S = 0.52
+
+
+def _m(*v):
+    out = []
+    for i, x in enumerate(v):
+        val = ((x - 120) * MOUTH_S + MOUTH_C[0]) if i % 2 == 0 else ((x - 156) * MOUTH_S + MOUTH_C[1])
+        out.append(val * S)
+    return out
 
 
 def mouth(d, kind="smile"):
@@ -249,41 +835,46 @@ def mouth(d, kind="smile"):
     elif kind == "attentive":
         # 专注听：只有一点点弧。嘴张成 o 加高眉一凑就是「啊？」——
         # 惊讶和倾听的区别就在嘴唇松不松，而安静地听人是闭着嘴的
-        d.arc([110 * S, 150 * S, 130 * S, 166 * S], 25, 155, fill=MOUTH, width=int(3.4 * S))
+        d.arc(_m(111, 148, 129, 162), 25, 155, fill=MOUTH, width=int(2.2 * S))
     elif kind == "smile":
-        d.arc([106 * S, 146 * S, 134 * S, 168 * S], 20, 160, fill=MOUTH, width=int(3.6 * S))
+        d.arc(_m(108, 149, 132, 166), 20, 160, fill=MOUTH, width=int(2.4 * S))
     elif kind == "grin":
-        d.chord([98 * S, 142 * S, 142 * S, 180 * S], 0, 180, fill=MOUTH)
-        d.chord([108 * S, 160 * S, 132 * S, 178 * S], 0, 180, fill=TONGUE)
+        d.chord(_m(105, 147, 135, 168), 0, 180, fill=MOUTH)
+        d.chord(_m(112, 158, 128, 167), 0, 180, fill=TONGUE)
     elif kind == "open":
-        el(d, (108 * S, 148 * S, 132 * S, 176 * S), fill=MOUTH)
-        el(d, (112 * S, 164 * S, 128 * S, 175 * S), fill=TONGUE)
+        el(d, _m(107, 150, 133, 168), fill=MOUTH)
+        el(d, _m(112, 160, 128, 167), fill=TONGUE)
     elif kind == "o":
-        el(d, (112 * S, 150 * S, 128 * S, 170 * S), fill=MOUTH)
+        # 张嘴必须带舌头：光一个红椭圆夹在两眼下方，无论大小都读成红鼻子。
+        # 参考图的 o 嘴其实就是「一个口 + 下面露舌」
+        el(d, _m(109, 151, 131, 167), fill=MOUTH)
+        el(d, _m(113, 159, 127, 167), fill=TONGUE)
     elif kind == "flat":
-        d.line([(110 * S, 158 * S), (130 * S, 158 * S)], fill=MOUTH, width=int(3.6 * S))
+        d.line([_m(113, 156)[0], _m(113, 156)[1], _m(127, 156)[0], _m(127, 156)[1]],
+               fill=MOUTH, width=int(2.4 * S))
     elif kind == "sad":
-        d.arc([106 * S, 156 * S, 134 * S, 178 * S], 200, 340, fill=MOUTH, width=int(3.6 * S))
+        d.arc(_m(109, 152, 131, 167), 200, 340, fill=MOUTH, width=int(2.4 * S))
     elif kind == "wavy":
         pts = []
         for i in range(19):
             t = i / 18.0
-            pts.append(((106 + 28 * t) * S, (158 + (3.5 if i % 2 else -3.5)) * S))
-        d.line(pts, fill=MOUTH, width=int(3 * S), joint="curve")
+            pts.append(_m(109 + 22 * t, 156 + (3.0 if i % 2 else -3.0)))
+        d.line(pts, fill=MOUTH, width=int(2.0 * S), joint="curve")
     elif kind == "cat":
-        d.arc([102 * S, 144 * S, 122 * S, 164 * S], 20, 160, fill=MOUTH, width=int(3.6 * S))
-        d.arc([118 * S, 144 * S, 138 * S, 164 * S], 20, 160, fill=MOUTH, width=int(3.6 * S))
+        d.arc(_m(106, 146, 120, 160), 20, 160, fill=MOUTH, width=int(2.4 * S))
+        d.arc(_m(120, 146, 134, 160), 20, 160, fill=MOUTH, width=int(2.4 * S))
 
 
 def tear(d, side=-1):
-    cx = 88 if side < 0 else 152
-    poly(d, [(cx * S, 146 * S), ((cx + 8) * S, 158 * S), ((cx - 8) * S, 158 * S)], (150, 214, 255, 255))
-    el(d, ((cx - 8) * S, 152 * S, (cx + 8) * S, 178 * S), fill=(150, 214, 255, 255))
+    cx = EYE_CX[0] if side < 0 else EYE_CX[1]
+    poly(d, [(cx * S, 125.2 * S), ((cx + 4.4) * S, 133.2 * S), ((cx - 4.4) * S, 133.2 * S)], (150, 214, 255, 255))
+    el(d, ((cx - 4.4) * S, 129.6 * S, (cx + 4.4) * S, 143.9 * S), fill=(150, 214, 255, 255))
 
 
 def sweat(d):
-    poly(d, [(196 * S, 96 * S), (206 * S, 114 * S), (186 * S, 114 * S)], (140, 210, 255, 255))
-    el(d, (186 * S, 104 * S, 206 * S, 128 * S), fill=(140, 210, 255, 255))
+    # 汗滴只能贴在右脸外缘外侧：脸右边界在 147.6，再往里就压在腮红上
+    poly(d, [(140.5 * S, 92.4 * S), (147.6 * S, 104.8 * S), (133.4 * S, 104.8 * S)], (140, 210, 255, 255))
+    el(d, (133.4 * S, 97.7 * S, 147.6 * S, 115.4 * S), fill=(140, 210, 255, 255))
 
 
 def add_outer_line(img, r=1):
@@ -305,7 +896,7 @@ def add_outer_line(img, r=1):
     g2 = dilated(2)
     out = Image.new("RGBA", img.size, (0, 0, 0, 0))
     halo = Image.new("RGBA", img.size, RIM_GLOW)
-    halo.putalpha(ImageChops.subtract(g2, g1).point(lambda v: int(v * 0.55)))
+    halo.putalpha(ImageChops.subtract(g2, g1).point(lambda v: int(v * 0.34)))
     out.alpha_composite(halo)
     ring = Image.new("RGBA", img.size, RIM)
     ring.putalpha(ImageChops.subtract(g1, a))
@@ -317,13 +908,17 @@ def add_outer_line(img, r=1):
 # ---- Q 版小身体：独立一张静态图，垫在头像下面 -------------------------
 # 不摊进 21 张脸里去：身体对每个表情都完全一样，画进每张脸等于把这张图复制 21 份（+450KB flash），
 # 而且会让眨眼贴片机制多背一份“睁眼/闭眼完全相同的像素”——diff_bbox 靠的就是这些像素完全相同。
-BODY_LW, BODY_LH = 180, 118   # 逻辑画布，跟头像共用同一套刻度和线宽
+BODY_LW, BODY_LH = 240, 120   # 逻辑画布，跟头像同宽同比例：两边同源才能拼接无缝
 BODY_W, BODY_H = sc(BODY_LW), sc(BODY_LH)   # 输出像素，跟 OUT 同比例缩
 SUIT = (88, 110, 158, 255)      # 衣服主色：科技蓝灰，固定色不跟 accent 走，衣服该是衣服自己的颜色
 SUIT_DK = (64, 82, 124, 255)
 SUIT_LT = (120, 148, 202, 255)
 COLLAR = (170, 210, 255, 255)
 SHOE = (44, 54, 86, 255)
+APRON = (246, 249, 255, 255)
+APRON_SH = (206, 222, 244, 255)
+TAIL = (86, 112, 172, 255)
+TAIL_LT = (140, 168, 220, 255)
 
 
 # 手臂单独成层：摆臂要动起来，只有把手臂从身体里拆出来才动得了。
@@ -348,72 +943,65 @@ def _rot(p, pivot, deg):
     return (pivot[0] + x * ca - y * sa, pivot[1] + x * sa + y * ca)
 
 
+BODY_CROP = (0, 620, 1000, 1055)   # 与 HEAD_CROP 完全同一条横向边界；底部留 10px 避开小红书水印
+_BODY_CACHE = {}
+
+
 def _arm_layer(deg):
-    """只有两条手臂的一层，画布和 body 完全同尺寸：C 侧共用同一套偏移宏。
-    这一层垫在 body 之下，臂根被躯干盖掉，转到任何角度都不会露缝。"""
-    img = Image.new("RGBA", (BODY_LW * S, BODY_LH * S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    ow = int(OUTLINE_W * S)
-    for sx in (-1, 1):
-        pts = [(BODY_LW - x, y) for x, y in ARM_PTS] if sx > 0 else list(ARM_PTS)
-        pivot = (BODY_LW - ARM_PIVOT[0], ARM_PIVOT[1]) if sx > 0 else ARM_PIVOT
-        # 右臂是镜像的，同一个角度会往下摆，取反才能跟左边同步抬起
-        rr = -deg if sx > 0 else deg
-        poly(d, [(x * S, y * S) for x, y in (_rot(p, pivot, rr) for p in pts)],
-             SKIN, OUTLINE, ow)
-        hx = ARM_HAND_DX if sx < 0 else BODY_LW - ARM_HAND_DX
-        hc = _rot((hx, ARM_HAND_Y), pivot, rr)
-        el(d, ((hc[0] - ARM_HAND_R) * S, (hc[1] - ARM_HAND_R) * S,
-               (hc[0] + ARM_HAND_R) * S, (hc[1] + ARM_HAND_R) * S),
-           fill=SKIN, outline=OUTLINE, width=ow)
-    # 不做 add_outer_line：手臂是人的一部分，不该自带一圈光。
-    # 做过一次，结果是脸两侧拉出两根细天线——那是手臂亮边被脸遮掉一半剩下的残渣
-    return img.resize((BODY_W, BODY_H), Image.LANCZOS)
+    """参考图的手臂是抱在胸前的静态姿势，已经焊死在身体底板里，不再有可旋转的手臂层。
+
+    保留函数和三帧，是为了固件侧的 EMOJI_ARM_FRAMES 循环一行都不用改；三帧全透明
+    等价于关掉挥手动画。要恢复挥手，得先从底板把两只手抠成独立素材。
+    """
+    return Image.new("RGBA", (BODY_W, BODY_H), (0, 0, 0, 0))
 
 
 def body():
-    """短脖子 + 敦实胶囊躯干 + 两条短腿（手臂在 _arm_layer 里单独一层）。
-    三条比例都是算过的，不是拍的：
-      · 整只身子（含手）58px < 头 90px —— Q 版靠大头小身子的反差，身体一宽就成冰箱。
-      · 躯干 45x40px 敦实，看着是个小人；抽成竖条就变成瘦长成年人。
-      · 必须有小短腿：没腿的躯干看着是不倒翁，加了腿才读成“站着的 Q 版小人”。"""
-    img = Image.new("RGBA", (BODY_LW * S, BODY_LH * S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    ow = int(OUTLINE_W * S)
-    # 脖子：头图盖到绝对 y=107，这里从 96 起，只露出下巴下面一丁点
-    d.rounded_rectangle([78 * S, 0, 102 * S, 30 * S], radius=10 * S,
-                        fill=SKIN, outline=OUTLINE, width=ow)
-    # 腿和鞋：短到只剩两小段，但有没有这两段差别巨大——有腿才站得住。
-    # 腿从 86 起画、躯干压到 88，重叠 2 逻辑（1px）只为了不留缝，不能真重叠多——
-    # 躯干圆角很大，盖太多会把腿切成只剩鞋面的两根短横线。
-    for sx in (-1, 1):
-        lx = 58 if sx < 0 else 100
-        d.rounded_rectangle([lx * S, 84 * S, (lx + 22) * S, 102 * S], radius=10 * S,
-                            fill=SUIT_DK, outline=OUTLINE, width=ow)
-        el(d, ((lx - 6) * S, 98 * S, (lx + 28) * S, 118 * S), fill=SHOE, outline=OUTLINE, width=ow)
-    # 躯干：圆角大到接近胶囊，Q 版的软感全靠这个弧
-    d.rounded_rectangle([45 * S, 20 * S, 135 * S, 88 * S], radius=28 * S,
-                        fill=SUIT, outline=OUTLINE, width=ow)
-    # 小圆领：只贴脖子根一圈，大了就成围嘴
-    d.chord([74 * S, 8 * S, 106 * S, 40 * S], 0, 180, fill=COLLAR)
-    # 左侧一条窄受光，不然整块纯色看着像纸片
-    d.rounded_rectangle([54 * S, 32 * S, 64 * S, 64 * S], radius=5 * S, fill=SUIT_LT)
-    # 腰部横条：把躯干分成上衣/下装，不再是一整个桶
-    d.rounded_rectangle([52 * S, 70 * S, 128 * S, 80 * S], radius=5 * S, fill=COLLAR)
-    return add_outer_line(img.resize((BODY_W, BODY_H), Image.LANCZOS))
+    """身体直接用参考图身体区，不再手绘女仆装。
+
+    手绘身体最致命的是裙摆：多边形画不出荷叶边的布料褶皱，缩到 80px 高就是
+    "梯形机器人 + 两根天线"，怎么调坐标都不像。
+    """
+    if "img" not in _BODY_CACHE:
+        im = Image.open(BASE_PNG).convert("RGBA").crop(BODY_CROP)
+        _BODY_CACHE["img"] = im.resize((BODY_W, BODY_H), Image.LANCZOS)
+    return _BODY_CACHE["img"]
+
+
+_HEAD_CACHE = {}
+
+
+def head_image():
+    """参考图头部，按 HEAD_CROP/HEAD_K 缩放到 4x 画布像素。缓存在内存里，21 张脸共用一张。"""
+    if "img" not in _HEAD_CACHE:
+        im = Image.open(BASE_PNG).convert("RGBA").crop(HEAD_CROP)
+        w = int(round(im.width * HEAD_K * S))
+        h = int(round(im.height * HEAD_K * S))
+        _HEAD_CACHE["img"] = im.resize((w, h), Image.LANCZOS)
+        _HEAD_CACHE["size"] = (w, h)
+    return _HEAD_CACHE["img"]
+
+
+def head_layer(d):
+    """把参考图头部贴到画布。alpha_composite 不接受负数坐标，
+    右侧超出部分由画布自己裁（宁可裁掉鳍耳外缘，也不能让脸偏到一边）。"""
+    d._img_ref.alpha_composite(head_image(), (int(round(HEAD_OX * S)), 0))
 
 
 def compose(fn):
     img = canvas()
-    fn(ImageDraw.Draw(img))
+    d = ImageDraw.Draw(img)
+    # hair_back 要用「画布引用 + mask」做逐行渐变，ImageDraw 本身不给图，
+    # 这里挂一个属性传下去；hair_masks 那种直接 new 出来的 draw 没有它，走单色分支
+    d._img_ref = img
+    fn(d)
     return img.resize((SZ, SZ), Image.LANCZOS)
 
 
 def build(spec):
+    """只贴底板 + 画五官。头发/发带/鳍耳/身体/尾巴全在底板里，不再重画。"""
     def fn(d):
-        hair_back(d)
-        face(d)
-        hair_front(d)
+        head_layer(d)
         spec(d)
     return compose(fn)
 
@@ -476,12 +1064,12 @@ def s_sad(d):
 
 def anger_mark(d):
     col = (255, 92, 112, 255)
-    cx, cy, r = 196, 62, 22
+    cx, cy, r = 137.9, 88.8, 10.7
     for a in (0, 90, 180, 270):
         rad = math.radians(a)
         ex, ey = cx + r * math.cos(rad), cy + r * math.sin(rad)
         d.line([((cx + r * 0.42 * math.cos(rad)) * S, (cy + r * 0.42 * math.sin(rad)) * S),
-                (ex * S, ey * S)], fill=col, width=int(5 * S))
+                (ex * S, ey * S)], fill=col, width=int(3.2 * S))
 
 
 def s_angry(d):
@@ -494,8 +1082,8 @@ def s_angry(d):
 
 def s_surprised(d):
     brows(d, "raised")
-    eye(d, 88, 116, rx=33, ry=38)
-    eye(d, 152, 116, rx=33, ry=38)
+    eye(d, 88, 116, big=1.25)
+    eye(d, 152, 116, big=1.25)
     mouth(d, "o")
 
 
@@ -532,32 +1120,35 @@ def s_thinking(d):
 
 def s_shocked(d):
     brows(d, "raised")
-    eye(d, 88, 114, rx=34, ry=39)
-    eye(d, 152, 114, rx=34, ry=39)
+    eye(d, 88, 114, big=1.3)
+    eye(d, 152, 114, big=1.3)
     mouth(d, "open")
     sweat(d)
 
 
 def sunglasses(d):
-    for cx in (88, 152):
-        d.rounded_rectangle([(cx - 30) * S, 100 * S, (cx + 30) * S, 140 * S],
-                            radius=14 * S, fill=(38, 40, 58, 255), outline=LINE, width=int(3 * S))
-        d.line([((cx - 22) * S, 112 * S), ((cx - 2) * S, 152 * S)], fill=(120, 132, 170, 160), width=int(5 * S))
-    d.line([(120 * S, 108 * S), (120 * S, 112 * S)], fill=LINE, width=int(5 * S))
-    d.line([(58 * S, 106 * S), (46 * S, 100 * S)], fill=LINE, width=int(4 * S))
-    d.line([(182 * S, 106 * S), (194 * S, 100 * S)], fill=LINE, width=int(4 * S))
+# 镜片必须比眼睛宽一圈、并且贴着 EYE_CY：镜片中心一旦偏离眼睛，
+# 屏幕上就是两片黑圆贴在脸上，读不出「戴墨镜」
+    for cx in EYE_CX:
+        d.rounded_rectangle([(cx - 14.2) * S, (EYE_CY - 9.8) * S, (cx + 14.2) * S, (EYE_CY + 9.8) * S],
+                            radius=7.1 * S, fill=(38, 40, 58, 255), outline=LINE, width=int(1.8 * S))
+        d.line([((cx - 9.8) * S, (EYE_CY - 5.3) * S), ((cx - 0.9) * S, (EYE_CY + 8.0) * S)],
+               fill=(120, 132, 170, 160), width=int(2.5 * S))
+    d.line([(97.0 * S, (EYE_CY - 3.6) * S), (97.0 * S, (EYE_CY - 0.9) * S)], fill=LINE, width=int(2.5 * S))
+    d.line([(59.7 * S, (EYE_CY - 1.8) * S), (52.6 * S, (EYE_CY - 5.3) * S)], fill=LINE, width=int(2.1 * S))
+    d.line([(132.5 * S, (EYE_CY - 1.8) * S), (139.6 * S, (EYE_CY - 5.3) * S)], fill=LINE, width=int(2.1 * S))
 
 
 def tongue(d, side=0):
-    cx = 120 + side
-    el(d, ((cx - 13) * S, 158 * S, (cx + 13) * S, 186 * S), fill=TONGUE)
-    d.line([(cx * S, 158 * S), (cx * S, 182 * S)], fill=(226, 108, 122, 200), width=int(2 * S))
+    cx = MOUTH_C[0] + side * MOUTH_S
+    el(d, ((cx - 5.9) * S, 137.5 * S, (cx + 5.9) * S, 146.1 * S), fill=TONGUE)
+    d.line([(cx * S, 137.5 * S), (cx * S, 144.5 * S)], fill=(226, 108, 122, 200), width=int(1.4 * S))
 
 
 def drool(d):
-    poly(d, [(132 * S, 166 * S), (140 * S, 180 * S), (124 * S, 180 * S)], (168, 214, 255, 235))
-    el(d, (122 * S, 172 * S, 142 * S, 198 * S), fill=(168, 214, 255, 235))
-    el(d, (187 * S, 104 * S, 197 * S, 116 * S), fill=(168, 214, 255, 210))
+    poly(d, [(105.9 * S, 143.9 * S), (110.3 * S, 150.1 * S), (101.4 * S, 150.1 * S)], (168, 214, 255, 235))
+    el(d, (100.6 * S, 144.7 * S, 111.2 * S, 156.3 * S), fill=(168, 214, 255, 235))
+    el(d, (134.3 * S, 104.8 * S, 141.4 * S, 112.8 * S), fill=(168, 214, 255, 210))
 
 
 def heart(d, cx, cy, s, col=(255, 108, 140, 255)):
@@ -573,8 +1164,8 @@ def s_funny(d):
     closed_eye(d, 152, 116, "happy")
     blush(d)
     mouth(d, "grin")
-    for side, sx in ((1, 66), (-1, 174)):
-        poly(d, [(sx * S, 132 * S), ((sx + side * 9) * S, 144 * S), ((sx - side * 4) * S, 146 * S)],
+    for side, sx in ((1, 50.8), (-1, 143.2)):
+        poly(d, [(sx * S, 113.7 * S), ((sx + side * 5.3) * S, 121.7 * S), ((sx - side * 2.7) * S, 122.6 * S)],
              (150, 214, 255, 240))
 
 
@@ -582,16 +1173,16 @@ def s_crying(d):
     brows(d, "sad")
     eye(d, 88, 120, lid=0.62, look=(0, 4))
     eye(d, 152, 120, lid=0.62, look=(0, 4))
-    for cx in (88, 152):
-        d.rounded_rectangle([(cx - 10) * S, 140 * S, (cx + 10) * S, 190 * S], radius=9 * S,
+    for cx in EYE_CX:
+        d.rounded_rectangle([(cx - 3.7) * S, 127.9 * S, (cx + 3.7) * S, 145.6 * S], radius=3.2 * S,
                             fill=(150, 214, 255, 230))
-        el(d, ((cx - 11) * S, 168 * S, (cx + 11) * S, 198 * S), fill=(150, 214, 255, 230))
+        el(d, ((cx - 4.3) * S, 136.8 * S, (cx + 4.3) * S, 149.2 * S), fill=(150, 214, 255, 230))
     blush(d, strength=1.1)
     if TALK_MODE:
         mouth(d, "open")
     else:
-        d.ellipse([104 * S, 148 * S, 136 * S, 182 * S], fill=MOUTH)
-        el(d, (108 * S, 164 * S, 132 * S, 180 * S), fill=TONGUE)
+        d.ellipse(_m(107, 146, 133, 168), fill=MOUTH)
+        el(d, _m(110, 158, 130, 166), fill=TONGUE)
 
 
 def s_winking(d):
@@ -607,7 +1198,7 @@ def s_cool(d):
     sunglasses(d)
     mouth(d, "smile")
     if not TALK_MODE:
-        d.line([(104 * S, 152 * S), (136 * S, 152 * S)], fill=MOUTH, width=int(3.6 * S))
+        d.line(_m(108, 156, 132, 156), fill=MOUTH, width=int(2.2 * S))
 
 
 def s_relaxed(d):
@@ -635,9 +1226,9 @@ def s_kissy(d):
     if TALK_MODE:
         mouth(d, "open")
     else:
-        el(d, (112 * S, 152 * S, 128 * S, 168 * S), fill=MOUTH)
-    heart(d, 186, 92, 15)
-    heart(d, 200, 62, 10)
+        el(d, _m(114, 150, 126, 162), fill=MOUTH)
+    heart(d, 146.7, 94.1, 7.1)
+    heart(d, 157.4, 76.4, 5.3)
 
 
 def s_confident(d):
@@ -655,7 +1246,7 @@ def s_silly(d):
     if TALK_MODE:
         mouth(d, "open")
     else:
-        d.arc([104 * S, 146 * S, 136 * S, 168 * S], 20, 160, fill=MOUTH, width=int(3.6 * S))
+        d.arc(_m(107, 146, 133, 164), 20, 160, fill=MOUTH, width=int(2.4 * S))
     tongue(d)
 
 
@@ -672,7 +1263,7 @@ def s_talk_small(d):
     eye(d, 88, 118, rx=29, ry=33)
     eye(d, 152, 118, rx=29, ry=33)
     blush(d, strength=0.7)
-    el(d, (110 * S, 150 * S, 130 * S, 168 * S), fill=MOUTH)
+    el(d, _m(112, 148, 128, 165), fill=MOUTH)
 
 
 def s_talk_open(d):
@@ -680,8 +1271,8 @@ def s_talk_open(d):
     eye(d, 88, 118, rx=29, ry=33)
     eye(d, 152, 118, rx=29, ry=33)
     blush(d, strength=0.7)
-    el(d, (108 * S, 148 * S, 132 * S, 178 * S), fill=MOUTH)
-    el(d, (112 * S, 166 * S, 128 * S, 177 * S), fill=TONGUE)
+    el(d, _m(110, 148, 130, 172), fill=MOUTH)
+    el(d, _m(114, 163, 126, 170), fill=TONGUE)
 
 
 REGISTRY = {
@@ -718,10 +1309,10 @@ MOUTH_OX = sc(MOUTH_BOX[0])
 MOUTH_OY = sc(MOUTH_BOX[1])
 
 
-# 身体相对头像左上角的偏移（输出坐标）：横向居中，纵向压住后脑勺下缘——
-# hair_back 到 y=107，从 100 起画身体，后脑勺正好盖住脖子接缝。
-# 必须排在 OUT 之后（横向居中要用它算），不能跟着 body() 一起写在前面
-BODY_OX, BODY_OY = (OUT - BODY_W) // 2, sc(192)
+# 身体相对头像左上角的偏移（输出坐标）：横向居中，纵向压住后脑勺下缘。
+# BODY_CROP 顶部在原图 y=620，乘上头像同一套 k 就是它该落的绝对位置——
+# 之前写死 192 是让旧手绘身体的脖子接到下巴上，现在两边同源，对不上就成双下巴。
+BODY_OX, BODY_OY = (OUT - BODY_W) // 2, sc(620 * HEAD_K)
 # 本脚本在 tools/ 下，产物要落到项目根的 main/display/ 与 _emoji_out/
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1044,7 +1635,7 @@ def talk_sheet(out, items, mouths, scale=2):
 
 
 def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, arm_imgs, gazes, gbox,
-             shadow):
+             shadow, shade_img, body_hair, body_hair_shade):
     hdr = os.path.join(HERE, "main", "display", "emoji_assets.h")
     src = os.path.join(HERE, "main", "display", "emoji_assets.c")
     names = list(items.keys())
@@ -1070,6 +1661,8 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
         f.write("extern const lv_image_dsc_t emoji_shadow;\n")
         f.write("#define EMOJI_ARM_FRAMES %d\n" % len(arm_imgs))
         f.write("extern const lv_image_dsc_t emoji_body;\n")
+        # 身体图上的下半截长发：+2 张 A8（遮罩 + 阴影），尺寸同 body
+        f.write("extern const lv_image_dsc_t emoji_body_hair;\nextern const lv_image_dsc_t emoji_body_hair_shade;\n")
         for i in range(len(arm_imgs)):
             f.write("extern const lv_image_dsc_t emoji_arm_%d;\n" % i)
         f.write("// 表情表：patch 是相对底图 emoji_neutral 的差异块，NULL 表示这张就是底图本身。\n"
@@ -1089,6 +1682,8 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
                 f.write("extern const lv_image_dsc_t emoji_gaze_%d;\n" % i)
         for name in names:
             f.write("extern const lv_image_dsc_t emoji_%s_hair;\n" % name)
+        f.write("// 换发色时的阴影层：全表情共用一张（头发在底板里，五官补丁不碰发区）\n")
+        f.write("extern const lv_image_dsc_t emoji_hair_shade;\n")
         f.write("extern const lv_image_dsc_t emoji_%s;\n" % BASE_NAME)
         for name in names:
             if name in patches:
@@ -1102,6 +1697,8 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
         f.write("// 由 tools/gen_emoji_assets.py 生成，勿手改\n")
         f.write("#include \"emoji_assets.h\"\n\n")
         f.write(c_array("emoji_body", to_rgb565a8(body_img)))
+        f.write(c_array("emoji_body_hair", to_a8(body_hair)))
+        f.write(c_array("emoji_body_hair_shade", to_a8(body_hair_shade)))
         for i, im in enumerate(arm_imgs):
             f.write(c_array("emoji_arm_%d" % i, to_rgb565a8(im)))
         f.write(c_array("emoji_shadow", to_a8(shadow)))
@@ -1116,6 +1713,7 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
                 f.write(c_array("emoji_" + name + "_blink_hair", to_a8(blink_hair[name])))
         for name in names:
             f.write(c_array("emoji_" + name + "_hair", to_a8(hair[name])))
+        f.write(c_array("emoji_hair_shade", to_a8(shade_img)))
         for i, im in enumerate(gazes):
             f.write(c_array("emoji_gaze_%d" % i, to_rgb565a8(im)))
         f.write(dsc_a8("emoji_shadow", shadow.size[0], shadow.size[1]))
@@ -1131,7 +1729,10 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
                 f.write(dsc_a8("emoji_" + name + "_blink_hair", bw, bh))
         for name in names:
             f.write(dsc_a8("emoji_" + name + "_hair", OUT, OUT))
+        f.write(dsc_a8("emoji_hair_shade", OUT, OUT))
         f.write(dsc("emoji_body", BODY_W, BODY_H))
+        f.write(dsc_a8("emoji_body_hair", BODY_W, BODY_H))
+        f.write(dsc_a8("emoji_body_hair_shade", BODY_W, BODY_H))
         for i in range(len(arm_imgs)):
             f.write(dsc("emoji_arm_%d" % i, BODY_W, BODY_H))
         for i in range(len(gazes)):
@@ -1184,12 +1785,21 @@ if __name__ == "__main__":
         im.save(os.path.join(out, "_arm_%d.png" % i))
     shadow = shadow_map(items, body_img)
     shadow.save(os.path.join(out, "_shadow.png"))
+    shade_img = hair_shade(items, hair)
+    shade_img.save(os.path.join(out, "_hair_shade.png"))
+    body_hair = body_hair_mask(body_img)
+    body_hair.save(os.path.join(out, "_body_hair.png"))
+    body_shade = body_hair_shade(body_img, body_hair)
+    body_shade.save(os.path.join(out, "_body_hair_shade.png"))
+    bh_hit = sum(1 for y in range(BODY_H) for x in range(BODY_W) if body_hair.load()[x, y])
+    print("body hair mask: %d px (%.1f%% of body)" % (bh_hit, 100.0 * bh_hit / (BODY_W * BODY_H)))
     src, size = export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, arm_imgs,
-                         gazes, gbox, shadow)
+                         gazes, gbox, shadow, shade_img, body_hair, body_shade)
     bw, bh = (bbox[2] - bbox[0], bbox[3] - bbox[1]) if bbox else (0, 0)
     total = (OUT * OUT * 3 + sum(im.size[0] * im.size[1] * 3 for im, _b in patches.values())
              + len(mouths) * MOUTH_W * MOUTH_H * 3 + len(blinks) * bw * bh * 4
-             + len(items) * OUT * OUT + BODY_W * BODY_H * 3 + shadow.size[0] * shadow.size[1])
+             + len(items) * OUT * OUT + BODY_W * BODY_H * 5 + shadow.size[0] * shadow.size[1]
+             + OUT * OUT)
     print("base %dx%d + %d patches (avg %.1fKB) -> %.0f KB total"
           % (OUT, OUT, len(patches),
              sum(im.size[0] * im.size[1] * 3 for im, _b in patches.values()) / 1024.0 / max(1, len(patches)),

@@ -18,6 +18,7 @@
 
 #include "audio_codec.h"
 #include "wake_word.h"
+#include "virtual_echo_ref.h"
 
 class AfeWakeWord : public WakeWord {
 public:
@@ -30,6 +31,7 @@ public:
     void Start();
     void Stop();
     size_t GetFeedSize();
+    void PushReference(const std::vector<int16_t>& pcm, int sample_rate);
     void EncodeWakeWordData();
     bool GetWakeWordOpus(std::vector<uint8_t>& opus);
     const std::string& GetLastDetectedWakeWord() const { return last_detected_wake_word_; }
@@ -44,6 +46,11 @@ private:
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
     AudioCodec* codec_ = nullptr;
     std::string last_detected_wake_word_;
+
+    // 单工板硬件只接了 mic，AFE 的 AEC 却只认交错的 R 通道，自己造一路
+    bool virtual_ref_ = false;
+    VirtualEchoRef ref_;
+    std::vector<int16_t> feed_buffer_;
 
     TaskHandle_t wake_word_encode_task_ = nullptr;
     StaticTask_t* wake_word_encode_task_buffer_ = nullptr;

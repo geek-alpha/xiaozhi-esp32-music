@@ -63,6 +63,11 @@ protected:
     uint32_t nod_wait_ms_ = 0;
     // Q 版身体：一张静态图垫在头像下面。和 21 张脸分开存，换表情只重画脸，身体只做呼吸
     lv_obj_t* body_image_ = nullptr;
+    // 身体图上的下半截长发：脸图只有 EMOJI_H 高，垂到肩/胸以下的发丝画在 body 里。
+    // 没有这层，换发色就是「上半截变了、下半截还是原蓝」。必须建在 body 之后、脸之前：
+    // 建在 body 之前会被躯干盖住，建在脸之后会把脸盖掉
+    lv_obj_t* body_hair_image_ = nullptr;
+    lv_obj_t* body_hair_shade_image_ = nullptr;
     lv_obj_t* emotion_image_ = nullptr;
     // 表情补丁层：底图永远是 neutral，切表情只换这块差异图（见 emoji_asset_t）
     lv_obj_t* patch_image_ = nullptr;
@@ -71,7 +76,11 @@ protected:
     // 头发染色层：挂在 emotion_image_ 下面当子对象，父图隐藏/挪位它自动跟着走
     lv_obj_t* hair_image_ = nullptr;
     const lv_image_dsc_t* hair_img_ = nullptr;
-    uint32_t hair_color_ = 0x76A6FF;  // 原发色，不染色时和旧版长得一模一样
+    // 染色阴影层：recolor 只有「新色」一个自由度，单靠它会把底板的发丝明暗压成平涂。
+    // 这张 A8 带的是底板里比头发中位亮度暗的部分，色相取同一新色的暗版，叠上去明暗就回来了
+    lv_obj_t* hair_shade_image_ = nullptr;
+    // 0 = 不染色，直接用参考图底板的原始像素。底板自带深→浅的发色层次，只有用户主动换色才染
+    uint32_t hair_color_ = 0;
     // HUD 主色，0 = 跟随主题默认（light 品红 / dark 青）。配过就整屏顶栏+底图动态一起换
     uint32_t accent_color_ = 0;
     // 整屏染色强度 0~10，要和 accent_color_ 一起存 NVS，否则重启后颜色回来了、染层却没了
@@ -187,6 +196,10 @@ public:
     // 小人整体呼吸：三层 y 由同一个 tick 统一算并同时下发
     void AvatarFloatTick();
     void ApplyAvatarY();
+    // 按 hair_color_ 决定染色层显不显示：0 = 隐藏（用原图），非 0 = 新色 + 阴影层
+    void ApplyHairTint();
+    // 头发两层提到最前。嘴/眨眼贴片每次显示后都要重提，漏一处那一帧头发就被盖住
+    void RaiseHairLayers();
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetHairColor(uint32_t rgb) override;
     virtual void SetAccentColor(uint32_t rgb, int strength = -1) override;

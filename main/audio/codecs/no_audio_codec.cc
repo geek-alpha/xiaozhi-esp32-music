@@ -1,6 +1,7 @@
 #include "no_audio_codec.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cmath>
 #include <cstring>
 
@@ -305,16 +306,29 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 }
 
 int NoAudioCodec::Read(int16_t* dest, int samples) {
-    size_t bytes_read = 0;
-
     in32_buf_.resize(samples);
     std::vector<int32_t>& bit32_buffer = in32_buf_;
     // 超时必须有。portMAX_DELAY 下 RX 通道只要进过一次坏状态（改时钟/重开通道的窗口期），
     // 这里就永不返回，AudioInputTask 永久卡死：屏幕照旧挂「聆听中」，说话一个字节上不去，
     // 只有重启设备才恢复。超时返回 0，交给上层退避重试 + 重开通道自愈。
     i2s_chan_handle_t rx = rx_handle_;
-    esp_err_t err = i2s_channel_read(rx, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read,
-                                     pdMS_TO_TICKS(AUDIO_CODEC_READ_TIMEOUT_MS));
+    // 累积读满一帧。_t3.log 实测单次 i2s_channel_read 仍有 30% 返回 bytes=0（DMA 里还没
+    // 攒够 512 帧，请求比数据产生快），丢一帧就在 AFE 的输入流上留一个 32ms 空洞——
+    // 唤醒词和 ASR 吃的恰好是这种断续信号，念十遍也认不出来。这里续读到凑满再返回，
+    // 总预算 2×超时，代价只是偶尔多等一个数据周期。
+    const size_t want_bytes = (size_t)samples * sizeof(int32_t);
+    size_t bytes_read = 0;
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)AUDIO_CODEC_READ_TIMEOUT_MS * 2000;
+    esp_err_t err = ESP_OK;
+    while (bytes_read < want_bytes) {
+        size_t got = 0;
+        err = i2s_channel_read(rx, (uint8_t*)bit32_buffer.data() + bytes_read, want_bytes - bytes_read, &got,
+                               pdMS_TO_TICKS(AUDIO_CODEC_READ_TIMEOUT_MS));
+        bytes_read += got;
+        if (esp_timer_get_time() >= deadline_us) {
+            break;
+        }
+    }
     // 判据只看 bytes_read：IDF 的 i2s_channel_read 在环形缓冲凑不满请求量时，会先把已到的
     // 数据拷进用户缓冲、再返回 ESP_ERR_TIMEOUT。原来把 err != ESP_OK 一律当读失败，输入任务
     // 读一次就 break 退出——之后永远显示「聆听中」、说话毫无反应，只有重启设备才恢复。
@@ -328,9 +342,34 @@ int NoAudioCodec::Read(int16_t* dest, int samples) {
     }
 
     samples = bytes_read / sizeof(int32_t);
+    // 削顶到底发生在哪一级只能靠这两个峰值分开看：raw32 到 int32 满量程说明 mic/ADC
+    // 已经饱和（信息丢了，AEC 再怎么算也消不掉回声）；raw32 远没满而 val16 顶到 32767
+    // 则是这里 >>12 的软件截断，少移一位就能救回来。
+    static int32_t s_raw_peak = 0;
+    static int32_t s_val_peak = 0;
+    static int64_t s_win_us = 0;
     for (int i = 0; i < samples; i++) {
-        int32_t value = bit32_buffer[i] >> 12;
+        int32_t raw = bit32_buffer[i];
+        int32_t araw = raw < 0 ? -raw : raw;
+        if (araw > s_raw_peak) {
+            s_raw_peak = araw;
+        }
+        int32_t value = raw >> 16;
+        int32_t aval = value < 0 ? -value : value;
+        if (aval > s_val_peak) {
+            s_val_peak = aval;
+        }
         dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
+    }
+    int64_t now_us = esp_timer_get_time();
+    if (s_win_us == 0) {
+        s_win_us = now_us;
+    }
+    if (now_us - s_win_us >= 1000000) {
+        ESP_LOGI(TAG, "mic peak raw32=%ld val16=%ld", (long)s_raw_peak, (long)s_val_peak);
+        s_raw_peak = 0;
+        s_val_peak = 0;
+        s_win_us = now_us;
     }
     return samples;
 }

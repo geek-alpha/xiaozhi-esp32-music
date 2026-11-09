@@ -187,15 +187,24 @@ McpServer::McpServer() {
     if (display) {
         AddTool("self.appearance.set_hair_color",
             "换屏幕上那个头像的头发颜色。用户说「头发换成粉色」「染成金色」时用它。\n"
+            "用户说「变回原来的颜色」「不用染了」「恢复原色」时，`color` 传 `原色`。\n"
             "参数:\n"
-            "  `color`: 颜色，可以给中文/英文色名（粉/金/银/黑/白/紫/绿/红/棕/蓝），也可以给 #RRGGBB。\n"
+            "  `color`: 颜色，可以给中文/英文色名（粉/金/银/黑/白/紫/绿/红/棕/蓝），也可以给 #RRGGBB；\n"
+            "           传 `原色` / `还原` = 取消染色，回到底图自带的那头蓝发。\n"
             "返回 success 表示屏幕上已经是新发色，照着说就行。",
             PropertyList({
                 Property("color", kPropertyTypeString)
             }),
             [display](const PropertyList& properties) -> ReturnValue {
                 uint32_t rgb = 0;
-                if (!ParseColorName(properties["color"].value<std::string>(), &rgb)) {
+                std::string name = properties["color"].value<std::string>();
+                // 0 = 不染色：只有这个值能保留底图自带的深→浅发色层次
+                if (name == "原色" || name == "原发色" || name == "还原" || name == "恢复" ||
+                    name == "默认" || name == "original" || name == "default" || name == "reset") {
+                    display->SetHairColor(0);
+                    return std::string("{\"success\": true, \"message\": \"头发已还原成原色\"}");
+                }
+                if (!ParseColorName(name, &rgb)) {
                     return std::string("{\"success\": false, \"message\": \"认不出这个颜色，给色名（粉/金/银/黑/白/紫/绿/红/棕/蓝）或 #RRGGBB\"}");
                 }
                 display->SetHairColor(rgb);

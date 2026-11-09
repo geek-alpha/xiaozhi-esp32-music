@@ -78,6 +78,36 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        // 静默监听期间只借 AEC 之后的残余能量判断用户开没开口，音频一律丢弃
+        if (IsUplinkMuted()) {
+            UpdateBargeInEnergy(data);
+            return;
+        }
+        // 喇叭静着时没有回声要消，改用 AEC 之前的原始 mic 帧：软件造的虚拟参考只要跟
+        // 真实回声对不齐，AFE 的残余抑制就会连人声一起切（数字见 StorePreFrame 注释），
+        // 远讲的人声正好被吃干。播放期必须消回声，仍走 AEC 后。多 mic 板帧长对不上，不换。
+        int32_t ref_rms = echo_ref_rms_.load(std::memory_order_relaxed);
+        bool playing = (ref_rms > 0) &&
+                       (esp_timer_get_time() - echo_ref_us_.load(std::memory_order_relaxed)) <= 300000;
+        bool from_pre = false;
+        if (!playing && codec_->input_channels() == 1) {
+            std::vector<int16_t> pre;
+            if (TakeLatestPreSamples(data.size(), pre)) {
+                data = std::move(pre);
+                from_pre = true;
+            }
+        }
+        int in_rms = RmsOf(data);
+        ApplyUplinkGain(data);
+        // 每 300ms 一条：src 说明这一帧上行取自原始 mic 还是 AEC 后，in/out 是增益前后的
+        // 电平。远讲能不能听清只看 out 进没进到 3k~8k，这个数不需要猜。
+        int64_t up_us = esp_timer_get_time();
+        if (up_us - uplink_log_us_ > 300000) {
+            uplink_log_us_ = up_us;
+            ESP_LOGI(TAG, "uplink src=%s in=%d out=%d gain=%d/256 playing=%d",
+                     from_pre ? "mic" : "aec", in_rms, RmsOf(data),
+                     uplink_gain_q8_.load(std::memory_order_relaxed), (int)playing);
+        }
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
@@ -279,6 +309,10 @@ void AudioService::AudioInputTask() {
             int samples = audio_processor_->GetFeedSize();
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
+                    // AEC 之前的原始 mic 电平：与 AEC 后的 barge rms 一对比就能看出衰减多少，
+                    // 「播放中回声到底被消掉没」这个事实只能靠这两个数的差看出来
+                    barge_in_pre_rms_.store(RmsOf(data), std::memory_order_relaxed);
+                    StorePreSamples(data);
                     audio_processor_->Feed(std::move(data));
                     continue;
                 }
@@ -322,6 +356,11 @@ void AudioService::AudioOutputTask() {
         // AfeAudioProcessor 里按固定样本数补偿。同时记下电平和时刻，用来判断「最近有没有在出声」。
         if (audio_processor_) {
             audio_processor_->PushReference(task->pcm, codec_->output_sample_rate());
+        }
+        // 说话期间 audio_processor_ 是停的，唯一能听见用户的是唤醒词——它也要拿到参考，
+        // 否则自己的 TTS 会把「你好小智」淹没，语音打断彻底失效。
+        if (wake_word_) {
+            wake_word_->PushReference(task->pcm, codec_->output_sample_rate());
         }
         UpdateEchoReference(task->pcm);
         codec_->OutputData(task->pcm);
@@ -441,6 +480,80 @@ void AudioService::UpdateEchoReference(const std::vector<int16_t>& pcm) {
     echo_ref_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
 }
 
+void AudioService::StorePreSamples(const std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pre_frames_mutex_);
+    const size_t cap = pre_ring_.size();
+    for (int16_t s : pcm) {
+        pre_ring_[pre_ring_pos_] = s;
+        pre_ring_pos_ = (pre_ring_pos_ + 1) % cap;
+        if (pre_ring_filled_ < cap) {
+            pre_ring_filled_++;
+        }
+    }
+}
+
+bool AudioService::TakeLatestPreSamples(size_t n, std::vector<int16_t>& out) {
+    if (n == 0 || n > pre_ring_.size()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pre_frames_mutex_);
+    if (pre_ring_filled_ < n) {
+        return false;
+    }
+    const size_t cap = pre_ring_.size();
+    size_t start = (pre_ring_pos_ + cap - n) % cap;
+    out.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        out[i] = pre_ring_[(start + i) % cap];
+    }
+    return true;
+}
+
+void AudioService::ApplyUplinkGain(std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return;
+    }
+    // 目标 5000 ≈ 满幅的 -16dBFS，是 ASR 最稳的区间。上限 5 倍：静默底噪实测 200 上下，
+    // 8 倍能把它推到 1600，服务端 VAD 会当成一直有人说话，ASR 收到的全是噪声。
+    constexpr int kTargetRms = 5000;
+    constexpr int kMinQ8 = 256;
+    constexpr int kMaxQ8 = 256 * 5;
+    // 底噪门 280：_up_ring.log 实测这块板静默原始 mic 就 188~243，原来写 120，
+    // 底噪全落在「算人声」里，增益被追到上限 2047/256 卡死一整段（in=209 out=1677），
+    // 用户真开口时的句头反而在这个 8 倍增益上被软拐点压扁。人声实测 2000+，280 坐在中间。
+    constexpr int kSpeechFloorRms = 280;
+
+    int rms = RmsOf(pcm);
+    int g = uplink_gain_q8_.load(std::memory_order_relaxed);
+    if (rms >= kSpeechFloorRms) {
+        int want = (kTargetRms << 8) / rms;
+        want = want < kMinQ8 ? kMinQ8 : (want > kMaxQ8 ? kMaxQ8 : want);
+        // 半帧收敛：跟得上句内的音量变化，又不会让增益在两帧之间来回跳。
+        g = (g + want) / 2;
+    } else if (g > kMinQ8) {
+        // 静默帧不归 1.0：字与字之间掉一瞬就把增益清零，下一个字从原始弱音量起步，
+        // 半帧收敛要好几帧才追上，句头永远是糊的。缓慢回落（约 16 帧到 1x）代替瞬切。
+        g -= (g - kMinQ8) / 16 + 1;
+    }
+    uplink_gain_q8_.store(g, std::memory_order_relaxed);
+    if (g == kMinQ8) {
+        return;
+    }
+    for (auto& s : pcm) {
+        int32_t v = (static_cast<int32_t>(s) * g) >> 8;
+        // 软拐点：越过 30000 的部分按 1/8 压，硬削出来的方波谐波会让 ASR 把字听成别的音。
+        if (v > 30000) {
+            v = 30000 + (v - 30000) / 8;
+        } else if (v < -30000) {
+            v = -30000 + (v + 30000) / 8;
+        }
+        s = static_cast<int16_t>(v > INT16_MAX ? INT16_MAX : (v < -32767 ? -32767 : v));
+    }
+}
+
 void AudioService::GateEchoFrame(std::vector<int16_t>& pcm) {
     int64_t now = esp_timer_get_time();
     int32_t ref = echo_ref_rms_.load(std::memory_order_relaxed);
@@ -451,10 +564,11 @@ void AudioService::GateEchoFrame(std::vector<int16_t>& pcm) {
     // 残余电平——AI 说话、没人插话时这个值应该贴近底噪，这是 AEC 真生效的唯一硬证据。
     if (audio_processor_ && audio_processor_->AecActive()) {
         if (playing) {
+            // 这里存的是 AEC 后的上行电平，不是喇叭输出——不要拿它当「在放音」的判据
             aec_up_sum_ += RmsOf(pcm);
             aec_frames_++;
         }
-        if (now - gate_log_us_ > 500000) {
+        if (now - gate_log_us_ > 200000) {
             gate_log_us_ = now;
             int32_t avg = aec_frames_ ? (int32_t)(aec_up_sum_ / aec_frames_) : 0;
             ESP_LOGI(TAG, "AEC: playing=%d up_avg=%ld ref=%ld frames=%lu", (int)playing, (long)avg,
@@ -735,4 +849,104 @@ void AudioService::CheckAndUpdateAudioPowerState() {
 
 void AudioService::UpdateOutputTimestamp() {
     last_output_time_ = std::chrono::steady_clock::now();
+}
+void AudioService::UpdateBargeInEnergy(const std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return;
+    }
+    int rms = RmsOf(pcm);
+    barge_in_rms_.store(rms, std::memory_order_relaxed);
+    // 帧长按实际样本数和 16kHz 推算，别写死 60ms：帧长是编译期配置
+    int frame_ms = static_cast<int>(pcm.size() * 1000 / 16000);
+    int64_t now = esp_timer_get_time();
+
+    // 标定期只学本底，一律不算打断：AEC 参考要几百毫秒才收敛，起播首帧还有爆音。
+    // 学的是慢速平滑值而不是最大值——本底是环境属性（房间/风扇/增益），不是这一句话的
+    // 属性，而且 max 被一次爆音顶上去就再也降不下来。
+    if (barge_settle_ms_left_ > 0) {
+        barge_settle_ms_left_ -= frame_ms;
+        int f = barge_echo_floor_.load(std::memory_order_relaxed);
+        barge_echo_floor_.store(f == 0 ? rms : (f * 3 + rms) / 4, std::memory_order_relaxed);
+        barge_in_run_ms_.store(0, std::memory_order_relaxed);
+        barge_in_gap_frames_.store(0, std::memory_order_relaxed);
+        if (now - barge_in_log_us_ > 200000) {
+            barge_in_log_us_ = now;
+            ESP_LOGI(TAG, "barge settle pre=%d rms=%d floor=%d ref=%ld left=%dms",
+                     barge_in_pre_rms_.load(std::memory_order_relaxed), rms,
+                     barge_echo_floor_.load(std::memory_order_relaxed),
+                     (long)echo_ref_rms_.load(std::memory_order_relaxed), barge_settle_ms_left_);
+        }
+        return;
+    }
+
+    // 参考断流的帧不判打断：那一刻 AFE 拿到的 R 通道是 0，AEC 等于没开，上行里全是
+    // 自己的回声。实测同一轮里正常帧残余 385、断流帧飙到 12299（_exp4.log），
+    // 这种帧根本不具备分辨「回声还是人声」的能力，拿它判就只能自己打断自己。
+    if (audio_processor_ && audio_processor_->EchoRefBroken()) {
+        barge_in_run_ms_.store(0, std::memory_order_relaxed);
+        barge_in_peak_rms_.store(0, std::memory_order_relaxed);
+        barge_in_gap_frames_.store(0, std::memory_order_relaxed);
+        if (now - barge_in_log_us_ > 200000) {
+            barge_in_log_us_ = now;
+            ESP_LOGW(TAG, "barge skip: echo ref underrun pre=%d rms=%d ref=%ld",
+                     barge_in_pre_rms_.load(std::memory_order_relaxed), rms,
+                     (long)echo_ref_rms_.load(std::memory_order_relaxed));
+        }
+        return;
+    }
+
+    // 门限固定：AEC 后残余与人声是两堆，跟播放电平无关，见 audio_service.h 的实测说明。
+    const int thr = BARGE_IN_THR_ABS;
+    // 必须是「连续」而不是积分：低能量帧只按 2 倍速和减，回声在阀值边缘抸动时会净增长，
+    // 一旦越过 200ms 就永久命中，后面哪怕静音 rms=98 也照样打断（_barge3.log 实测）。
+    if (rms >= thr) {
+        barge_in_gap_frames_.store(0, std::memory_order_relaxed);
+        barge_in_run_ms_.fetch_add(frame_ms, std::memory_order_relaxed);
+        if (rms > barge_in_peak_rms_.load(std::memory_order_relaxed)) {
+            barge_in_peak_rms_.store(rms, std::memory_order_relaxed);
+        }
+    } else {
+        // 一帧掉下来就归零：人说话不会一半声音掉到门限以下，能让它掉的就是回声波动或
+        // 噪声尾巴。中文连读字间的空隙由 HOLD 抬到 350ms 来补偿，不再靠容忍掉帧。
+        barge_in_run_ms_.store(0, std::memory_order_relaxed);
+        barge_in_peak_rms_.store(0, std::memory_order_relaxed);
+        barge_in_gap_frames_.fetch_add(1, std::memory_order_relaxed);
+        // 安静帧顺带极慢地跟踪本底：换房间、开风扇这类环境变化能自己跟上，
+        // 而不用靠每句话重新学一遍（那正是旧版门限乱跳的原因）。
+        int f = barge_echo_floor_.load(std::memory_order_relaxed);
+        barge_echo_floor_.store((f * 15 + rms) / 16, std::memory_order_relaxed);
+    }
+    // 每 200ms 打一次：pre=mic 原始电平，rms=AEC 之后，ref=当前播放 PCM 电平。
+    // 三个数同看就能定性：ref 大而 rms 也大 = AEC 没消掉（自打断）；
+    // ref 近乎为 0 而 rms 大 = 喇叭在放音之外真的有人在说话。
+    if (now - barge_in_log_us_ > 200000) {
+        barge_in_log_us_ = now;
+        ESP_LOGI(TAG, "barge pre=%d rms=%d peak=%d ref=%ld held=%dms gap=%d thr=%d floor=%d",
+                 barge_in_pre_rms_.load(std::memory_order_relaxed), rms,
+                 barge_in_peak_rms_.load(std::memory_order_relaxed),
+                 (long)echo_ref_rms_.load(std::memory_order_relaxed),
+                 barge_in_run_ms_.load(std::memory_order_relaxed),
+                 barge_in_gap_frames_.load(std::memory_order_relaxed), thr,
+                 barge_echo_floor_.load(std::memory_order_relaxed));
+    }
+}
+
+bool AudioService::IsBargeInConfirmed() const {
+    return barge_in_run_ms_.load(std::memory_order_relaxed) >= BARGE_IN_HOLD_MS;
+}
+
+void AudioService::ResetBargeIn() {
+    barge_in_rms_.store(0, std::memory_order_relaxed);
+    barge_in_peak_rms_.store(0, std::memory_order_relaxed);
+    barge_in_run_ms_.store(0, std::memory_order_relaxed);
+    barge_in_gap_frames_.store(0, std::memory_order_relaxed);
+    barge_settle_ms_left_ = BARGE_IN_SETTLE_MS;
+    // barge_echo_floor_ 故意不清零：本底属于环境（房间/风扇/mic 增益），不是这一句话的，
+    // 每轮重学一遍只会让门限跟着起播爆音乱跳。
+
+    // 对齐量固定 70ms。之前每轮循环换档（70/110/150/200）做实验，AEC 时好时坏，
+    // 表现就是「有时被自己打断、有时又打不动」——别再让它随机了，要调就改这里。
+    if (audio_processor_) {
+        audio_processor_->SetEchoRefAlignMs(BARGE_ECHO_REF_ALIGN_MS);
+    }
 }

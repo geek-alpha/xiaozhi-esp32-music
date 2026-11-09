@@ -737,7 +737,9 @@ void Application::MainEventLoop()
 
     while (true)
     {
-        auto bits = xEventGroupWaitBits(event_group_, MAIN_EVENT_SCHEDULE | MAIN_EVENT_SEND_AUDIO | MAIN_EVENT_WAKE_WORD_DETECTED | MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_ERROR, pdTRUE, pdFALSE, portMAX_DELAY);
+        // 50ms 超时不是等事件用，是给「打断判定」留轮询节拍：说话期间上行静音、唤醒词也
+        // 关着，事件位一个都不会来，portMAX_DELAY 会让这个循环彻底睡死，打断永远判不到。
+        auto bits = xEventGroupWaitBits(event_group_, MAIN_EVENT_SCHEDULE | MAIN_EVENT_SEND_AUDIO | MAIN_EVENT_WAKE_WORD_DETECTED | MAIN_EVENT_VAD_CHANGE | MAIN_EVENT_ERROR, pdTRUE, pdFALSE, pdMS_TO_TICKS(50));
         if (bits & MAIN_EVENT_ERROR)
         {
             // 网络报错不等于用户要待机：没手动按过就让它自己接回来
@@ -805,6 +807,23 @@ void Application::MainEventLoop()
             {
                 task();
             }
+        }
+
+        // TTS 说话中用户直接开口 = 打断，不必先喊唤醒词。这里必须无条件轮询：说话期间
+        // 上行静音、唤醒词也关着，事件位一个都不来，原来挂在 VAD_CHANGE 分支里等于只在
+        // VAD 首次报人声时查一次（那时 held 才 60ms，必然跳过），之后没人复查，
+        // 现场表现就是「怎么喊都不停」。节拍由上面 WaitBits 的 50ms 超时给。
+        // 判据只认「够响 + 够久」，见 AudioService::IsBargeInConfirmed：单看 VAD 太灵敏，
+        // 环境噪声、键盘声都会被判成人声，AI 说半句就被杂音打断。
+        // 起播 800ms 内不判——首帧爆音和提示音尾巴会被当成开口（TTS 首句前面还有一段
+        // 「叮咚」和降噪 warmup，400ms 盖不住）；aborted_ 由 tts start 复位，保证一轮只发一次 abort。
+        if (BARGE_IN_ENABLE && device_state_ == kDeviceStateSpeaking && !aborted_ &&
+            audio_service_.IsBargeInConfirmed() &&
+            esp_timer_get_time() - speaking_started_us_ > 1500000)
+        {
+            ESP_LOGI(TAG, "Voice barge-in: peak=%d held=%dms, aborting",
+                     audio_service_.GetBargeInPeakRms(), audio_service_.GetBargeInHeldMs());
+            AbortSpeaking(kAbortReasonNone);
         }
     }
 }
@@ -985,6 +1004,8 @@ void Application::SetDeviceState(DeviceState state)
     case kDeviceStateIdle:
         display->SetStatus(Lang::Strings::STANDBY);
         // 表情不跟着状态回中性：一张表情要留到下一句情绪事件，说话完就切回来等于白演
+        audio_service_.SetUplinkMuted(false);
+        passive_listen_ = false;
         audio_service_.EnableVoiceProcessing(false);
         audio_service_.EnableWakeWordDetection(true);
         break;
@@ -999,26 +1020,30 @@ void Application::SetDeviceState(DeviceState state)
         // "Ringbuffer of AFE is empty"，屏幕挂「聆听中」说话毫无反应。音乐停止走 ResumeSession
         // 时 processor 已经在跑，原来这句 false 正好被这个 if 跳掉，就是这个 bug。
         audio_service_.EnableWakeWordDetection(false);
+        audio_service_.SetUplinkMuted(false);
         // Make sure the audio processor is running
-        if (!audio_service_.IsAudioProcessorRunning())
+        if (!audio_service_.IsAudioProcessorRunning() || passive_listen_)
         {
             // Send the start listening command
             protocol_->SendStartListening(listening_mode_);
             audio_service_.EnableVoiceProcessing(true);
+            passive_listen_ = false;
         }
         break;
     case kDeviceStateSpeaking:
         display->SetStatus(Lang::Strings::SPEAKING);
 
-        if (listening_mode_ != kListeningModeRealtime)
+        // 说话期间语音处理器保持运行，但上行静音：本地要靠它的 VAD 判断用户开没开口，
+        // 这才是「直接说话就能打断」，不必先喊唤醒词。回声由虚拟参考喂给 AFE 的 AEC 消掉。
+        speaking_started_us_ = esp_timer_get_time();
+        audio_service_.EnableWakeWordDetection(false);
+        audio_service_.SetUplinkMuted(true);
+        audio_service_.ResetBargeIn();
+        // 无条件置上：处理器不再随状态停，回到 listening 时只能靠这个标志补发 start listening
+        passive_listen_ = true;
+        if (!audio_service_.IsAudioProcessorRunning())
         {
-            audio_service_.EnableVoiceProcessing(false);
-            // Only AFE wake word can be detected in speaking mode
-#if CONFIG_USE_AFE_WAKE_WORD
-            audio_service_.EnableWakeWordDetection(true);
-#else
-            audio_service_.EnableWakeWordDetection(false);
-#endif
+            audio_service_.EnableVoiceProcessing(true);
         }
         audio_service_.ResetDecoder();
         break;

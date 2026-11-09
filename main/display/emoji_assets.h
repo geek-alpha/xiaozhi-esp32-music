@@ -5,27 +5,29 @@
 
 #define EMOJI_W 162
 #define EMOJI_H 162
-#define MOUTH_W 30
-#define MOUTH_H 35
-#define MOUTH_OX 66
-#define MOUTH_OY 94
-#define BLINK_W 98
-#define BLINK_H 56
-#define BLINK_OX 28
-#define BLINK_OY 50
+#define MOUTH_W 18
+#define MOUTH_H 14
+#define MOUTH_OX 57
+#define MOUTH_OY 86
+#define BLINK_W 60
+#define BLINK_H 24
+#define BLINK_OX 34
+#define BLINK_OY 66
 
-#define EMOJI_BODY_W 122
-#define EMOJI_BODY_H 80
-#define EMOJI_BODY_OX 20
-#define EMOJI_BODY_OY 130
-#define EMOJI_TOTAL_H 210
+#define EMOJI_BODY_W 162
+#define EMOJI_BODY_H 81
+#define EMOJI_BODY_OX 0
+#define EMOJI_BODY_OY 100
+#define EMOJI_TOTAL_H 181
 
 #define EMOJI_SHADOW_W 162
-#define EMOJI_SHADOW_H 210
+#define EMOJI_SHADOW_H 181
 
 extern const lv_image_dsc_t emoji_shadow;
 #define EMOJI_ARM_FRAMES 3
 extern const lv_image_dsc_t emoji_body;
+extern const lv_image_dsc_t emoji_body_hair;
+extern const lv_image_dsc_t emoji_body_hair_shade;
 extern const lv_image_dsc_t emoji_arm_0;
 extern const lv_image_dsc_t emoji_arm_1;
 extern const lv_image_dsc_t emoji_arm_2;
@@ -44,10 +46,10 @@ typedef struct {
 extern const emoji_asset_t emoji_table[];
 extern const int emoji_table_count;
 #define GAZE_COUNT 3
-#define GAZE_W 96
-#define GAZE_H 54
-#define GAZE_OX 30
-#define GAZE_OY 50
+#define GAZE_W 56
+#define GAZE_H 20
+#define GAZE_OX 38
+#define GAZE_OY 70
 extern const lv_image_dsc_t emoji_gaze_0;
 extern const lv_image_dsc_t emoji_gaze_1;
 extern const lv_image_dsc_t emoji_gaze_2;
@@ -73,6 +75,8 @@ extern const lv_image_dsc_t emoji_confident_hair;
 extern const lv_image_dsc_t emoji_sleepy_hair;
 extern const lv_image_dsc_t emoji_silly_hair;
 extern const lv_image_dsc_t emoji_confused_hair;
+// 换发色时的阴影层：全表情共用一张（头发在底板里，五官补丁不碰发区）
+extern const lv_image_dsc_t emoji_hair_shade;
 extern const lv_image_dsc_t emoji_neutral;
 extern const lv_image_dsc_t emoji_neutral_mouth;
 extern const lv_image_dsc_t emoji_neutral_blink;

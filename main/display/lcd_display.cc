@@ -150,6 +150,12 @@ void LcdDisplay::ApplyAvatarY()
     if (body_image_ != nullptr) {
         lv_obj_set_y(body_image_, EMOJI_BODY_OY + float_y_);
     }
+    if (body_hair_image_ != nullptr) {
+        lv_obj_set_y(body_hair_image_, EMOJI_BODY_OY + float_y_);
+    }
+    if (body_hair_shade_image_ != nullptr) {
+        lv_obj_set_y(body_hair_shade_image_, EMOJI_BODY_OY + float_y_);
+    }
     // 投影必须跟呼吸走：不跟着动，小人一浮就和自己的影子离婚
     if (shadow_image_ != nullptr) {
         lv_obj_set_y(shadow_image_, float_y_);
@@ -316,6 +322,11 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     Settings settings("display", false);
     current_theme_name_ = settings.GetString("theme", "light");
     hair_color_ = (uint32_t)settings.GetInt("hair_color", (int32_t)hair_color_);
+    // 老版本把平涂色 0x76A6FF 当默认存进了 NVS：那个值落在参考图底板上就是一块硬贴上去的纯蓝，
+    // 不迁走的话老设备升级后还是一半纯蓝一半原色
+    if (hair_color_ == 0x76A6FF) {
+        hair_color_ = 0;
+    }
     accent_color_ = (uint32_t)settings.GetInt("accent_color", 0);
     accent_strength_ = (int)settings.GetInt("accent_strength", 3);
     ESP_LOGI(TAG, "Hair color from NVS: #%06X, accent: %s (tint %d/10)", (unsigned)hair_color_,
@@ -1087,6 +1098,25 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(body_image_, 0, 0);
     lv_image_set_src(body_image_, &emoji_body);
 
+    // 下半截长发：A8 遮罩 + recolor，和脸那套同理。
+    // 放在这里创建 = 压在 body 之上、被后面的 emotion_image_ 盖住，
+    // 重叠区（BODY_OY ~ EMOJI_H）依旧以脸为准
+    body_hair_image_ = lv_image_create(content_);
+    lv_obj_set_size(body_hair_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_style_pad_all(body_hair_image_, 0, 0);
+    lv_obj_set_style_image_recolor_opa(body_hair_image_, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(body_hair_image_, lv_color_hex(hair_color_), 0);
+    lv_image_set_src(body_hair_image_, &emoji_body_hair);
+    lv_obj_add_flag(body_hair_image_, LV_OBJ_FLAG_HIDDEN);
+
+    body_hair_shade_image_ = lv_image_create(content_);
+    lv_obj_set_size(body_hair_shade_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_style_pad_all(body_hair_shade_image_, 0, 0);
+    lv_obj_set_style_image_recolor_opa(body_hair_shade_image_, LV_OPA_COVER, 0);
+    lv_obj_set_style_image_recolor(body_hair_shade_image_, lv_color_hex(hair_color_), 0);
+    lv_image_set_src(body_hair_shade_image_, &emoji_body_hair_shade);
+    lv_obj_add_flag(body_hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+
     emotion_image_ = lv_image_create(content_);
     lv_obj_set_size(emotion_image_, EMOJI_W, EMOJI_H);
     lv_obj_set_style_pad_all(emotion_image_, 0, 0);
@@ -1111,6 +1141,16 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(hair_color_), 0);
     hair_img_ = &emoji_neutral_hair;
     lv_image_set_src(hair_image_, hair_img_);
+
+    // 阴影层：和 hair_image_ 同挂点同尺寸。A8 只带明暗，色相由 recolor 给成新色的暗版；
+    // 亮部保持 hair_image_ 的纯新色，两层叠起来才有原图那种发丝层次
+    hair_shade_image_ = lv_image_create(emotion_image_);
+    lv_obj_remove_style_all(hair_shade_image_);
+    lv_obj_set_size(hair_shade_image_, EMOJI_W, EMOJI_H);
+    lv_obj_set_pos(hair_shade_image_, 0, 0);
+    lv_obj_set_style_image_recolor_opa(hair_shade_image_, LV_OPA_COVER, 0);
+    lv_obj_add_flag(hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(hair_shade_image_, &emoji_hair_shade);
 
     // 眼神贴片：和眨眼同一块眼区，挂在脸名下跟着走。
     // 建在 blink_image_ 之前 = 压在它下面：闭眼时整块眼睛归闭眼贴片，眼神贴片不能露出来
@@ -1154,7 +1194,8 @@ void LcdDisplay::SetupUI() {
     mouth_img_ = &emoji_neutral_mouth;
     lv_image_set_src(mouth_image_, mouth_img_);
     // 贴片排在染色层下面：头发遮罩透明的地方才露贴片，头发该染色的地方贴片被盖住
-    lv_obj_move_foreground(hair_image_);
+    RaiseHairLayers();
+    ApplyHairTint();
 
     preview_image_ = lv_image_create(content_);
     lv_obj_set_size(preview_image_, width_ * 0.5, height_ * 0.5);
@@ -1378,6 +1419,12 @@ void LcdDisplay::LayoutContentBlocks() {
     }
     if (body_image_ != nullptr) {
         lv_obj_set_pos(body_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+    }
+    if (body_hair_image_ != nullptr) {
+        lv_obj_set_pos(body_hair_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+    }
+    if (body_hair_shade_image_ != nullptr) {
+        lv_obj_set_pos(body_hair_shade_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
     }
     if (emotion_label_ != nullptr) {
         lv_obj_align(emotion_label_, LV_ALIGN_TOP_MID, 0, 0);
@@ -1661,7 +1708,7 @@ void LcdDisplay::SetEmotion(const char* emotion) {
         lv_image_set_src(hair_image_, hair_img_);
         // 颜色和换图分开管：任何一条换图路径都不该把染色带走
         lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(hair_color_), 0);
-        lv_obj_move_foreground(hair_image_);
+        RaiseHairLayers();
     }
     if (mouth_image_ != nullptr) {
         lv_image_set_src(mouth_image_, mouth_img_);
@@ -1697,15 +1744,70 @@ void LcdDisplay::SetEmotion(const char* emotion) {
              (int)lv_obj_get_content_width(content_));
 }
 
+void LcdDisplay::ApplyHairTint() {
+    bool on = hair_color_ != 0;
+    lv_color_t base = lv_color_hex(hair_color_);
+    // 阴影层取同一个新色压暗 45%：用纯黑会把发丝压成灰，色相就跑了
+    lv_color_t dark = lv_color_make((uint8_t)(base.red * 55 / 100), (uint8_t)(base.green * 55 / 100),
+                                    (uint8_t)(base.blue * 55 / 100));
+    if (hair_image_ != nullptr) {
+        if (on) {
+            lv_obj_set_style_image_recolor(hair_image_, base, 0);
+            lv_obj_clear_flag(hair_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(hair_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (hair_shade_image_ != nullptr) {
+        if (on) {
+            lv_obj_set_style_image_recolor(hair_shade_image_, dark, 0);
+            lv_obj_clear_flag(hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (body_hair_image_ != nullptr) {
+        if (on) {
+            lv_obj_set_style_image_recolor(body_hair_image_, base, 0);
+            lv_obj_clear_flag(body_hair_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(body_hair_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (body_hair_shade_image_ != nullptr) {
+        if (on) {
+            lv_obj_set_style_image_recolor(body_hair_shade_image_, dark, 0);
+            lv_obj_clear_flag(body_hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(body_hair_shade_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (blink_hair_image_ != nullptr) {
+        if (on) {
+            lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(hair_color_), 0);
+            lv_obj_clear_flag(blink_hair_image_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(blink_hair_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (on) {
+        RaiseHairLayers();
+    }
+}
+
+void LcdDisplay::RaiseHairLayers() {
+    if (hair_image_ != nullptr) {
+        lv_obj_move_foreground(hair_image_);
+    }
+    if (hair_shade_image_ != nullptr) {
+        lv_obj_move_foreground(hair_shade_image_);
+    }
+}
+
 void LcdDisplay::SetHairColor(uint32_t rgb) {
     DisplayLockGuard lock(this);
     hair_color_ = rgb;
-    if (hair_image_ != nullptr) {
-        lv_obj_set_style_image_recolor(hair_image_, lv_color_hex(rgb), 0);
-    }
-    if (blink_hair_image_ != nullptr) {
-        lv_obj_set_style_image_recolor(blink_hair_image_, lv_color_hex(rgb), 0);
-    }
+    ApplyHairTint();
     Settings settings("display", true);
     settings.SetInt("hair_color", (int32_t)rgb);
     ESP_LOGI(TAG, "Hair color -> #%06X (saved)", (unsigned)rgb);
@@ -2111,7 +2213,7 @@ void LcdDisplay::BlinkTick() {
             if (mouth_open_) {
                 lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
                 lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_move_foreground(hair_image_);
+                RaiseHairLayers();
             } else {
                 lv_obj_add_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
             }
@@ -2189,7 +2291,7 @@ void LcdDisplay::BlinkTick() {
             lv_image_set_src(blink_image_, blink_img_);
             lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
             lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(hair_image_);
+            RaiseHairLayers();
             blink_frames_ = 2;
             // 只打第一次：以后有人问「为什么不眨眼」，这条日志直接分辨是没触发还是被别的层盖住
             static bool blink_logged = false;
@@ -2270,7 +2372,7 @@ void LcdDisplay::ListenAnimTick()
         } else if (--listen_mouth_wait_ == 0) {
             lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
             lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(hair_image_);
+            RaiseHairLayers();
             listen_mouth_hold_ = kListenMouthHoldMin + esp_random() % kListenMouthHoldSpan;
             static int mouth_logged = 0;
             if (mouth_logged < 2) {
