@@ -110,6 +110,9 @@ private:
     // 第二次 close 回调——第二次会被当成断连去续接，把刚起播的歌直接掐掉。
     std::atomic<bool> audio_owns_channel_{false};
     std::atomic<int64_t> last_activity_us_{0};
+    // 用户这一轮还在不在场：唤醒、聆听期本地 VAD 判到人声、服务端这轮说完，都算刚有过互动。
+    // 待机计时和「服务端是不是在自说自话地告别」都只认它，不认通道活了多久。
+    std::atomic<int64_t> last_turn_us_{0};
     // 本次会话里没有唤醒词、自动接话的次数，超过上限就回待机等唤醒词
     std::atomic<int> auto_rounds_{0};
     TaskHandle_t check_new_version_task_handle_ = nullptr;

@@ -20,10 +20,15 @@
 
 #define TAG "Application"
 
-// 聆听状态静默这么久还没一句话，就是人走了：关麦回待机省电。
-// 必须明显早于服务端的静默告别阈值（实测约 67 秒就播「那我先不打扰你了，拜拜」），
-// 否则设备一直空转听着，服务端抢在固件前面开口，用户就听到那句尴尬的再见。
-#define LISTENING_IDLE_STANDBY_SEC 45
+// 一轮聊天结束后，要连续 5 分钟没再开口才回待机、才需要唤醒词。
+// 计时基准是「人」不是连接：会话断了会自动接回来，按通道寿命算的话每次重连都把 5 分钟清零。
+#define LISTENING_IDLE_STANDBY_SEC 300
+
+// 服务端在长时间没人说话时会自己收尾：先一句「我先不打扰你啦」，再一句「拜拜」，然后 goodbye。
+// 那是它的礼仪，不是用户的意图——设备醒着、麦开着，这句告别只是噪音（idle300.log 实测第 177 秒开始）。
+// 判据：来了一段 TTS，而这一轮已经安静这么久没人搭理它，那就是它在自说自话，音频别播，
+// 顺手把通道收掉重开——不打断它，它就会接着把「拜拜」也念出来。
+#define SERVER_FAREWELL_GUARD_SEC 25
 
 // 一轮会话里没有唤醒词、自动接话的上限。真人闲聊几轮就到头，能连刷几十轮的
 // 一定是环境音（游戏语音/电视）在喂它，那就该停下来等唤醒词。
@@ -428,9 +433,18 @@ void Application::Start()
     };
     callbacks.on_vad_change = [this](bool speaking)
     {
+        // 只认「用户真开口」：这块板 AEC 参考没接上，设备自己 TTS 时喇叭直接灌回麦，
+        // 说话期收到的人声大半是自己的回声，认了等于 AI 每说一句都替用户续一次在场。
+        if (speaking && device_state_ != kDeviceStateSpeaking)
+        {
+            last_turn_us_ = esp_timer_get_time();
+        }
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);
+
+    // 计时起点从开机算，不然 last_turn_us_ 为 0 会让第一轮静默判据立刻成立
+    last_turn_us_ = esp_timer_get_time();
 
     /* Start the clock timer to update the status bar */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
@@ -539,6 +553,21 @@ void Application::Start()
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                int64_t quiet_us = esp_timer_get_time() - last_turn_us_;
+                if (device_state_ == kDeviceStateListening && !audio_owns_channel_ &&
+                    quiet_us >= (int64_t)SERVER_FAREWELL_GUARD_SEC * 1000000)
+                {
+                    // 不进 Speaking，OnIncomingAudio 只往 Speaking 的解码队列塞包，这段 TTS 自然一句都不播
+                    ESP_LOGI(TAG, "Drop server farewell TTS (%ds without user), reconnecting", (int)(quiet_us / 1000000));
+                    Schedule([this]()
+                             {
+                        if (!user_stopped_ && protocol_ && protocol_->IsAudioChannelOpened()) {
+                            resume_pending_ = true;
+                            resume_due_us_ = esp_timer_get_time() + 300000;
+                            protocol_->CloseAudioChannel();
+                        } });
+                    return;
+                }
                 Schedule([this]() {
                     aborted_ = false;
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
@@ -546,6 +575,7 @@ void Application::Start()
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                last_turn_us_ = esp_timer_get_time();
                 Schedule([this, display]() {
                     // 服务器说这轮 tts 结束了：字幕从这里才开始回顶慢滚
                     display->NotifySpeechFinished();
@@ -675,13 +705,12 @@ void Application::OnClockTimer()
         }
     }
 
-    // 聆听就是在等一句话，等满 45 秒一句没来就回待机（早于服务端告别，别让它先开口）。
-    // clock_ticks_ 在每次状态切换时归零，等于「在本状态待了多少秒」；
-    // 再加一道 last_activity_us_ 是为了把服务端刚下发过的内容算成活动，别掐在人说话中间。
-    if (device_state_ == kDeviceStateListening && clock_ticks_ >= LISTENING_IDLE_STANDBY_SEC &&
-        (esp_timer_get_time() - last_activity_us_) >= (int64_t)LISTENING_IDLE_STANDBY_SEC * 1000000)
+    // 一轮对话真正结束（用户说完、服务端这轮也说完）后，连续 5 分钟没人搭理才回待机等唤醒词。
+    int64_t quiet_us = esp_timer_get_time() - last_turn_us_;
+    if (device_state_ != kDeviceStateIdle && device_state_ != kDeviceStateSpeaking &&
+        quiet_us >= (int64_t)LISTENING_IDLE_STANDBY_SEC * 1000000)
     {
-        ESP_LOGI(TAG, "Listening idle for %d seconds, entering standby to save power", LISTENING_IDLE_STANDBY_SEC);
+        ESP_LOGI(TAG, "No user for %d seconds, entering standby until wake word", LISTENING_IDLE_STANDBY_SEC);
         // 走手动待机同一条路：user_stopped_ 不设的话，关通道的回调会把会话自动接回来，白切。
         Schedule([this]()
                  {
@@ -849,6 +878,8 @@ void Application::OnWakeWordDetected()
 
         auto wake_word = audio_service_.GetLastWakeWord();
         ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+        // 人就在跟前了，5 分钟静默待机从这里重新计
+        last_turn_us_ = esp_timer_get_time();
         // 用户主动喊了，连续对话的轮次重新从零数
         auto_rounds_ = 0;
         // 唤醒词只负责唤醒。上行唤醒词音频或 wake_word_detected 事件，都会让服务端
