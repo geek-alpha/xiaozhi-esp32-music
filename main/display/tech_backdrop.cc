@@ -13,53 +13,8 @@ namespace {
 constexpr int kCoreCx = 120;
 constexpr int kCoreCy = 91;
 
-constexpr int kBladeA[2][2] = {{6, 158}, {234, 196}};
-constexpr int kBladeB[2][2] = {{234, 150}, {10, 190}};
-
-// 雨滴：x 散在全屏，只给小幅度偏移，落的是斜雨不是喷泉
-constexpr int kSparkX0[] = {26, 54, 86, 118, 146, 176, 208};
-constexpr int kSparkDx[] = {5, -4, 6, -5, 4, -6, 5};
-constexpr uint16_t kSparkDur[] = {1500, 1210, 1780, 1340, 1620, 1120, 1720};
-constexpr uint16_t kSparkDelay[] = {0, 260, 520, 760, 180, 980, 640};
-
-constexpr uint16_t kTrailDelay[] = {0, 340, 180, 620};
-constexpr uint16_t kTrailDur[] = {2200, 2600, 2000, 2800};
-
-struct RingCtx {
-    lv_obj_t* obj;
-    int cx;
-    int cy;
-};
-
-RingCtx g_ring_ctx[2];
-
-void SetX(void* var, int32_t v) { lv_obj_set_x(static_cast<lv_obj_t*>(var), v); }
-void SetY(void* var, int32_t v) { lv_obj_set_y(static_cast<lv_obj_t*>(var), v); }
 void SetBgOpa(void* var, int32_t v) {
     lv_obj_set_style_bg_opa(static_cast<lv_obj_t*>(var), (lv_opa_t)v, 0);
-}
-void SetBorderOpa(void* var, int32_t v) {
-    lv_obj_set_style_border_opa(static_cast<lv_obj_t*>(var), (lv_opa_t)v, 0);
-}
-
-// 环要「以核心为圆心往外长」，所以 size 和 pos 必须同一条回调里改
-void RingSize(void* var, int32_t v) {
-    auto* r = static_cast<RingCtx*>(var);
-    lv_obj_set_size(r->obj, v, v);
-    lv_obj_set_pos(r->obj, r->cx - v / 2, r->cy - v / 2);
-}
-
-lv_obj_t* MakeDot(lv_obj_t* parent, int size, uint32_t color, lv_opa_t opa) {
-    lv_obj_t* o = lv_obj_create(parent);
-    lv_obj_remove_style_all(o);
-    lv_obj_add_flag(o, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(o, size, size);
-    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(o, opa, 0);
-    lv_obj_set_style_radius(o, 0, 0);
-    lv_obj_set_style_border_width(o, 0, 0);
-    return o;
 }
 
 }  // namespace
@@ -107,35 +62,8 @@ void TechBackdrop::Create(lv_obj_t* parent, int w, int h, int status_h)
     lv_obj_set_style_bg_opa(core_, LV_OPA_10, 0);
     lv_obj_set_style_border_width(core_, 0, 0);
 
-    // 冲击环：从核心往外扩、边扩边淡出
-    for (int i = 0; i < kRings; i++) {
-        lv_obj_t* r = lv_obj_create(root_);
-        lv_obj_remove_style_all(r);
-        lv_obj_add_flag(r, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(r, 40, 40);
-        lv_obj_set_pos(r, kCoreCx - 20, kCoreCy - 20);
-        lv_obj_set_style_radius(r, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(r, LV_OPA_0, 0);
-        lv_obj_set_style_border_width(r, 2, 0);
-        lv_obj_set_style_border_color(r, lv_color_hex(0xFF3E9E), 0);
-        lv_obj_set_style_border_opa(r, LV_OPA_0, 0);
-        rings_[i] = r;
-        g_ring_ctx[i] = {r, kCoreCx, kCoreCy};
-    }
+    ESP_LOGI(TAG, "Anemone backdrop: core only");
 
-    for (int i = 0; i < kSparks; i++) {
-        sparks_[i] = MakeDot(root_, 2, i % 2 == 0 ? 0xBFF6FF : 0xFF6AB0, LV_OPA_70);
-        lv_obj_set_pos(sparks_[i], kSparkX0[i], status_h_ - 6);
-    }
-
-    for (int i = 0; i < kTrail; i++) {
-        trail_[i] = MakeDot(root_, 3, i % 2 == 0 ? 0xA8FFF4 : 0xFF6AB0, LV_OPA_80);
-        lv_obj_set_pos(trail_[i], kBladeA[0][0], kBladeA[0][1]);
-    }
-
-    ESP_LOGI(TAG, "Neon backdrop: %d rings, %d rain, %d trail",
-             kRings, kSparks, kTrail);
     SetAnimationsEnabled(true);
 }
 
@@ -150,42 +78,66 @@ void TechBackdrop::ApplyTheme(bool dark, uint32_t accent, int strength)
 
     // accent==0 走原来那套手调色，观感跟旧版逐像素一致；配了 accent 才从它派生
     const lv_color_t base = lv_color_hex(accent != 0 ? accent : (dark ? 0x00E5FF : 0xD8408C));
-    const lv_color_t ring = accent != 0 ? lv_color_mix(base, lv_color_white(), 60)
-                                        : lv_color_hex(dark ? 0xFF3E9E : 0xC03878);
-    const lv_color_t spark = accent != 0 ? lv_color_mix(base, lv_color_white(), 140)
-                                         : lv_color_hex(dark ? 0xBFF6FF : 0x3A82B4);
-    const lv_color_t trail_a = accent != 0 ? lv_color_mix(base, lv_color_white(), 100)
-                                           : lv_color_hex(dark ? 0xA8FFF4 : 0x8A5AC8);
-    const lv_color_t trail_b = accent != 0 ? base : lv_color_hex(dark ? 0xFF6AB0 : 0xC03878);
 
-    // 整屏染色：底图占满全屏，不染它的话换主色只有几样小元素变，肉眼几乎看不出来。
-    // 10 级映射到 0~230，默认 3 约 24%。
+    // 整屏染色这条路废了：底图是不透明位图，任何半透明色叠上去都只是把整块屏蒙一层，
+    // 字和图一起变淡——用户的原话就是「整个屏幕都被颜色盖掉」、
+    // 「文字和背景对比不强」。要「背景就是某颜色」走 SetSolidBackground（纯色底 + 对比前景）
     if (tint_ != nullptr) {
         lv_obj_set_style_bg_color(tint_, base, 0);
-        int s = strength;
-        if (s < 0) s = 0;
-        if (s > kMaxTint) s = kMaxTint;
-        lv_obj_set_style_bg_opa(tint_, (lv_opa_t)(accent != 0 ? s * 23 : 0), 0);
+        lv_obj_set_style_bg_opa(tint_, LV_OPA_TRANSP, 0);
+        ESP_LOGI(TAG, "Tint #%06X: screen wash off (accent -> effects only)", (unsigned)accent);
     }
 
     if (core_ != nullptr) {
         lv_obj_set_style_bg_color(core_, base, 0);
     }
-    for (int i = 0; i < kRings; i++) {
-        if (rings_[i] != nullptr) {
-            lv_obj_set_style_border_color(rings_[i], ring, 0);
-        }
+
+    // 底色接管期间任何一次重刷（换主题/换主色/开机恢复）都得把纯色层压回去，
+    // 否则上面那行 tint_ opa 会把它重置成透明，用户看到「刚才设的底色又没了」
+    if (solid_rgb_ != 0) {
+        SetSolidBackground(solid_rgb_);
     }
-    for (int i = 0; i < kSparks; i++) {
-        if (sparks_[i] != nullptr) {
-            lv_obj_set_style_bg_color(sparks_[i], spark, 0);
+}
+
+void TechBackdrop::SetSolidBackground(uint32_t rgb)
+{
+    const uint32_t color = rgb & 0xFFFFFF;
+    if (color == 0) {
+        // 本来就没接管：SetTheme 刚调过 ApplyTheme，这里再重放一次就是白刷一帧
+        if (solid_rgb_ == 0) {
+            return;
         }
-    }
-    for (int i = 0; i < kTrail; i++) {
-        if (trail_[i] != nullptr) {
-            lv_obj_set_style_bg_color(trail_[i], i % 2 == 0 ? trail_a : trail_b, 0);
+        solid_rgb_ = 0;
+        if (bg_image_ != nullptr) {
+            lv_obj_clear_flag(bg_image_, LV_OBJ_FLAG_HIDDEN);
         }
+        // 回底图：按当前主题重放一次，别把 solid 期间留下的纯色/对比色留在场上
+        ApplyTheme(dark_, accent_, strength_);
+        ESP_LOGI(TAG, "Solid background off, theme backdrop restored");
+        return;
     }
+
+    solid_rgb_ = color;
+    if (bg_image_ != nullptr) {
+        lv_obj_add_flag(bg_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (tint_ != nullptr) {
+        lv_obj_set_style_bg_color(tint_, lv_color_hex(color), 0);
+        lv_obj_set_style_bg_opa(tint_, LV_OPA_COVER, 0);
+    }
+
+    // 底色是用户直接指定的，动态层必须跟它拉开：亮底用深色元素，暗底用亮色元素。
+    // 跟着 accent 派生的话，红底上的红色核心就是隐形的
+    const int lum = (299 * ((color >> 16) & 0xFF) + 587 * ((color >> 8) & 0xFF)
+                     + 114 * (color & 0xFF)) / 1000;
+    const bool light_bg = lum > 150;
+    const lv_color_t base = lv_color_hex(light_bg ? 0x14141A : 0xF2F6FF);
+
+    if (core_ != nullptr) {
+        lv_obj_set_style_bg_color(core_, base, 0);
+    }
+    ESP_LOGI(TAG, "Solid background #%06X (lum %d), dynamic layers -> contrast",
+             (unsigned)color, lum);
 }
 
 
@@ -203,30 +155,11 @@ void TechBackdrop::SetAnimationsEnabled(bool on)
         return;
     }
     StartCoreAnim();
-    StartRingAnim();
-    StartSparkAnim();
-    StartTrailAnim();
 }
 
 void TechBackdrop::StopAnims()
 {
     lv_anim_del(core_, nullptr);
-    for (int i = 0; i < kRings; i++) {
-        if (rings_[i] != nullptr) {
-            lv_anim_del(rings_[i], nullptr);
-            lv_anim_del(&g_ring_ctx[i], nullptr);
-        }
-    }
-    for (int i = 0; i < kSparks; i++) {
-        if (sparks_[i] != nullptr) {
-            lv_anim_del(sparks_[i], nullptr);
-        }
-    }
-    for (int i = 0; i < kTrail; i++) {
-        if (trail_[i] != nullptr) {
-            lv_anim_del(trail_[i], nullptr);
-        }
-    }
 }
 
 void TechBackdrop::StartCoreAnim()
@@ -241,95 +174,4 @@ void TechBackdrop::StartCoreAnim()
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_start(&a);
-}
-
-void TechBackdrop::StartRingAnim()
-{
-    for (int i = 0; i < kRings; i++) {
-        if (rings_[i] == nullptr) {
-            continue;
-        }
-        lv_anim_t s;
-        lv_anim_init(&s);
-        lv_anim_set_var(&s, &g_ring_ctx[i]);
-        lv_anim_set_exec_cb(&s, RingSize);
-        lv_anim_set_values(&s, 40, 112);
-        lv_anim_set_duration(&s, 1700);
-        lv_anim_set_delay(&s, i * 850);
-        lv_anim_set_repeat_count(&s, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&s, lv_anim_path_ease_out);
-        lv_anim_start(&s);
-
-        lv_anim_t o;
-        lv_anim_init(&o);
-        lv_anim_set_var(&o, rings_[i]);
-        lv_anim_set_exec_cb(&o, SetBorderOpa);
-        lv_anim_set_values(&o, 200, 0);
-        lv_anim_set_duration(&o, 1700);
-        lv_anim_set_delay(&o, i * 850);
-        lv_anim_set_repeat_count(&o, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&o, lv_anim_path_ease_out);
-        lv_anim_start(&o);
-    }
-}
-
-void TechBackdrop::StartSparkAnim()
-{
-    for (int i = 0; i < kSparks; i++) {
-        if (sparks_[i] == nullptr) {
-            continue;
-        }
-        lv_anim_t ax;
-        lv_anim_init(&ax);
-        lv_anim_set_var(&ax, sparks_[i]);
-        lv_anim_set_exec_cb(&ax, SetX);
-        lv_anim_set_values(&ax, kSparkX0[i], kSparkX0[i] + kSparkDx[i]);
-        lv_anim_set_duration(&ax, kSparkDur[i]);
-        lv_anim_set_delay(&ax, kSparkDelay[i]);
-        lv_anim_set_repeat_count(&ax, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ax, lv_anim_path_linear);
-        lv_anim_start(&ax);
-
-        lv_anim_t ay;
-        lv_anim_init(&ay);
-        lv_anim_set_var(&ay, sparks_[i]);
-        lv_anim_set_exec_cb(&ay, SetY);
-        lv_anim_set_values(&ay, status_h_ - 6, h_ + 4);
-        lv_anim_set_duration(&ay, kSparkDur[i]);
-        lv_anim_set_delay(&ay, kSparkDelay[i]);
-        lv_anim_set_repeat_count(&ay, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ay, lv_anim_path_linear);
-        lv_anim_start(&ay);
-    }
-}
-
-void TechBackdrop::StartTrailAnim()
-{
-    for (int i = 0; i < kTrail; i++) {
-        if (trail_[i] == nullptr) {
-            continue;
-        }
-        const int(*blade)[2] = (i % 2 == 0) ? kBladeA : kBladeB;
-        lv_anim_t ax;
-        lv_anim_init(&ax);
-        lv_anim_set_var(&ax, trail_[i]);
-        lv_anim_set_exec_cb(&ax, SetX);
-        lv_anim_set_values(&ax, blade[0][0], blade[1][0]);
-        lv_anim_set_duration(&ax, kTrailDur[i]);
-        lv_anim_set_delay(&ax, kTrailDelay[i]);
-        lv_anim_set_repeat_count(&ax, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ax, lv_anim_path_linear);
-        lv_anim_start(&ax);
-
-        lv_anim_t ay;
-        lv_anim_init(&ay);
-        lv_anim_set_var(&ay, trail_[i]);
-        lv_anim_set_exec_cb(&ay, SetY);
-        lv_anim_set_values(&ay, blade[0][1], blade[1][1]);
-        lv_anim_set_duration(&ay, kTrailDur[i]);
-        lv_anim_set_delay(&ay, kTrailDelay[i]);
-        lv_anim_set_repeat_count(&ay, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&ay, lv_anim_path_linear);
-        lv_anim_start(&ay);
-    }
 }

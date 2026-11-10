@@ -18,6 +18,7 @@
  #include "board.h"
  #include "boards/common/esp32_music.h"
  #include "alarm.h"
+#include "bg_schedule.h"
 #include "weather.h"
  
  #define TAG "MCP"
@@ -88,7 +89,7 @@ static bool ParseColorName(const std::string& raw, uint32_t* rgb) {
         {"绿", 0x8CF0B4}, {"绿色", 0x8CF0B4}, {"green", 0x8CF0B4},
         {"浅绿", 0x7BF5B0}, {"lightgreen", 0x7BF5B0},
         {"深绿", 0x1FA35C}, {"darkgreen", 0x1FA35C},
-        {"红", 0xFF6B6B}, {"red", 0xFF6B6B},
+        {"红", 0xFF3B30}, {"red", 0xFF3B30}, {"正红", 0xFF3B30},
         {"深红", 0xB3241F}, {"darkred", 0xB3241F},
         {"棕", 0xB07A50}, {"brown", 0xB07A50},
         {"蓝", 0x76A6FF}, {"蓝色", 0x76A6FF}, {"blue", 0x76A6FF},
@@ -117,6 +118,25 @@ static bool ParseColorName(const std::string& raw, uint32_t* rgb) {
         }
     }
     return false;
+}
+
+// "9:00" / "09:00" / "24:00" → 当天分钟数。24:00 归一到 0；跨午夜靠 start>end 表达
+static bool ParseHhMm(const std::string& raw, int* minutes) {
+    int h = -1;
+    int m = -1;
+    if (sscanf(raw.c_str(), "%d:%d", &h, &m) != 2) {
+        return false;
+    }
+    if (h < 0 || h > 24 || m < 0 || m > 59) {
+        return false;
+    }
+    if (h == 24 && m != 0) {
+        return false;
+    }
+    int total = h * 60 + m;
+    // 24:00 保留为 1440（「到当天结束」），调度层靠它区分「全天」与「跨午夜」
+    *minutes = total;
+    return true;
 }
 
 McpServer::McpServer() {
@@ -213,13 +233,46 @@ McpServer::McpServer() {
                 return std::string(buf);
             });
 
+        AddTool("self.screen.set_background_color",
+            "把背景整个换成指定的纯色（不是半透明染色，底图让位）。\n"
+            "用户说「背景换成红色」「我要红色的背景」「底色弄成蓝色」时用它，比 set_accent_color 更直接。\n"
+            "参数:\n"
+            "  `color`: 色名（红/正红/深红/黄/橙/绿/蓝/紫/粉/青/白/黑）也可以给 #RRGGBB。\n"
+            "返回 success 表示底色已换，顶栏文字会自动转成看得清的颜色。",
+            PropertyList({
+                Property("color", kPropertyTypeString)
+            }),
+            [display](const PropertyList& properties) -> ReturnValue {
+                uint32_t rgb = 0;
+                if (!ParseColorName(properties["color"].value<std::string>(), &rgb)) {
+                    return std::string("{\"success\": false, \"message\": \"认不出这个颜色，给色名或 #RRGGBB\"}");
+                }
+                // 不用先清 accent：底色接管时 SetTheme 本来就不走 accent 染色，
+                // 多这一刀就是两次 SetTheme 重刷，用户看到的是一次多余的闪
+                display->SetBackgroundColor(rgb);
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "{\"success\": true, \"message\": \"背景已换成纯色 #%06X\"}", (unsigned)rgb);
+                return std::string(buf);
+            });
+
+        AddTool("self.screen.clear_background_color",
+            "把背景色改回主题默认底图。用户说「背景恢复原来的」「不要这个底色了」时用它。",
+            PropertyList(),
+            [display](const PropertyList&) -> ReturnValue {
+                display->SetBackgroundColor(0);
+                return std::string("{\"success\": true, \"message\": \"背景已回到主题默认\"}");
+            });
+
         AddTool("self.screen.set_accent_color",
-            "换屏幕主色，并控制整屏染色浓度。整屏（包括待机背景那张底图）都会染上这个颜色。\n"
-            "用户说「背景改成深蓝色」「换成浅绿色」「整个屏幕变个气氛」「颜色太扎眼了/太暗了」时用它。\n"
+            "换屏幕主色：只换光效元素（核心/冲击环/气泡/轨迹）和顶栏主色，不动底图。\n"
+            "用户说「光效换个色」「顶栏换个颜色」时用它。\n"
+            "注意：它不会把背景变色。用户说「背景变红/变黄」「整个屏幕换成某颜色」时，\n"
+            "必须用 self.screen.set_background_color，底色才有对比度可言。\n"
             "参数:\n"
             "  `color`: 色名（品红/青/深蓝/浅蓝/深绿/浅绿/紫/金/橙/红/粉/黄/白），也可以给 #RRGGBB。\n"
-            "  `strength`: 1~10 染色浓淡，默认 3。用户嫌看不出来就调到 6~8，喊太浓太糊就降到 1~2，0 = 只换顶栏和光效、不染整屏。\n"
-            "返回 success 表示屏幕已经变色，照着说就行。",
+            "  `strength`: 兼容参数，现在不控制屏幕染色（整屏洗色已取消），传 0 即可。\n"
+            "返回 success 表示主色已换，照着说就行。",
             PropertyList({
                 Property("color", kPropertyTypeString),
                 Property("strength", kPropertyTypeInteger, 3, 0, 10)
@@ -236,6 +289,87 @@ McpServer::McpServer() {
                          "{\"success\": true, \"message\": \"屏幕主色已换成 #%06X，整屏染色 %d/10\"}",
                          (unsigned)rgb, strength);
                 return std::string(buf);
+            });
+
+        AddTool("self.screen.set_bg_schedule",
+            "给屏幕背景按时间段配色：到点自动换底色，出了时间段自己恢复主题色。\n"
+            "用户说「上午9点到12点显示黄色」「下午3点到8点换成紫色」「用背景色提醒我几点」时用它。\n"
+            "参数:\n"
+            "  `rules`: JSON 数组字符串，每条 `{\"start\":\"09:00\",\"end\":\"12:00\",\"color\":\"黄色\"}`。\n"
+            "           start/end 是 24 小时制 HH:MM，走到 end 那一刻就恢复；\n"
+            "           color 用色名（黄/紫/粉/蓝……）或 #RRGGBB。可以一次给多条（最多 8 条），整份替换旧的。\n"
+            "返回 success 表示已经生效，现在就按当前时刻上色。",
+            PropertyList({
+                Property("rules", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string text = properties["rules"].value<std::string>();
+                cJSON* root = cJSON_Parse(text.c_str());
+                if (root == nullptr || !cJSON_IsArray(root)) {
+                    if (root != nullptr) {
+                        cJSON_Delete(root);
+                    }
+                    return std::string("{\"success\": false, \"message\": \"rules 要是一个 JSON 数组，形如"
+                                       " [{\\\"start\\\":\\\"09:00\\\",\\\"end\\\":\\\"12:00\\\",\\\"color\\\":\\\"黄色\\\"}]\"}");
+                }
+                cJSON* normalized = cJSON_CreateArray();
+                std::string fail;
+                const cJSON* item = nullptr;
+                cJSON_ArrayForEach(item, root) {
+                    const cJSON* start = cJSON_GetObjectItemCaseSensitive(item, "start");
+                    const cJSON* end = cJSON_GetObjectItemCaseSensitive(item, "end");
+                    const cJSON* color = cJSON_GetObjectItemCaseSensitive(item, "color");
+                    int start_min = 0;
+                    int end_min = 0;
+                    uint32_t rgb = 0;
+                    if (!cJSON_IsString(start) || !cJSON_IsString(end) || !cJSON_IsString(color) ||
+                        !ParseHhMm(start->valuestring, &start_min) ||
+                        !ParseHhMm(end->valuestring, &end_min) ||
+                        !ParseColorName(color->valuestring, &rgb)) {
+                        fail = "每条规则要有 start/end 的 HH:MM 和 color 色名或 #RRGGBB";
+                        break;
+                    }
+                    if (cJSON_GetArraySize(normalized) >= 8) {
+                        fail = "最多 8 条规则";
+                        break;
+                    }
+                    cJSON* entry = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(entry, "s", start_min);
+                    cJSON_AddNumberToObject(entry, "e", end_min);
+                    cJSON_AddNumberToObject(entry, "rgb", (double)rgb);
+                    cJSON_AddItemToArray(normalized, entry);
+                }
+                char* text_norm = fail.empty() ? cJSON_PrintUnformatted(normalized) : nullptr;
+                std::string rules_json = text_norm != nullptr ? text_norm : "[]";
+                if (text_norm != nullptr) {
+                    cJSON_free(text_norm);
+                }
+                cJSON_Delete(normalized);
+                cJSON_Delete(root);
+                if (!fail.empty()) {
+                    return "{\"success\": false, \"message\": \"" + fail + "\"}";
+                }
+                const std::string err = BgSchedule::GetInstance().SetRules(rules_json);
+                if (!err.empty()) {
+                    return "{\"success\": false, \"message\": \"" + err + "\"}";
+                }
+                return "{\"success\": true, \"message\": \"背景时间表已生效\", \"rules\": " +
+                       BgSchedule::GetInstance().DumpJson() + "}";
+            });
+
+        AddTool("self.screen.get_bg_schedule",
+            "查当前配的背景时间表。用户问「屏幕什么时候是什么颜色」时用它。",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                return "{\"success\": true, \"rules\": " + BgSchedule::GetInstance().DumpJson() + "}";
+            });
+
+        AddTool("self.screen.clear_bg_schedule",
+            "清掉背景时间表，底色回到主题默认。用户说「取消时段配色」「背景恢复原来的」时用它。",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                BgSchedule::GetInstance().ClearRules();
+                return std::string("{\"success\": true, \"message\": \"背景时间表已清空，底色回到主题默认\"}");
             });
     }
 

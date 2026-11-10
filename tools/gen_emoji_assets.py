@@ -273,14 +273,12 @@ def hair_front(d, fill=None, dark=None, highlight=True, outline=True):
         d.line([(70 * S, 58 * S), (146 * S, 50 * S)], fill=(255, 255, 255, 110), width=int(3 * S))
 
 
-def accessories(d):
-    """荷叶边发带 + 蝴蝶结。
-    刻意不写进 hair_front：hair_masks 把 hair_front 的每一笔重放成"头发几何"，
-    白带子会命中"亮白"那条判据被吞进遮罩，用户换发色时整条发带跟着变色。"""
-    ol, ow = OUTLINE, int(OUTLINE_W * S)
-    # 参考图的喀秋莎是宽大的一片荷叶边裙边，不是一根细头箍：
-    # 外缘 87×60、内缘 73×46，厚度 14 逻辑（屏上 9px）。上一版只有 6 厚，缩下去就是一圈珠子
-    # 参考图的喀秋莎外缘比头还宽（横向盖过头顶两侧），上一版 87×60 只到头顶内侧
+def band_polys():
+    """喀秋莎荷叶边发带的几何（已乘 S，画布像素）。accessories 画它、hair_geo_mask 减它。
+    参考图的喀秋莎是宽大的一片荷叶边裙边，不是一根细头箍：
+    外缘 87×60、内缘 73×46，厚度 14 逻辑（屏上 9px）。上一版只有 6 厚，缩下去就是一圈珠子。
+    外缘比头还宽（横向盖过头顶两侧），上一版 87×60 只到头顶内侧。
+    """
     rx, ry, cy = 88, 44, 52
     n = 240
     outer, inner = [], []
@@ -299,7 +297,15 @@ def accessories(d):
         # 34 是两者之间唯一能保持「一条宽荷叶边」的值
         inner.append(((120 + (rx - 34 + wob * 0.5) * math.cos(th)) * S,
                       (cy + (ry - 34 + wob * 0.5) * math.sin(th)) * S))
-    poly(d, outer + inner[::-1], BAND, ol, ow)
+    return outer + inner[::-1]
+
+
+def accessories(d):
+    """荷叶边发带 + 蝴蝶结。
+    刻意不写进 hair_front：hair_masks 把 hair_front 的每一笔重放成"头发几何"，
+    白带子会命中"亮白"那条判据被吞进遮罩，用户换发色时整条发带跟着变色。"""
+    ol, ow = OUTLINE, int(OUTLINE_W * S)
+    poly(d, band_polys(), BAND, ol, ow)
     # 蝴蝶结：压在右太阳穴上方。参考图是两只圆瓣 + 中间一个小结，
     # 用三角形画出来会读成两片叶子，所以瓣也是椭圆
     # 蝴蝶结只有约 30 逻辑宽（参考图上它占脸宽的 1/4），上一版 68 宽是它的两倍多
@@ -341,8 +347,13 @@ def ears(d):
 # 不挖掉就会跟着用户选的颜色一起变。脸、喀秋莎、鳍耳都不再靠矩形排除——
 # 手写矩形是硬边，挖在头发上染色后就是一块原色方块（上一版两侧脸颊旁的蓝块）。
 # 眼区另用椭圆排除，见 hair_masks。
+# 框的位置只能按底图实测，不能照矢量：accessories() 里蝴蝶结画在 bx=202，那是画给
+# 生成图看的位置，从参考立绘裁出来的底板整体偏左下约 40 逻辑单位。旧值
+# (150,60,183,85) 就是照矢量写的，落在底图上正好压住蝴蝶结左上方的真头发——
+# 换发色后那里留一块原蓝方块（实测覆盖率 0%，用户报的「蝴蝶结旁边缺一块」）。
+# 现在是按底板亮蓝像素实测的框：蝴蝶结亮蓝像素误染 0，被误挖的头发恢复 99 像素。
 HAIR_EXCL = (
-    (150, 60, 183, 85),      # 蝴蝶结
+    (158, 69, 188, 92),      # 蝴蝶结（底板实测框，含描边）
 )
 
 # 判据：头发是底板里唯一成片的蓝。但「蓝」不是充分条件——虹膜、蝴蝶结、鳍耳同样蓝，
@@ -357,6 +368,11 @@ HAIR_B_MIN = 90      # b 下限
 # 用它当「allowed」而不用它直接当遮罩——直接当遮罩会连 rim 和虹膜一起吃进来。
 HAIR_LOOSE_BR = 16
 HAIR_LOOSE_B = 70
+HAIR_BRIGHT_B = 160   # 发束外缘亮边：b 与 b-r 同时高，尾巴达不到
+HAIR_BRIGHT_BR = 80
+# 发丝高光那笔白与发带的白在色值上不可分（r 中位 247 vs 248、b-r 中位 -3 vs -5，
+# 实测两组直方图几乎重合），而矢量几何跟手绘底图又对不齐，任何“把高光也拉进遮罩”
+# 的写法都会把整圈喀秋莎一起染成粉。高光就留给原图。
 HAIR_OPEN = 3        # 开运算核（腐蚀→最大块），切断细桥
 HAIR_HOLE_MAX = 900  # 只补发丝缝这种细洞；喀秋莎白块邻接占比过不了下面的门槛
 HAIR_HOLE_SPAN = 22  # 洞的 bbox 跨度上限：再大就是脸/发带空腔，不是发丝缝
@@ -372,6 +388,24 @@ def _hair_blue(p):
 def _hair_loose(p):
     r, g, b, a = p
     return a > 40 and b - r >= HAIR_LOOSE_BR and b >= HAIR_LOOSE_B
+
+
+def _hair_bright(p):
+    """发束外缘那道亮边。它紧贴尾巴内缘、又在几何允许带外，原来整条漏染，
+    换发色后发束右缘留一条原蓝（用户报的「鱼尾那边一块没变色」）。
+    它 b>=160/b-r>=80，尾巴本体 b~120/b-r~54，两者在这条线上分得开——
+    所以只拿它当 allowed（不当 seed），重建能沿亮边长出去，进不了尾巴内部。"""
+    r, g, b, a = p
+    return a > 40 and b >= HAIR_BRIGHT_B and b - r >= HAIR_BRIGHT_BR
+
+
+def _close_gaps(mask):
+    """条件膨胀的允许区做一次闭运算（3x3 膨胀后腐蚀）。
+    发丝之间的深紫描边不满足任何颜色判据，1~2px 宽就能把外圈的发梢、鳍耳、
+    散落的发束跟主体切断——重建跨不过去，那些小块就一直留原蓝。
+    闭运算把这条细缝接上：只连 ≤2px 的断口，大块的空腔（脸、发带）宽度远超核，
+    腐蚀阶段会原样退回去。核再放大到 5x5 实测一个像素都不多连，就停在这里。"""
+    return mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
 
 
 def _reconstruct(seed_p, allowed_p, w, h):
@@ -533,9 +567,12 @@ def hair_masks(items):
         lop = loose.load()
         for y in range(OUT):
             for x in range(OUT):
-                if not ep[x, y] and _hair_loose(px[x, y]):
+                if ep[x, y]:
+                    continue
+                if _hair_loose(px[x, y]):
                     lop[x, y] = 255
-        masks[name] = _clip_to_alpha(_fill_hair_holes(_reconstruct(kp, lop, OUT, OUT)), im)
+        masks[name] = _clip_to_alpha(
+            _fill_hair_holes(_reconstruct(kp, _close_gaps(loose).load(), OUT, OUT)), im)
     return masks
 
 
@@ -605,18 +642,19 @@ def body_hair_mask(body_img):
         lp = loose.load()
         for y in range(h):
             for x in range(w):
-                if not ap[x, y]:
-                    continue
                 p = px[x, y]
-                if _hair_blue(p):
-                    sp[x, y] = 255
-                if _hair_loose(p):
+                if ap[x, y]:
+                    if _hair_blue(p):
+                        sp[x, y] = 255
+                    if _hair_loose(p):
+                        lp[x, y] = 255
+                elif _hair_bright(p):
                     lp[x, y] = 255
         keep = Image.new("L", (w, h), 0)
         kp = keep.load()
         for cx, cy in _largest_block(sp, w, h):
             kp[cx, cy] = 255
-        rp = _reconstruct(kp, lp, w, h).load()
+        rp = _reconstruct(kp, _close_gaps(loose).load(), w, h).load()
         for y in range(h):
             for x in range(w):
                 if rp[x, y]:
@@ -877,11 +915,17 @@ def sweat(d):
     el(d, (133.4 * S, 97.7 * S, 147.6 * S, 115.4 * S), fill=(140, 210, 255, 255))
 
 
+FACE_EDGE_SKIP = None
+
+
 def add_outer_line(img, r=1):
     """最外圈：1px 亮实线 + 1px 半透明光晕，把头从深色背景里拔出来。
     逐形状 outline 只能画出每个形状自己的边，脸与头发、头发与外缘的交接处会留断口，
     整张 alpha 外扩再减回原 alpha，才能保证「头 vs 背景」是一条连续的线。
-    ring 保留 grown-a 的差值而不是二值化，抗锯齿边缘得到的是一圈渐变实线，不是硬边。"""
+    ring 保留 grown-a 的差值而不是二值化，抗锯齿边缘得到的是一圈渐变实线，不是硬边。
+
+    FACE_EDGE_SKIP 非空时，它不透明的地方不描边：脸底下被身体接住的那段边界归身体负责，
+    两边都画就是一条亮线(168,200,246)横在脖子上，缩小到 162px 就是「头身之间一道白缝」。"""
     a = img.split()[3]
 
     def dilated(rad):
@@ -894,12 +938,18 @@ def add_outer_line(img, r=1):
 
     g1 = dilated(1)
     g2 = dilated(2)
+    ring_a = ImageChops.subtract(g1, a)
+    halo_a = ImageChops.subtract(g2, g1).point(lambda v: int(v * 0.34))
+    if FACE_EDGE_SKIP is not None and FACE_EDGE_SKIP.size == img.size:
+        keep = ImageChops.invert(FACE_EDGE_SKIP)
+        ring_a = ImageChops.multiply(ring_a, keep)
+        halo_a = ImageChops.multiply(halo_a, keep)
     out = Image.new("RGBA", img.size, (0, 0, 0, 0))
     halo = Image.new("RGBA", img.size, RIM_GLOW)
-    halo.putalpha(ImageChops.subtract(g2, g1).point(lambda v: int(v * 0.34)))
+    halo.putalpha(halo_a)
     out.alpha_composite(halo)
     ring = Image.new("RGBA", img.size, RIM)
-    ring.putalpha(ImageChops.subtract(g1, a))
+    ring.putalpha(ring_a)
     out.alpha_composite(ring)
     out.alpha_composite(img)
     return out
@@ -1421,11 +1471,12 @@ def shadow_map(items, body_img):
     m.paste(face, (0, 0), face)
     b = body_img.split()[3]
     m.paste(b, (BODY_OX, BODY_OY), b)
-    m = m.filter(ImageFilter.GaussianBlur(OUT * 0.05))
+    # 投影别怕小：亮度给低一点、模糊收窄，小人几乎顶满屏时大团黑雾只会把角色泣没
+    m = m.filter(ImageFilter.GaussianBlur(OUT * 0.035))
     # 光从上方来，影往下落：不偏移的投影看着像发光
     out = Image.new("L", (w, h), 0)
-    out.paste(m, (0, int(OUT * 0.035)))
-    return out.point(lambda v: int(v * 0.72))
+    out.paste(m, (0, int(OUT * 0.028)))
+    return out.point(lambda v: int(v * 0.45))
 
 
 def edge_vignette(w, h, depth, strength):
@@ -1756,6 +1807,11 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
 if __name__ == "__main__":
     out = os.path.join(HERE, "_emoji_out")
     os.makedirs(out, exist_ok=True)
+    # 必须比 items 先开：脸图的外圈线在生成时就按「身体盖住的地方不描」剪一下
+    _body_for_skip = body()
+    FACE_EDGE_SKIP = Image.new("L", (OUT, OUT), 0)
+    _ba = _body_for_skip.split()[3]
+    FACE_EDGE_SKIP.paste(_ba, (BODY_OX, BODY_OY), _ba)
     items = {}
     for name, fn in list(REGISTRY.items()) + list(ANIM.items()):
         items[name] = rgba(name, fn)

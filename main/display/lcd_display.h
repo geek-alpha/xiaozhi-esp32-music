@@ -83,6 +83,10 @@ protected:
     uint32_t hair_color_ = 0;
     // HUD 主色，0 = 跟随主题默认（light 品红 / dark 青）。配过就整屏顶栏+底图动态一起换
     uint32_t accent_color_ = 0;
+    // 背景色覆盖（时间表调度器下发）：bg_override_ 为真时主题底色让位给 bg_color_，
+    // 文字/气泡仍按主题。用单独的 flag 而不是拿 0 当哨兵——纯黑也是一合法底色
+    bool bg_override_ = false;
+    uint32_t bg_color_ = 0;
     // 整屏染色强度 0~10，要和 accent_color_ 一起存 NVS，否则重启后颜色回来了、染层却没了
     int accent_strength_ = 3;
     lv_obj_t* mouth_image_ = nullptr;
@@ -108,7 +112,12 @@ protected:
     uint16_t blink_tick_ = 0;
     // 下一次眨眼要等的 tick 数：固定 32 拍（3.2s）像个节拍器，人眼一眼看出是机器
     uint16_t blink_next_ = 0;
-    uint8_t blink_frames_ = 0;
+    // 眨眼不再数 tick：眼睑高度由 lv_anim 按真实时间推进（BlinkAnimExec），
+    // 这里只记「正在眨」和「这一下眨完要不要接第二下」
+    bool blink_active_ = false;
+    bool blink_double_pending_ = false;
+    int32_t blink_depth_ = 100;   // 这一下闭到的深度 %，<100 = 浅眨
+    uint8_t blink_guard_ = 0;     // 兜底：动画被打断时的超时复位拍数
     uint16_t mouth_tick_ = 0;
     bool mouth_open_ = false;
     bool mouth_active_ = false;
@@ -193,6 +202,9 @@ protected:
 public:
     ~LcdDisplay();
     void BlinkTick();
+    // 起一次眨眼：depth 是闭眼深度 %，眼睑位置随时间连续推进
+    void StartBlink(int32_t depth);
+    static void BlinkAnimExec(void* var, int32_t v);
     // 小人整体呼吸：三层 y 由同一个 tick 统一算并同时下发
     void AvatarFloatTick();
     void ApplyAvatarY();
@@ -200,9 +212,13 @@ public:
     void ApplyHairTint();
     // 头发两层提到最前。嘴/眨眼贴片每次显示后都要重提，漏一处那一帧头发就被盖住
     void RaiseHairLayers();
+    // 整屏色调：底图有染色层，但角色的脸/身体/手臂盖住了屏幕大半，光染底图
+    // 肉眼看就是「只有边角变了一点」。这三层挂 recolor，整屏才统一偏色
+    void ApplySceneTint(uint32_t rgb, int strength);
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetHairColor(uint32_t rgb) override;
     virtual void SetAccentColor(uint32_t rgb, int strength = -1) override;
+    virtual void SetBackgroundColor(uint32_t rgb) override;
     virtual void SetIcon(const char* icon) override;
     virtual void SetMusicInfo(const char* song_name) override;
     virtual void SetWeatherText(const char* text) override;

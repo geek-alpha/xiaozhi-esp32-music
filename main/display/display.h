@@ -29,6 +29,9 @@ public:
     // 换屏幕 HUD 主色（顶栏/核心/冲击环/流光），并控制整屏染色强度。0 = 跟随主题默认色
     // strength: 0~10，-1 = 不改当前强度（只换色）
     virtual void SetAccentColor(uint32_t rgb, int strength = -1) {}
+    // 换屏幕底色（整屏背景 + 顶栏/容器），0 = 恢复主题默认。
+    // 和 SetAccentColor 分两层：那个是整屏染色，这个是底色本身
+    virtual void SetBackgroundColor(uint32_t rgb) {}
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void SetMusicInfo(const char* song_name);
     virtual void SetIcon(const char* icon);

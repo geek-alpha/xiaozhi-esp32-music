@@ -71,6 +71,22 @@ static constexpr uint32_t kArmListenMs = 560;
 static constexpr uint16_t kArmListenMinTicks = 120;
 static constexpr uint16_t kArmListenSpanTicks = 150;
 
+// 眨眼三段时长：真人落睑 90ms（加速落下，贴到下眼睑时速度最大）、闭合 70ms、
+// 抬睑 150ms（两端速度为 0，不会「啪」地弹开），全程 310ms ≈ 10 帧 @30fps
+// （CONFIG_LV_DEF_REFR_PERIOD=33）。旧实现是在 100ms 的 BlinkTick 上直接切两张图
+// 再停 200ms：只有全睁/全闭两态，落睑抬睑都是单帧硬跳，屏幕上就是「卡一下」。
+static constexpr uint32_t kBlinkCloseMs = 90;
+static constexpr uint32_t kBlinkHoldMs = 70;
+static constexpr uint32_t kBlinkOpenMs = 150;
+static constexpr uint32_t kBlinkTotalMs = kBlinkCloseMs + kBlinkHoldMs + kBlinkOpenMs;
+// 真人约 1/4 的眨眼是连眨两下，第二下略浅；还有一部分根本没完全合上
+static constexpr uint8_t kBlinkDoubleChance = 4;    // 1/4
+static constexpr uint8_t kBlinkSecondDepth = 88;
+static constexpr uint8_t kBlinkLightChance = 9;     // 1/9
+static constexpr uint8_t kBlinkLightDepth = 76;
+// 眼睑动画的超时兜底：正常 310ms 就走完，超过这个拍数说明被换脸/图层重建打断了
+static constexpr uint8_t kBlinkGuardTicks = 12;
+
 static void StartArmWave(lv_obj_t* arms, uint32_t per_frame_ms, bool loop = true)
 {
     if (arms == nullptr || kArmFrameCount < 2) {
@@ -283,6 +299,24 @@ static float avg_power_spectrum[FFT_SIZE/2]={-25.0f};
 #define HUD_ACCENT_DARK              lv_color_hex(0x00E5FF)
 #define HUD_ACCENT_LIGHT             lv_color_hex(0xD8408C)
 
+// 底色亮度决定前景：亮底深字、暗底浅字，两套主题同一个判据。
+// 顶栏字跟主色走时，主色等于底色的那几秒就彻底消失（红底红字），所以改按对比度算
+static lv_color_t ForegroundOn(uint32_t rgb)
+{
+    const int lum = (299 * ((rgb >> 16) & 0xFF) + 587 * ((rgb >> 8) & 0xFF)
+                     + 114 * (rgb & 0xFF)) / 1000;
+    return lv_color_hex(lum > 150 ? 0x14141A : 0xF2F6FF);
+}
+
+// 顶栏底衬：前景亮就给近黑底，前景暗就给近白底。
+// 顶栏原本透明，字直接压在科技底图上——底图花纹密，同一行字在亮斑上糊成一片，
+// 只有恰好压在暗块上的那几个字才清楚。实心底衬是「任何底图上都看得清」的唯一办法
+static lv_color_t BarBackdropOn(lv_color_t fg)
+{
+    const int lum = (299 * fg.red + 587 * fg.green + 114 * fg.blue) / 1000;
+    return lv_color_hex(lum > 140 ? 0x14141A : 0xF2F6FF);
+}
+
 
 // Define dark theme colors
 const ThemeColors DARK_THEME = {
@@ -329,6 +363,8 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     }
     accent_color_ = (uint32_t)settings.GetInt("accent_color", 0);
     accent_strength_ = (int)settings.GetInt("accent_strength", 3);
+    bg_color_ = (uint32_t)settings.GetInt("bg_color", 0) & 0xFFFFFF;
+    bg_override_ = settings.GetInt("bg_override", 0) != 0 && bg_color_ != 0;
     ESP_LOGI(TAG, "Hair color from NVS: #%06X, accent: %s (tint %d/10)", (unsigned)hair_color_,
              accent_color_ ? "set" : "theme default", accent_strength_);
 
@@ -364,7 +400,11 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     // 默认 7168 字节扛不住 LVGL9 分层重绘的递归深度（refr_obj/lv_obj_redraw 交替），
     // 会踩到任务栈外触发间歇性 LoadStoreAlignment / MMU entry fault panic。
     port_cfg.task_stack = 16 * 1024;
-    port_cfg.timer_period_ms = 50;
+    // LVGL 的时间轴精度就是这个值：50ms 时所有 timer（含 33ms 的刷新周期）都被量化成 50ms，
+    // 整屏实际只有 20fps——眨眼这种 300ms 级的动作在屏幕上只剩 4~5 帧，看着就是卡。
+    // 5ms 是 esp_lvgl_port 的官方默认值：刷新落在 35ms（约 28fps），
+    // 代价只是 esp_timer 200Hz 的空回调（回调里就一条 lv_tick_inc 加法）。
+    port_cfg.timer_period_ms = 5;
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
@@ -447,7 +487,11 @@ RgbLcdDisplay::RgbLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = 1;
-    port_cfg.timer_period_ms = 50;
+    // LVGL 的时间轴精度就是这个值：50ms 时所有 timer（含 33ms 的刷新周期）都被量化成 50ms，
+    // 整屏实际只有 20fps——眨眼这种 300ms 级的动作在屏幕上只剩 4~5 帧，看着就是卡。
+    // 5ms 是 esp_lvgl_port 的官方默认值：刷新落在 35ms（约 28fps），
+    // 代价只是 esp_timer 200Hz 的空回调（回调里就一条 lv_tick_inc 加法）。
+    port_cfg.timer_period_ms = 5;
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
@@ -606,9 +650,13 @@ void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
 
     auto screen = lv_screen_active();
+    // 换字库后行高/基线都变了，排版按这些值算，先打出来才能分清是字库问题还是布局问题
+    ESP_LOGI(TAG, "Text font: line_height %d base_line %d",
+             (int)fonts_.text_font->line_height, (int)fonts_.text_font->base_line);
     lv_obj_set_style_text_font(screen, fonts_.text_font, 0);
     lv_obj_set_style_text_color(screen, current_theme_.text, 0);
     lv_obj_set_style_bg_color(screen, current_theme_.background, 0);
+
 
     /* Container */
     container_ = lv_obj_create(screen);
@@ -1028,6 +1076,9 @@ void LcdDisplay::SetupUI() {
     // 运行时只有 1 次 blit；动态只剩核心/环/火星/流光几样小对象，脏区不到 20KB/帧
     backdrop_.Create(screen, LV_HOR_RES, LV_VER_RES, fonts_.text_font->line_height);
     backdrop_.ApplyTheme(current_theme_name_ == "dark", accent_color_, accent_strength_);
+    // 开机就要把上次的底色贴回来：这里不走 SetTheme（它自己会取 display 锁，
+    // 在 SetupUI 里重入会卡死），只补纯色这一层
+    backdrop_.SetSolidBackground(bg_override_ ? bg_color_ : 0);
 
     /* Container */
     container_ = lv_obj_create(screen);
@@ -1044,15 +1095,15 @@ void LcdDisplay::SetupUI() {
     status_bar_ = lv_obj_create(container_);
     lv_obj_set_size(status_bar_, LV_HOR_RES, fonts_.text_font->line_height);
     lv_obj_set_style_radius(status_bar_, 0, 0);
-    // 顶栏也是 HUD 的一部分：背景透出来让底图连上去，只在底部压一条青色扫描线
-    lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
-    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_text_color(status_bar_,
-        (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT, 0);
+    // 底色被接管时顶栏不能跟 HUD 主色走：红底红字等于字没了
+    const lv_color_t hud_fg = bg_override_ ? ForegroundOn(bg_color_)
+        : ((current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT);
+    lv_obj_set_style_bg_color(status_bar_, BarBackdropOn(hud_fg), 0);
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(status_bar_, hud_fg, 0);
     lv_obj_set_style_border_width(status_bar_, 1, 0);
     lv_obj_set_style_border_side(status_bar_, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_color(status_bar_,
-        (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT, 0);
+    lv_obj_set_style_border_color(status_bar_, hud_fg, 0);
     lv_obj_set_style_border_opa(status_bar_, LV_OPA_50, 0);
     
     /* Content */
@@ -1169,6 +1220,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_FLOATING);
     lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_pad_all(blink_image_, 0, 0);
+    // 固定尺寸 + 顶部对齐：image 默认是 SIZE_CONTENT，不锁死尺寸的话改 height 会被
+    // 内容尺寸覆盖；而默认对齐会把贴片居中，改高度时裁掉的是上下两边而不是向下长
+    lv_obj_set_size(blink_image_, BLINK_W, BLINK_H);
+    lv_image_set_inner_align(blink_image_, LV_IMAGE_ALIGN_TOP_LEFT);
 
     // 贴片会带出「睁眼时被眼球挡住的刘海」，那几块在原图染色遮罩里是空的，眨一下闪回原蓝。
     // 挂成 blink_image_ 的子对象：跟着同步显隐/同步位置，且自然压在贴片之上
@@ -1285,7 +1340,11 @@ void LcdDisplay::SetupUI() {
     /* Status bar */
     lv_obj_set_flex_flow(status_bar_, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(status_bar_, 0, 0);
-    lv_color_t hud = (current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT;
+    lv_color_t hud = bg_override_ ? ForegroundOn(bg_color_)
+                                  : ((current_theme_name_ == "dark") ? HUD_ACCENT_DARK : HUD_ACCENT_LIGHT);
+    // 底衬跟字一起在这里重贴：布局重排不能把顶栏退回透明，那样字又在底图上裸奔
+    lv_obj_set_style_bg_color(status_bar_, BarBackdropOn(hud), 0);
+    lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);
     // 顶栏底边那道霓虹线创建时设过，这里不能再清成 0
     lv_obj_set_style_border_width(status_bar_, 1, 0);
     lv_obj_set_style_border_side(status_bar_, LV_BORDER_SIDE_BOTTOM, 0);
@@ -1716,8 +1775,12 @@ void LcdDisplay::SetEmotion(const char* emotion) {
     }
     if (blink_image_ != nullptr) {
         lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+        // 换脸会换掉贴片指针：正在跑的眼睑动画必须停掉，否则新脸的眼睛会被上一张脸的贴片裁着画
+        lv_anim_del(blink_image_, nullptr);
     }
-    blink_frames_ = 0;
+    blink_active_ = false;
+    blink_double_pending_ = false;
+    blink_guard_ = 0;
     mouth_tick_ = 0;
     mouth_open_ = false;
     mouth_active_ = false;
@@ -1793,6 +1856,24 @@ void LcdDisplay::ApplyHairTint() {
     if (on) {
         RaiseHairLayers();
     }
+}
+
+void LcdDisplay::ApplySceneTint(uint32_t rgb, int strength) {
+    // 低强度混色而不是盖一层纯色：明暗、衣服褶皱、脸部轮廓都还在，
+    // 观感是「整块屏偏了色」，不是「贴了张单色纸」
+    int s = strength < 0 ? 0 : (strength > 10 ? 10 : strength);
+    const bool on = rgb != 0 && s > 0;
+    const lv_color_t color = lv_color_hex(rgb);
+    const lv_opa_t opa = on ? (lv_opa_t)(s * 11) : LV_OPA_TRANSP;
+    lv_obj_t* layers[] = {body_image_, arms_image_, emotion_image_};
+    for (lv_obj_t* o : layers) {
+        if (o == nullptr) {
+            continue;
+        }
+        lv_obj_set_style_image_recolor(o, color, 0);
+        lv_obj_set_style_image_recolor_opa(o, opa, 0);
+    }
+    ESP_LOGI(TAG, "Scene tint #%06X opa %d on avatar layers", (unsigned)rgb, (int)opa);
 }
 
 void LcdDisplay::RaiseHairLayers() {
@@ -1921,6 +2002,29 @@ void LcdDisplay::SetAccentColor(uint32_t rgb, int strength) {
     ESP_LOGI(TAG, "Accent color -> #%06X, tint %d/10 (saved)", (unsigned)rgb, accent_strength_);
 }
 
+void LcdDisplay::SetBackgroundColor(uint32_t rgb) {
+    const uint32_t color = rgb & 0xFFFFFF;
+    // 0 = 回主题默认。纯黑是合法底色，所以用 bg_override_ 而不是拿 0 当哨兵
+    const bool override_on = color != 0;
+    if (override_on == bg_override_ && (!override_on || color == bg_color_)) {
+        return;  // 状态没变就不下发：SetTheme 重刷整屏，白刷一次就是一次可见的闪
+    }
+    bg_override_ = override_on;
+    bg_color_ = color;
+    {
+        Settings settings("display", true);
+        settings.SetInt("bg_color", (int32_t)bg_color_);
+        settings.SetInt("bg_override", bg_override_ ? 1 : 0);
+    }
+    // 重刷复用 SetTheme 那条链路，同 SetAccentColor 的理由：别养两套刷新逻辑
+    SetTheme(current_theme_name_.empty() ? "light" : current_theme_name_);
+    if (bg_override_) {
+        ESP_LOGI(TAG, "Background -> #%06X (time schedule)", (unsigned)bg_color_);
+    } else {
+        ESP_LOGI(TAG, "Background -> theme default");
+    }
+}
+
 void LcdDisplay::SetTheme(const std::string& theme_name) {
     DisplayLockGuard lock(this);
     
@@ -1933,7 +2037,25 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
         ESP_LOGE(TAG, "Invalid theme name: %s", theme_name.c_str());
         return;
     }
-    backdrop_.ApplyTheme(theme_name == "dark" || theme_name == "DARK", accent_color_, accent_strength_);
+    // 时段配过的底色要在这里重新贴上去：SetTheme 开头每次都把 current_theme_
+    // 重设回 DARK/LIGHT，不贴的话设备一换主题就漏回白底
+    if (bg_override_) {
+        current_theme_.background = lv_color_hex(bg_color_);
+        // 底色被时段色整屏接管后，主题那套浅/深文字都不再保证对比度：
+        // 按底色亮度自己挑前景，亮底深字、暗底近白字，两套主题同一判据
+        current_theme_.text = ForegroundOn(bg_color_);
+    }
+    // 时段配色不能靠半透明染色层：底图不透明，叠半透明只能把颜色洗淡，
+    // 正红/正黄永远出不来。底色接管时整块换成纯色，动态层取对比色。
+    const bool bg_owns_tint = bg_override_ && bg_color_ != 0;
+    backdrop_.ApplyTheme(theme_name == "dark" || theme_name == "DARK",
+                         bg_owns_tint ? 0 : accent_color_,
+                         bg_owns_tint ? 0 : accent_strength_);
+    backdrop_.SetSolidBackground(bg_owns_tint ? bg_color_ : 0);
+    // 角色图是身份，不参与染色：纯色底上再染一层，脸就成同色剪影了
+    // 角色图不参与任何洗色：image_recolor 叠一层浅色只会把脸和衣服的暗部洗成灰，
+    // 看上去就是「身上蒙了好多灰影」，比原图脏得多
+    ApplySceneTint(0, 0);
     current_theme_name_ = (theme_name == "dark" || theme_name == "DARK") ? "dark" : "light";
     
     // Get the active screen
@@ -1951,9 +2073,11 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
     
     // Update status bar colors
     if (status_bar_ != nullptr) {
-        lv_color_t accent = AccentColor();
-        lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
-        lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);
+        // 整屏被时段色压成一种色时，顶栏再跟主色走就是「紫底紫字」直接糊没。
+        // 这时让位给对比色（current_theme_.text 已按底色亮度算好）
+        lv_color_t accent = bg_owns_tint ? current_theme_.text : AccentColor();
+        lv_obj_set_style_bg_color(status_bar_, BarBackdropOn(accent), 0);
+        lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);
         lv_obj_set_style_text_color(status_bar_, accent, 0);
         lv_obj_set_style_border_color(status_bar_, accent, 0);
         
@@ -2176,6 +2300,79 @@ void LcdDisplay::start(){
     );
 }
 
+// 眼睑位置 = 闭眼贴片的可见高度：贴片从顶部往下长，就是把眼睑压下来；
+// 收回去时从底部往回收，眼睛自上而下睁开。0 = 全睁，BLINK_H = 全闭。
+static int32_t BlinkLidHeight(int32_t t, int32_t depth)
+{
+    const int32_t full = ((int32_t)BLINK_H * depth + 50) / 100;
+    if (t <= 0) {
+        return 0;
+    }
+    if (t < (int32_t)kBlinkCloseMs) {
+        const float x = (float)t / (float)kBlinkCloseMs;
+        return (int32_t)(full * x * x);
+    }
+    if (t < (int32_t)(kBlinkCloseMs + kBlinkHoldMs)) {
+        return full;
+    }
+    int32_t o = t - (int32_t)(kBlinkCloseMs + kBlinkHoldMs);
+    if (o > (int32_t)kBlinkOpenMs) {
+        o = (int32_t)kBlinkOpenMs;
+    }
+    const float x = (float)o / (float)kBlinkOpenMs;
+    const float s = x * x * (3.0f - 2.0f * x);
+    return (int32_t)(full * (1.0f - s));
+}
+
+void LcdDisplay::BlinkAnimExec(void* var, int32_t v)
+{
+    lv_obj_t* img = (lv_obj_t*)var;
+    LcdDisplay* self = (LcdDisplay*)lv_obj_get_user_data(img);
+    if (self == nullptr) {
+        return;
+    }
+    const int32_t h = BlinkLidHeight(v, self->blink_depth_);
+    if (lv_obj_get_height(img) != h) {
+        lv_obj_set_height(img, h);
+    }
+    if (h > 0) {
+        if (lv_obj_has_flag(img, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_clear_flag(img, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (!lv_obj_has_flag(img, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (v >= (int32_t)kBlinkTotalMs) {
+        // 收尾只改状态：第二下由下一拍 BlinkTick 起，不在动画回调里动 anim 链表
+        self->blink_active_ = false;
+    }
+}
+
+void LcdDisplay::StartBlink(int32_t depth)
+{
+    if (blink_image_ == nullptr || blink_img_ == nullptr) {
+        return;
+    }
+    lv_anim_del(blink_image_, nullptr);
+    blink_depth_ = depth;
+    lv_obj_set_user_data(blink_image_, this);
+    lv_image_set_src(blink_image_, blink_img_);
+    lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
+    lv_obj_set_height(blink_image_, 0);
+    RaiseHairLayers();
+    blink_active_ = true;
+    blink_guard_ = 0;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, blink_image_);
+    lv_anim_set_exec_cb(&a, BlinkAnimExec);
+    lv_anim_set_values(&a, 0, (int32_t)kBlinkTotalMs);
+    lv_anim_set_duration(&a, kBlinkTotalMs);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_start(&a);
+}
+
 // 真人眨眼间隔不均匀：2.4~4.8s 随机，固定节拍一眼就看得出是机器。
 // 听人说话时会眨得更少（专注），分神才眨得勤
 static uint16_t NextBlinkTicks(bool listening) {
@@ -2193,6 +2390,7 @@ void LcdDisplay::BlinkTick() {
         if (blink_image_ != nullptr) {
             lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
         }
+        blink_active_ = false;
         return;
     }
 
@@ -2273,10 +2471,23 @@ void LcdDisplay::BlinkTick() {
         ClearListenAnim();
     }
 
-    if (blink_frames_ > 0) {
-        if (--blink_frames_ == 0 && blink_image_ != nullptr) {
-            lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+    // 眼睑动画在跑的时候不再排新的一次。兜底：动画被打断（换表情/图层重建）后
+    // blink_active_ 会卡住，超过 kBlinkGuardTicks 拍就强制复位，否则这张脸再也不眨
+    if (blink_active_) {
+        if (++blink_guard_ > kBlinkGuardTicks) {
+            lv_anim_del(blink_image_, nullptr);
+            blink_active_ = false;
+            blink_guard_ = 0;
+            if (blink_image_ != nullptr) {
+                lv_obj_add_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
+            }
         }
+        return;
+    }
+    // 连眨第二下：上一拍已经把眼睛睁开了，这一拍立刻接上，中间就是一次全睁
+    if (blink_double_pending_ && blink_img_ != nullptr && blink_image_ != nullptr) {
+        blink_double_pending_ = false;
+        StartBlink(kBlinkSecondDepth);
         return;
     }
     // 表里没眨眼贴片的表情（本来闭眼/戴墨镜）跳过眨眼
@@ -2288,11 +2499,8 @@ void LcdDisplay::BlinkTick() {
         if (++blink_tick_ >= blink_next_) {
             blink_tick_ = 0;
             blink_next_ = NextBlinkTicks(listening);
-            lv_image_set_src(blink_image_, blink_img_);
-            lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
-            lv_obj_clear_flag(blink_image_, LV_OBJ_FLAG_HIDDEN);
-            RaiseHairLayers();
-            blink_frames_ = 2;
+            blink_double_pending_ = (esp_random() % kBlinkDoubleChance) == 0;
+            StartBlink((esp_random() % kBlinkLightChance) == 0 ? (int32_t)kBlinkLightDepth : 100);
             // 只打第一次：以后有人问「为什么不眨眼」，这条日志直接分辨是没触发还是被别的层盖住
             static bool blink_logged = false;
             if (!blink_logged) {
@@ -2311,7 +2519,7 @@ void LcdDisplay::ListenAnimTick()
     // ---- 眼神游移 ----
     if (gaze_image_ != nullptr && GAZE_COUNT > 0) {
         if (gaze_hold_ > 0) {
-            if (blink_frames_ > 0) {
+            if (blink_active_) {
                 // 闭眼贴片要整块盖住眼睛，眼神贴片压在上面会露出半只瞳孔
                 if (!gaze_blink_hide_) {
                     lv_obj_add_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
@@ -2342,7 +2550,7 @@ void LcdDisplay::ListenAnimTick()
                 gaze_hold_ = kGazeHoldMinTicks + esp_random() % kGazeHoldSpanTicks;
                 lv_image_set_src(gaze_image_, kGazeFrames[idx]);
                 lv_obj_set_pos(gaze_image_, GAZE_OX, GAZE_OY);
-                if (blink_frames_ == 0) {
+                if (!blink_active_) {
                     lv_obj_clear_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
                     gaze_blink_hide_ = false;
                 } else {

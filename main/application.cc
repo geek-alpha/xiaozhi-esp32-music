@@ -8,6 +8,7 @@
 #include "font_awesome_symbols.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
+#include "bg_schedule.h"
 #include "weather.h"
 
 #include <cstring>
@@ -467,6 +468,10 @@ void Application::Start()
 
     // Add MCP common tools before initializing the protocol
     McpServer::GetInstance().AddCommonTools();
+
+    // 背景色时间表：到点自己换底色。必须等 display 就绪后再起，
+    // 首个 Tick 会把 NVS 里存过的规则立刻应用一次
+    BgSchedule::GetInstance().Start(display);
 
     if (ota.HasMqttConfig())
     {

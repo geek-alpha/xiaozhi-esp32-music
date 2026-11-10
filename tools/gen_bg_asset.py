@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""赛博朋克霓虹待机背景生成器：出 240x240 RGB565 资源。
+"""金鱼娘待机背景生成器：出 240x240 RGB565 资源。
 
     py -3 tools/gen_bg_asset.py
 
@@ -7,13 +7,13 @@
     main/display/bg_assets.c / bg_assets.h   固件内嵌底图（dark / light 各一张）
     _bg_out/bg_*.png                          预览图，改完先看图再刷机
 
-风格取向（第一性原理）：屏幕中央那张脸是圆润、明亮、Q 版的蓝发角色，
-背景要当「夜里的霓虹街景」——暗底、软光晕、剪影，凡是直角框、刻度尺、
-军用 HUD 这类硬元素都会跟它抢戏，所以一个都不留。
-硬几何全部换成光：霓虹环、斜向光带、湿地面反光、雨丝。
+风格取向（第一性原理）：屏幕中央是一张圆润、明亮、Q 版的蓝发角色，
+所以背景只做「她所在的水」——从上往下透的天光、飘过的尾纱、上升的气泡、
+水底的焦散光纹。凡是直角、HUD 框、扫描线这类赛博元素一个不留：
+它们会把 Q 版脸压成仪表盘，跟金鱼娘这个设定也没关系。
 
 静态全烘进图里，运行时只 blit 一次；动态留给固件里少数小对象
-（光环呼吸、冲击环、雨滴、光带流光、扫描带）。
+（核心呼吸、水波涟漪、上升气泡、尾纱流光）。
 """
 import math
 import os
@@ -28,60 +28,60 @@ OUT_DIR = os.path.join(ROOT, "_bg_out")
 C_PATH = os.path.join(ROOT, "main", "display", "bg_assets.c")
 H_PATH = os.path.join(ROOT, "main", "display", "bg_assets.h")
 
-# 表情固定贴在 content_ 顶部正中，光环圆心跟着它走（EMOJI 120x120）。
+# 表情固定贴在 content_ 顶部正中，水波涟漪圆心跟着它走（EMOJI 120x120）。
 # 实测（串口日志 Chat view ... in 226x202, emoji at 53,0）：content_ 从 y=24 起，
 # 加 2px border + 5px pad 后表情顶在 y=31，所以圆心 31+60 = 91。
 EMOJI_CX, EMOJI_CY = W // 2, 91
-HORIZON_Y = 198
 
+# 尾纱两条主弧的端点：固件里的 trail 流光沿这两条线走（tech_backdrop.cc 的
+# kBladeA / kBladeB），改这里必须同步改那边，否则流光会飘在纱外。
+VEIL_A = ((108, 152), (2, 216))
+VEIL_B = ((132, 152), (238, 216))
+
+# dark：夜里的小水槽。上青绿透光、下深蓝，尾纱是金鱼橙，气泡冷白。
 DARK = dict(
-    top=(12, 6, 26),
-    bottom=(34, 12, 52),
-    halo=(0, 226, 255),
-    halo2=(255, 45, 149),
-    ring_in=(150, 250, 255),
-    ring_mid=(0, 214, 255),
-    ring_out=(255, 62, 158),
-    streak=(255, 58, 158),
-    streak2=(72, 240, 255),
-    city=(24, 12, 42),
-    city_edge=(168, 52, 208),
-    win_c=(0, 226, 255),
-    win_p=(255, 96, 176),
-    horizon=(255, 62, 158),
-    reflect=(0, 200, 236),
-    rain=(150, 226, 255),
-    rain_alpha=46,
-    scan_alpha=10,
-    status=(10, 5, 22),
-    status_line=(255, 62, 158),
-    vignette=205,
-    grain=4,
+    top=(38, 96, 106),
+    mid=(22, 56, 82),
+    bottom=(10, 24, 46),
+    shaft=(178, 252, 240),
+    halo=(255, 186, 176),
+    halo2=(255, 144, 124),
+    caustic=(176, 252, 246),
+    veil_a=(255, 138, 96),
+    veil_b=(255, 178, 202),
+    veil_core=(255, 244, 234),
+    bubble=(204, 250, 255),
+    scale=(146, 232, 244),
+    petal=(255, 168, 198),
+    fish=(255, 136, 92),
+    weed=(30, 74, 78),
+    status=(14, 30, 44),
+    status_line=(255, 176, 164),
+    vignette=150,
+    grain=3,
 )
 
+# light：白天的樱花水。樱白到青白，天光更强，尾纱同色系压低饱和度。
 LIGHT = dict(
-    top=(238, 226, 250),
-    bottom=(186, 156, 216),
-    halo=(58, 150, 196),
-    halo2=(224, 72, 158),
-    ring_in=(255, 255, 255),
-    ring_mid=(200, 96, 176),
-    ring_out=(96, 130, 210),
-    streak=(224, 72, 158),
-    streak2=(66, 158, 200),
-    city=(150, 126, 186),
-    city_edge=(96, 44, 140),
-    win_c=(16, 120, 172),
-    win_p=(206, 44, 132),
-    horizon=(224, 72, 158),
-    reflect=(72, 150, 196),
-    rain=(120, 150, 190),
-    rain_alpha=34,
-    scan_alpha=7,
-    status=(226, 214, 240),
-    status_line=(214, 64, 148),
-    vignette=140,
-    grain=3,
+    top=(255, 250, 252),
+    mid=(228, 246, 248),
+    bottom=(176, 208, 230),
+    shaft=(255, 255, 255),
+    halo=(255, 214, 214),
+    halo2=(255, 182, 182),
+    caustic=(255, 255, 255),
+    veil_a=(255, 172, 150),
+    veil_b=(255, 202, 218),
+    veil_core=(255, 255, 252),
+    bubble=(255, 255, 255),
+    scale=(188, 224, 240),
+    petal=(255, 180, 206),
+    fish=(246, 148, 116),
+    weed=(150, 192, 188),
+    status=(240, 246, 252),
+    status_line=(255, 182, 172),
+    vignette=92,
+    grain=2,
 )
 
 
@@ -90,17 +90,21 @@ def lerp(a, b, t):
 
 
 def rgba(color, a):
-    return (color[0], color[1], color[2], int(a))
+    return (color[0], color[1], color[2], int(max(0, min(255, a))))
 
 
 def add_layer(img, layer):
     return Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
 
 
+def new_layer():
+    return Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+
 def radial_glow(cx, cy, radius, color, peak_alpha, power=2.2, squash=1.0):
     """径向发光：逐像素算 alpha。同一张 RGBA 层上叠圆是后画覆盖先画，叠不出
     「中心亮、边缘透明」的渐变，只有逐像素写才累积得出来。squash<1 压扁成椭圆光带。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    layer = new_layer()
     px = layer.load()
     ry = max(1, int(radius * squash))
     for y in range(max(0, cy - ry), min(H, cy + ry)):
@@ -114,15 +118,240 @@ def radial_glow(cx, cy, radius, color, peak_alpha, power=2.2, squash=1.0):
     return layer
 
 
-def vertical_gradient(top, bottom):
-    """夜空竖向渐变：上暗下亮一档，给地面反光留出底部亮度。"""
+def water_gradient(p):
+    """三段水色：上（天光透进来的那层）→ 中（水体主色）→ 下（水底）。
+    单段两停渐变读起来像塑料板；三段才有「光从上往下被吃掉」的层次。"""
     img = Image.new("RGB", (W, H))
     px = img.load()
+    mid_y = int(H * 0.46)
     for y in range(H):
-        c = lerp(top, bottom, (y / (H - 1)) ** 1.6)
+        if y <= mid_y:
+            c = lerp(p["top"], p["mid"], (y / max(1, mid_y)) ** 1.15)
+        else:
+            c = lerp(p["mid"], p["bottom"], ((y - mid_y) / max(1, H - 1 - mid_y)) ** 0.85)
         for x in range(W):
             px[x, y] = c
     return img
+
+
+def draw_shafts(img, p):
+    """天光光柱：从水面往下散开的柔光竖条，越往下越淡。
+    条数少、边界糊到几乎看不出线，只留下「上方有光」的方向感。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    for cx, half_w, a in ((40, 20, 52), (104, 30, 74), (170, 24, 58), (216, 14, 42)):
+        d.polygon(
+            [(cx - half_w * 0.5, STATUS_H), (cx + half_w * 0.5, STATUS_H),
+             (cx + half_w * 1.35, H - 20), (cx - half_w * 1.35, H - 20)],
+            fill=rgba(p["shaft"], a),
+        )
+    layer = layer.filter(ImageFilter.GaussianBlur(13))
+    return add_layer(img, layer)
+
+
+def draw_caustics(img, p):
+    """焦散光纹：水面把光聚成网状亮线打到水底，是「这是水」最省事的信号。
+    两条相位不同的正弦叠出交叉网格，只留画面下 1/3——铺满整屏会糊住角色的脸。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    for k, (amp, freq, phase, y0, a) in enumerate((
+        (7.0, 0.052, 0.0, 168, 62),
+        (5.0, 0.071, 1.7, 176, 52),
+        (9.0, 0.037, 3.1, 158, 40),
+    )):
+        prev = None
+        for x in range(0, W + 4, 4):
+            y = y0 + amp * math.sin(freq * x + phase) + 3.0 * math.sin(freq * 2.3 * x + phase * 2)
+            if prev is not None:
+                d.line([prev, (x, y)], fill=rgba(p["caustic"], a), width=2)
+            prev = (x, y)
+    layer = layer.filter(ImageFilter.GaussianBlur(2.6))
+    return add_layer(img, layer)
+
+
+def _bezier(p0, p1, ctrl, t):
+    u = 1 - t
+    x = u * u * p0[0] + 2 * u * t * ctrl[0] + t * t * p1[0]
+    y = u * u * p0[1] + 2 * u * t * ctrl[1] + t * t * p1[1]
+    return x, y
+
+
+def draw_veil(img, p, p0, p1, bow, color, color2, width, peak, blur=3.2):
+    """一尾纱：沿二次贝塞尔扫一条中段粗、两端收的软带，再用更细的芯提一次亮。
+    纱的质感全靠「边上糊、中间透」——所以模糊层给宽度、芯层只给一条细线，
+    整条加粗会变成一根塑料管，跟金鱼的尾摆没关系。"""
+    mid = ((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2)
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    ln = max(1.0, math.hypot(dx, dy))
+    ctrl = (mid[0] - dy / ln * bow * ln, mid[1] + dx / ln * bow * ln)
+
+    halo = new_layer()
+    dh = ImageDraw.Draw(halo)
+    sharp = new_layer()
+    ds = ImageDraw.Draw(sharp)
+    n = 84
+    prev = None
+    prev_c = None
+    for s in range(n + 1):
+        t = s / n
+        pt = _bezier(p0, p1, ctrl, t)
+        # 包络：两端收窄到 0.25，中段最宽；正弦开方让它收得比直线柔和
+        env = math.sin(math.pi * t) ** 0.55 * 0.75 + 0.25
+        if prev is not None:
+            dh.line([prev, pt], fill=rgba(color, int(peak * env / 2.6)), width=int(width * env))
+            ds.line([prev_c, pt], fill=rgba(color2, int(peak * env / 2.2)), width=max(1, int(width * env * 0.26)))
+        prev = pt
+        prev_c = pt
+    out = add_layer(img, halo.filter(ImageFilter.GaussianBlur(blur)))
+    return add_layer(out, sharp.filter(ImageFilter.GaussianBlur(0.7)))
+
+
+def draw_tails(img, p):
+    """四道尾纱：下方两道往下垂（裙摆），上方两道往斜上飘（尾摆上扬）。
+    下方两道刻意不从同一点起手、中间留 24px 缝——交汇处会顶出一个尖峰，
+    在 240px 屏上读起来就是一座山，不是纱。上方两道更淡更细，只给上扬的动势。"""
+    for p0, p1, bow, w, peak, blur in (
+        (VEIL_A[0], VEIL_A[1], -0.18, 26, 110, 7.5),
+        (VEIL_B[0], VEIL_B[1], 0.18, 26, 104, 7.5),
+        ((100, 138), (8, 92), 0.26, 13, 74, 5.0),
+        ((140, 138), (232, 92), -0.26, 13, 70, 5.0),
+    ):
+        img = draw_veil(img, p, p0, p1, bow, p["veil_a"], p["veil_b"], w, peak, blur=blur)
+        img = draw_veil(img, p, p0, p1, bow, p["veil_core"], p["veil_core"],
+                        max(3, w // 3), peak + 40, blur=1.1)
+    return img
+
+
+def draw_bubbles(img, p):
+    """气泡：大小不一的空心圆 + 一点左上高光。实心点会读成雪或星星，
+    空心圈才读得出「水里的泡」。避开角色脸部那圈，别把脸戳出洞。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    rnd = random.Random(1907)
+    placed = 0
+    while placed < 22:
+        cx = rnd.randrange(6, W - 6)
+        cy = rnd.randint(STATUS_H + 6, H - 6)
+        r = rnd.choice([2.0, 2.5, 3.0, 4.0, 5.0, 6.5])
+        if math.hypot(cx - EMOJI_CX, cy - EMOJI_CY) < 66 + r:
+            continue
+        placed += 1
+        a = rnd.randint(36, 82)
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=rgba(p["bubble"], a), width=1)
+        d.point((cx - r * 0.42, cy - r * 0.42), fill=rgba(p["bubble"], min(255, a + 90)))
+    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(0.3)))
+
+
+def draw_scales(img, p):
+    """鳞片纹：一片片小圆弧切出的扇形网格，只铺在角色外圈。
+    金鱼娘这个设定下鳞片比任何赛博元素都对味，但铺到脸上就变成鱼鳞脸了，
+    所以圆心 74px 以内整片跳过。alpha 压到个位数，远看只是一层「有肌理的水」。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    step = 15
+    rad = 8
+    for row, y in enumerate(range(STATUS_H + 4, H, rad)):
+        for col, x in enumerate(range(-step, W + step, step)):
+            cx = x + (step // 2 if row % 2 else 0)
+            if math.hypot(cx - EMOJI_CX, y - EMOJI_CY) < 70:
+                continue
+            if x < -step or x > W + step:
+                continue
+            d.arc([cx - step // 2, y - rad, cx + step // 2, y + rad], 200, 340,
+                  fill=rgba(p["scale"], 34), width=1)
+    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(0.5)))
+
+
+def draw_petals(img, p):
+    """樱花瓣：五片式花形，用水滴多边形而不是椭圆。
+    椭圆加旋转在 240px 上只会读成一堆粉方块；花形靠「尖端 + 圆弧」才能被认出来。
+    整层画完统一旋转，省得逐片算旋转矩阵；只放边缘，中央留给脸。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    rnd = random.Random(8)
+    pts = [(22, 52), (206, 74), (36, 196), (198, 178), (150, 34), (78, 214), (222, 138), (12, 128)]
+    for cx, cy in pts:
+        s = rnd.uniform(0.8, 1.25)
+        a = rnd.randint(110, 170)
+        tip_ang = rnd.uniform(0, math.tau)
+        shape = []
+        for k in range(14):
+            ang = math.tau * k / 14
+            # 一个方向拉长成水滴，另一侧收窄：r = s * (0.55 + 0.45*cos) 就是花瓣的经典轮廓
+            r = s * (5.2 + 3.4 * math.cos(ang - tip_ang))
+            shape.append((cx + r * math.cos(ang), cy + r * 0.72 * math.sin(ang)))
+        d.polygon(shape, fill=rgba(p["petal"], a))
+        d.line([(cx, cy), (cx + 5.4 * s * math.cos(tip_ang), cy + 3.9 * s * math.sin(tip_ang))],
+               fill=rgba((255, 255, 255), a // 3), width=1)
+    layer = layer.filter(ImageFilter.GaussianBlur(0.35)).rotate(-14, resample=Image.BICUBIC)
+    return add_layer(img, layer)
+
+
+def draw_fish(img, p):
+    """远处两尾小金鱼：身体一个扁椭圆、尾巴两条扫开的弧，尺寸压到十几像素。
+    它们在画面里只担「这是金鱼的地盘」，不是主体——所以半透明、避开中央。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    for cx, cy, s, a, flip in (
+        (46, 122, 1.35, 130, 0),
+        (196, 104, 1.0, 100, 1),
+    ):
+        dirx = -1 if flip else 1
+        d.ellipse([cx - 7 * s, cy - 4 * s, cx + 7 * s, cy + 4 * s], fill=rgba(p["fish"], a))
+        d.polygon([
+            (cx - 6 * s * dirx, cy),
+            (cx - 15 * s * dirx, cy - 6 * s),
+            (cx - 12 * s * dirx, cy),
+            (cx - 15 * s * dirx, cy + 6 * s),
+        ], fill=rgba(p["fish"], a * 0.75))
+        # 眼睛和背鳍：两笔就够，多了在 7px 的鱼身上全是噪点
+        d.point((cx + 3 * s * dirx, cy - 1 * s), fill=rgba((40, 20, 26), min(255, a + 80)))
+        d.line([(cx - 2 * s * dirx, cy - 4 * s), (cx + 2 * s * dirx, cy - 6 * s)],
+               fill=rgba(p["veil_core"], a * 0.8), width=1)
+    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(0.4)))
+
+
+def draw_halo(img, p):
+    """角色背后的暖光：把脸托在光里，跟她金鱼橙的尾纱同色系。
+    刻意不画硬边框——硬圆环会把 Q 版脸压成仪表盘。"""
+    img = add_layer(img, radial_glow(EMOJI_CX, EMOJI_CY + 4, 92, p["halo"], 74, 1.9))
+    # 两圈不完整的涟漪弧：比整圈硬环柔和，也不会把脸框成仪表盘
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    for r, a, w in ((76, 46, 1), (90, 30, 1)):
+        d.arc([EMOJI_CX - r, EMOJI_CY - r + 4, EMOJI_CX + r, EMOJI_CY + r + 4], 186, 354,
+              fill=rgba(p["halo2"], a), width=w)
+    img = add_layer(img, layer.filter(ImageFilter.GaussianBlur(1.6)))
+    return img
+
+
+def draw_weeds(img, p):
+    """水底水草：几根摇摆的细曲线，从底边往上长。
+    有了它画面才有「底」，不然全屏均匀水色在 240px 上读起来像没画完。"""
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    rnd = random.Random(613)
+    for base_x in (10, 26, 44, 196, 214, 230):
+        h = rnd.randint(26, 54)
+        sway = rnd.choice([-1, 1]) * rnd.uniform(4, 11)
+        prev = None
+        for s in range(h):
+            t = s / h
+            x = base_x + sway * math.sin(t * 2.4) * t
+            y = H - 2 - s
+            if prev is not None:
+                d.line([prev, (x, y)], fill=rgba(p["weed"], int(120 * (1 - t * 0.55))), width=1)
+            prev = (x, y)
+    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(0.7)))
+
+
+def draw_statusbar(img, p):
+    layer = new_layer()
+    d = ImageDraw.Draw(layer)
+    d.rectangle([0, 0, W, STATUS_H], fill=rgba(p["status"], 236))
+    d.line([(0, STATUS_H), (W, STATUS_H)], fill=rgba(p["status_line"], 120), width=1)
+    d.line([(0, STATUS_H + 1), (W, STATUS_H + 1)], fill=rgba(p["status_line"], 40), width=1)
+    return add_layer(img, layer)
 
 
 def add_vignette(img, strength):
@@ -151,214 +380,19 @@ def add_grain(img, amount, seed=7):
     return img
 
 
-def neon_ambient(img, p):
-    """两侧逆光：左下一团品红霓虹、右上一团青霓虹，像站在招牌林立的巷口。"""
-    img = add_layer(img, radial_glow(16, 178, 154, p["halo2"], 112, 2.0))
-    img = add_layer(img, radial_glow(226, 54, 142, p["halo"], 68, 2.4))
-    img = add_layer(img, radial_glow(EMOJI_CX, EMOJI_CY + 6, 100, p["ring_mid"], 48, 2.4))
-    return img
-
-
-def draw_skyline(img, p):
-    """两侧高楼剪影 + 稀疏霓虹窗：中间留空给角色，只做场景深度，不抢视觉。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rnd = random.Random(2024)
-    # (左边界, 顶边, 宽度) —— 越靠外越高，把视线往中间压
-    blocks = [
-        (-6, 118, 42), (28, 142, 34), (52, 160, 30),
-        (188, 150, 32), (214, 128, 40), (232, 108, 26),
-    ]
-    for x0, y0, w in blocks:
-        d.rectangle([x0, y0, x0 + w, HORIZON_Y], fill=rgba(p["city"], 236))
-        d.line([(x0, y0), (x0 + w, y0)], fill=rgba(p["city_edge"], 235), width=1)
-        d.line([(x0, y0), (x0, y0 + 8)], fill=rgba(p["city_edge"], 130), width=1)
-        for _ in range(rnd.randint(10, 18)):
-            wx = rnd.randint(x0 + 3, x0 + w - 5)
-            wy = rnd.randint(y0 + 5, HORIZON_Y - 6)
-            col = p["win_c"] if rnd.random() < 0.62 else p["win_p"]
-            a = rnd.choice([120, 170, 215])
-            d.point((wx, wy), fill=rgba(col, a))
-            if rnd.random() < 0.4:
-                d.point((wx + 1, wy), fill=rgba(col, a // 2))
-    return add_layer(img, layer)
-
-
-def draw_horizon(img, p):
-    """霓虹地平线 + 湿地面竖条反光：整张图的「地面」靠这条光带立住。"""
-    glow = radial_glow(W // 2, HORIZON_Y, 190, p["horizon"], 58, 2.0, squash=0.16)
-    img = add_layer(img, glow)
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    d.line([(0, HORIZON_Y), (W, HORIZON_Y)], fill=rgba(p["horizon"], 210), width=1)
-    d.line([(0, HORIZON_Y + 1), (W, HORIZON_Y + 1)], fill=rgba(p["horizon"], 90), width=1)
-    rnd = random.Random(99)
-    for _ in range(26):
-        x = rnd.randrange(W)
-        h = rnd.randint(4, 22)
-        a = rnd.randint(16, 46)
-        col = p["reflect"] if rnd.random() < 0.55 else p["streak"]
-        d.line([(x, HORIZON_Y + 2), (x, HORIZON_Y + 2 + h)], fill=rgba(col, a), width=1)
-    return add_layer(img, layer)
-
-
-def draw_halo(img, p):
-    """角色背后的霓虹光环：三圈同心软光，中心最亮往外散，把脸托在光里。
-    刻意不画硬边框——硬圆环会把 Q 版脸压成仪表盘。"""
-    img = add_layer(img, radial_glow(EMOJI_CX, EMOJI_CY, 92, p["ring_mid"], 62, 1.7))
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    for r, col, a, wd in (
-        (66, p["ring_mid"], 165, 2),
-        (82, p["ring_out"], 96, 1),
-    ):
-        d.ellipse([EMOJI_CX - r, EMOJI_CY - r, EMOJI_CX + r, EMOJI_CY + r],
-                  outline=rgba(col, a), width=wd)
-    # 环上开四道缺口，像没接完的霓虹灯管，比整圈更活
-    for ang in (18, 104, 197, 286):
-        a0 = math.radians(ang)
-        for rr in (66, 82):
-            cx = EMOJI_CX + rr * math.cos(a0)
-            cy = EMOJI_CY + rr * math.sin(a0)
-            d.ellipse([cx - 3.2, cy - 3.2, cx + 3.2, cy + 3.2], fill=(0, 0, 0, 0))
-    layer = layer.filter(ImageFilter.GaussianBlur(0.8))
-    return add_layer(img, layer)
-
-
-def draw_stars(img, p):
-    """夜空星点：上半个屏幕撒一点冷星，给天空一层「远处有东西」的深度。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rnd = random.Random(31)
-    for _ in range(46):
-        x = rnd.randrange(W)
-        y = rnd.randint(STATUS_H + 2, 150)
-        a = rnd.choice([40, 70, 110, 150])
-        d.point((x, y), fill=rgba(p["ring_in"], a))
-        if rnd.random() < 0.16:
-            d.line([(x - 1, y), (x + 1, y)], fill=rgba(p["ring_in"], max(0, a - 50)), width=1)
-    return add_layer(img, layer)
-
-
-def draw_bokeh(img, p):
-    """散景光斑：大小不一的柔圆光点，像镜头外失焦的霓虹。
-    代替之前那排横向亮条——规整的短横条读起来像仪表刻度，
-    跟萌系脸放一起就是「乱入」；失焦光斑没有方向感，只给氛围。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rnd = random.Random(77)
-    for _ in range(18):
-        cx = rnd.choice([rnd.randint(0, 52), rnd.randint(188, W)])
-        cy = rnd.randint(STATUS_H + 4, 186)
-        r = rnd.randint(3, 9)
-        col = p["streak"] if rnd.random() < 0.5 else p["streak2"]
-        a = rnd.randint(26, 62)
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgba(col, a))
-        d.ellipse([cx - r * 0.45, cy - r * 0.45, cx + r * 0.45, cy + r * 0.45], fill=rgba(col, a * 2))
-    # 贴近角色背后的两团大光斑：给脸添一层环境光，不是硬框
-    d.ellipse([EMOJI_CX - 104, EMOJI_CY - 52, EMOJI_CX - 40, EMOJI_CY + 12], fill=rgba(p["streak"], 22))
-    d.ellipse([EMOJI_CX + 34, EMOJI_CY - 40, EMOJI_CX + 106, EMOJI_CY + 34], fill=rgba(p["streak2"], 20))
-    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(2.4)))
-
-
-def _tube(dst, x0, y0, x1, y1, color, core, peak, blur_r, half_w):
-    """单根霓虹灯管：模糊层给环境光晕，清晰层给灯管本身。
-    分段必须首尾相接（每段从上一段的落点画起），否则逐点竖线会变成一排骨排。"""
-    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dh = ImageDraw.Draw(halo)
-    sharp = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ds = ImageDraw.Draw(sharp)
-    n = 150
-    px_, py_ = x0, y0
-    for s in range(1, n + 1):
-        t = s / n
-        x = x0 + (x1 - x0) * t
-        y = y0 + (y1 - y0) * t
-        fade = math.sin(math.pi * (t - 0.5 / n)) ** 0.5
-        a = int(peak * fade)
-        if a > 0:
-            dh.line([(px_, py_), (x, y)], fill=rgba(color, a // 3), width=half_w * 9)
-            ds.line([(px_, py_), (x, y)], fill=rgba(color, a), width=half_w * 2)
-        px_, py_ = x, y
-    # 白芯只占中段，一条连贯的 line；端点不画芯，收尾才干净
-    t0, t1 = 0.18, 0.82
-    ds.line([(x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0),
-             (x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1)],
-            fill=rgba(core, 170), width=1)
-    out = add_layer(dst, halo.filter(ImageFilter.GaussianBlur(blur_r)))
-    return add_layer(out, sharp)
-
-
-def draw_streaks(img, p):
-    """角色下方的交叉灯管：一品格红主光、一条青弱光。
-    刻意压到 y>=150——光带从脸上横穿会把 Q 版脸切成两半，
-    放在下巴以下就变成「擂台的斜切灯光」，动势还在，脸不被切。"""
-    img = _tube(img, 6, 158, 234, 196, p["streak"], (255, 240, 252), 205, 2.6, 1)
-    img = _tube(img, 234, 150, 10, 190, p["streak2"], (222, 252, 255), 165, 2.0, 1)
-    return img
-
-
-def draw_rain(img, p):
-    """斜雨丝：赛博朋克夜景的标配，也让画面有「正在下雨」的运动暗示。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    rnd = random.Random(512)
-    for _ in range(58):
-        x = rnd.randrange(W + 30)
-        y = rnd.randint(STATUS_H, H)
-        ln = rnd.randint(5, 13)
-        a = rnd.randint(18, p["rain_alpha"] + 20)
-        d.line([(x, y), (x - ln * 0.32, y + ln)], fill=rgba(p["rain"], a), width=1)
-    return add_layer(img, layer.filter(ImageFilter.GaussianBlur(0.4)))
-
-
-def draw_scanlines(img, p):
-    """CRT 扫描线：每 3 行压暗一档，屏幕质感全靠它。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    for y in range(STATUS_H, H, 3):
-        d.line([(0, y), (W, y)], fill=(0, 0, 0, p["scan_alpha"]), width=1)
-    return add_layer(img, layer)
-
-
-def draw_glitch(img, p):
-    """只留一点横向色散：青/品红错开 1px 的短线，信号不稳的感觉。
-    之前那几条横向亮块在 240px 屏上读起来像没清干净的 UI 残留，已删。"""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    for dy, x0, x1, col, a in (
-        (0, 118, 152, p["streak"], 58),
-        (1, 116, 150, p["streak2"], 58),
-        (0, 34, 62, p["streak2"], 40),
-        (1, 32, 60, p["streak"], 40),
-    ):
-        d.line([(x0, 205 + dy), (x1, 205 + dy)], fill=rgba(col, a), width=1)
-    return add_layer(img, layer)
-
-
-def draw_statusbar(img, p):
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    d.rectangle([0, 0, W, STATUS_H], fill=rgba(p["status"], 255))
-    d.line([(0, STATUS_H), (W, STATUS_H)], fill=rgba(p["status_line"], 130), width=1)
-    d.line([(0, STATUS_H + 1), (W, STATUS_H + 1)], fill=rgba(p["status_line"], 44), width=1)
-    return add_layer(img, layer)
-
-
 def compose(p):
-    img = vertical_gradient(p["top"], p["bottom"])
-    img = draw_stars(img, p)
-    img = neon_ambient(img, p)
-    img = draw_bokeh(img, p)
-    img = draw_skyline(img, p)
-    img = draw_horizon(img, p)
+    img = water_gradient(p)
+    img = draw_shafts(img, p)
+    img = draw_caustics(img, p)
+    img = draw_scales(img, p)
+    img = draw_fish(img, p)
     img = draw_halo(img, p)
-    img = draw_streaks(img, p)
-    img = draw_rain(img, p)
-    img = draw_glitch(img, p)
+    img = draw_tails(img, p)
+    img = draw_bubbles(img, p)
+    img = draw_petals(img, p)
+    img = draw_weeds(img, p)
     img = add_vignette(img, p["vignette"])
     img = add_grain(img, p["grain"])
-    img = draw_scanlines(img, p)
     img = draw_statusbar(img, p)
     return img
 
@@ -409,7 +443,7 @@ def main():
     with open(H_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(
             "#ifndef BG_ASSETS_H\n#define BG_ASSETS_H\n\n#include <lvgl.h>\n\n"
-            "// 待机背景底图：暗色 / 亮色各一张，240x240 RGB565\n"
+            "// 金鱼娘待机背景底图：dark（夜水槽）/ light（樱花水）各一张，240x240 RGB565\n"
             "extern const lv_image_dsc_t bg_dark;\nextern const lv_image_dsc_t bg_light;\n\n"
             "#endif\n"
         )
