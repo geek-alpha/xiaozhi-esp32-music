@@ -1,7 +1,7 @@
 {
   "firmware": {
-    "version": "2.0.32",
-    "url": "https://gh-proxy.com/https://github.com/geek-alpha/xiaozhi-esp32-music/releases/download/v2.0.32/xiaozhi-music-v2.0.32-app-ota.bin",
+    "version": "2.0.38",
+    "url": "https://gh-proxy.com/https://github.com/geek-alpha/xiaozhi-esp32-music/releases/download/v2.0.38/xiaozhi-music-v2.0.38-app-ota.bin",
     "force": 0
   }
 }
