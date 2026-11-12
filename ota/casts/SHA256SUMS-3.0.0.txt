@@ -1,0 +1,12 @@
+018b886bfeea034f52c107e14bf96653b169a85587f7d2447fad9a56b32f5157  xiaozhi-music-v3.0.0-base-full.bin
+c2c1c16aa4e9da4708167db53d752bced372ea1de8f59a995a401d02ad9f8fdd  assets-base.bin
+56521e6aa9544ac48853602d80d8eff5b1663bb0e3b0655a3f1ad8a988ba6b9c  xiaozhi-music-v3.0.0-hoop-full.bin
+4a957b82cfad62e3b5af07f675eba3798aa6241d759087798e33443a38128c88  assets-hoop.bin
+939cb4f234d6e0cb29e4210e478088163b8ae9df388318e0b030b6da5f37aad6  xiaozhi-music-v3.0.0-painter-full.bin
+2a6b2c85346f9a550c4be4e5900ee4e842c64b1879cd417762b156992878e96d  assets-painter.bin
+ca12c5fed892c8d65c3186b38ebca03a8e6ac99bf678cb75ac182a4d052cf20f  xiaozhi-music-v3.0.0-phone-full.bin
+af340a6b413a18634d660bc4cd52a35641c1f0f1c33c91782194da4008e3678d  assets-phone.bin
+46862ca1c327318f5dff376feea643aa58c7b32dc4396970d0108fca73d7ef7d  xiaozhi-music-v3.0.0-apple-full.bin
+cc2d69ef63b5566bea20049f4e934bad3b8f39a67d6b8f9ddef125f119387eff  assets-apple.bin
+64ce8c2703c84cf1c3045b31c72adcda75a3d6710a796577f1aa833a69fe886a  xiaozhi-music-v3.0.0-book-full.bin
+0ccaac835466ee3c332c9d14b49a0d4d7f75eb822f2fb058c7cde5c021c027ae  assets-book.bin

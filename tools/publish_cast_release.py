@@ -92,7 +92,10 @@ def collect(version):
     sums = os.path.join(OUT_DIR, "SHA256SUMS-%s.txt" % version)
     if not os.path.exists(sums):
         raise SystemExit("缺少 %s" % sums)
-    return full + assets + [sums]
+    app = os.path.join(OUT_DIR, "xiaozhi-music-v%s-app-ota.bin" % version)
+    if not os.path.exists(app):
+        raise SystemExit("缺少 %s，先跑 tools/release_cast_ota.py" % app)
+    return full + assets + [app, sums]
 
 
 def ensure_release(tok, tag, text):

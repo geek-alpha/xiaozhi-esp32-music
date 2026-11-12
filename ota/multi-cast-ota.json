@@ -1,0 +1,7 @@
+{
+  "firmware": {
+    "version": "3.0.1",
+    "url": "https://gh-proxy.com/https://github.com/geek-alpha/xiaozhi-esp32-music/releases/download/multi-cast-v3.0.1/xiaozhi-music-v3.0.1-app-ota.bin",
+    "force": 0
+  }
+}

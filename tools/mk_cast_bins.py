@@ -101,6 +101,10 @@ def main(argv):
         sums.append((hashlib.sha256(image).hexdigest(), fname))
         sums.append((hashlib.sha256(blob).hexdigest(), "assets-%s.bin" % key))
 
+    app = os.path.join(OUT_DIR, "xiaozhi-music-v%s-app-ota.bin" % version)
+    if os.path.exists(app):
+        sums.append((hashlib.sha256(io.open(app, "rb").read()).hexdigest(), os.path.basename(app)))
+
     spath = os.path.join(OUT_DIR, "SHA256SUMS-%s.txt" % version)
     with io.open(spath, "w", encoding="utf-8", newline="\n") as f:
         for h, name in sums:
