@@ -1,8 +1,12 @@
 # ESP-IDF Partition Table
-# Name,   Type, SubType, Offset,  Size, Flags
+# Name,   Type, SubType, Offset,   Size, Flags
+# assets 放角色像素，OTA 不碰它：换/加角色只重烧这一个分区，不用整机重刷。
+# app 让出 1M 后仍有 0.8M 余量，assets 装 6 个角色（3.21M）还剩 1.8M。
 nvs,      data, nvs,     0x9000,    0x4000,
 otadata,  data, ota,     0xd000,    0x2000,
 phy_init, data, phy,     0xf000,    0x1000,
 model,    data, spiffs,  0x10000,   0xF0000,
-ota_0,    app,  ota_0,   0x100000,  6M,
-ota_1,    app,  ota_1,   0x700000,  6M,
+ota_0,    app,  ota_0,   0x100000,  5M,
+ota_1,    app,  ota_1,   0x600000,  5M,
+assets,   data, spiffs,  0xB00000,  5M,
+

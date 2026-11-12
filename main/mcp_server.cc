@@ -205,6 +205,13 @@ McpServer::McpServer() {
      }
 
     if (display) {
+        // 分区里存的 key 是英文代号（hoop），用户嘴里说的是名字（星野）。这层映射
+        // 不该让模型去猜，写在这里；新增角色时和 assets 分区一起加
+        static const struct { const char* key; const char* alias; } kCastNames[] = {
+            {"base", "大肥鱼"}, {"hoop", "星野"}, {"painter", "紫苑"},
+            {"phone", "灼"},    {"apple", "青苹"}, {"book", "墨言"},
+        };
+
         AddTool("self.appearance.set_hair_color",
             "换屏幕上那个头像的头发颜色。用户说「头发换成粉色」「染成金色」时用它。\n"
             "用户说「变回原来的颜色」「不用染了」「恢复原色」时，`color` 传 `原色`。\n"
@@ -231,6 +238,83 @@ McpServer::McpServer() {
                 char buf[80];
                 snprintf(buf, sizeof(buf), "{\"success\": true, \"message\": \"头发已换成 #%06X\"}", (unsigned)rgb);
                 return std::string(buf);
+            });
+
+        AddTool("self.appearance.list_characters",
+            "列出这台设备能换的几个角色形象。用户问「都有哪些角色」「能换成谁」「现在是哪个」时用它。\n"
+            "返回 characters 里是 [{key, name}]，current 是现在屏幕上那个的 key。",
+            PropertyList(),
+            [display](const PropertyList&) -> ReturnValue {
+                std::string keys[12];
+                int n = display->GetCharacters(keys, 12);
+                std::string out = "{\"success\": true, \"characters\": [";
+                for (int i = 0; i < n; i++) {
+                    const char* alias = nullptr;
+                    for (const auto& m : kCastNames) {
+                        if (keys[i] == m.key) {
+                            alias = m.alias;
+                            break;
+                        }
+                    }
+                    if (i > 0) {
+                        out += ", ";
+                    }
+                    out += "{\"key\": \"" + keys[i] + "\", \"name\": \"";
+                    out += alias ? alias : keys[i].c_str();
+                    out += "\"}";
+                }
+                out += "], \"current\": \"";
+                const char* cur = display->GetCharacter();
+                out += cur ? cur : "";
+                out += "\"}";
+                return out;
+            });
+
+        AddTool("self.appearance.set_character",
+            "把屏幕上那只角色整个换掉（脸、发型、衣服同时换）。\n"
+            "用户说「换成星野」「让紫苑出来」「换回大肥鱼」时用它。\n"
+            "参数:\n"
+            "  `character`: 角色名或 key，如 大肥鱼/base、星野/hoop、紫苑/painter、灼/phone、青苹/apple、墨言/book。\n"
+            "返回 success=false 说明没这个角色，把 message 里的可用名单告诉用户。",
+            PropertyList({
+                Property("character", kPropertyTypeString)
+            }),
+            [display](const PropertyList& properties) -> ReturnValue {
+                std::string want = properties["character"].value<std::string>();
+                std::string keys[12];
+                int n = display->GetCharacters(keys, 12);
+                std::string key;
+                for (int i = 0; i < n && key.empty(); i++) {
+                    if (want == keys[i]) {
+                        key = keys[i];
+                    }
+                }
+                // 先认名字，再退一步认子串——用户和模型都可能带语气词（「换成星野吧」）
+                for (int pass = 0; pass < 2 && key.empty(); pass++) {
+                    for (int i = 0; i < n && key.empty(); i++) {
+                        for (const auto& m : kCastNames) {
+                            if (keys[i] != m.key) {
+                                continue;
+                            }
+                            bool hit = (pass == 0) ? (want == m.alias)
+                                                   : (want.find(m.alias) != std::string::npos);
+                            if (hit) {
+                                key = keys[i];
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (key.empty()) {
+                    return std::string("{\"success\": false, \"message\": \"没有这个角色，可用：大肥鱼、星野、紫苑、灼、青苹、墨言\"}");
+                }
+                if (!display->SetCharacter(key.c_str())) {
+                    return std::string("{\"success\": false, \"message\": \"切换失败，assets 分区里读不到这个角色\"}");
+                }
+                std::string msg = "{\"success\": true, \"message\": \"画面已换成 ";
+                msg += key;
+                msg += "\"}";
+                return msg;
             });
 
         AddTool("self.screen.set_background_color",

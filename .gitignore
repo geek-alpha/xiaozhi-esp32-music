@@ -26,6 +26,8 @@ queue_live.txt
 verify_out.txt
 reset_log.txt
 *.bak-*
+*.bak_inline*
+build_err*.txt
 _*
 _flash_q.bat
 _emoji_out/

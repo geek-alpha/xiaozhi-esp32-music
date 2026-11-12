@@ -32,6 +32,13 @@ public:
     // 换屏幕底色（整屏背景 + 顶栏/容器），0 = 恢复主题默认。
     // 和 SetAccentColor 分两层：那个是整屏染色，这个是底色本身
     virtual void SetBackgroundColor(uint32_t rgb) {}
+    // 换掉屏幕上这只角色的整个形象（脸/发型/衣服一起换）。key 是 assets 分区里的
+    // cast 名，如 "base" / "hoop"。默认 false：没有角色分区的板子不受影响
+    virtual bool SetCharacter(const char* key) { return false; }
+    // 可用角色 key（每项最多 16 字节，和分区 slot 的存储宽度一致）；返回个数
+    virtual int GetCharacters(std::string* out, int max) { return 0; }
+    // 当前角色 key；不支持或未绑定返回 nullptr
+    virtual const char* GetCharacter() { return nullptr; }
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void SetMusicInfo(const char* song_name);
     virtual void SetIcon(const char* icon);

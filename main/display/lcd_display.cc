@@ -15,6 +15,8 @@
 #include <math.h>
 #include "settings.h"
 #include "emoji_assets.h"
+#include "emoji_geom.h"
+#include "emoji_pack.h"   // emoji_pack_geom()：贴片几何按当前角色取，得有声明
 #include "application.h"
 #include "device_state.h"
 
@@ -29,6 +31,16 @@
 // 竖直慢滚：回顶停 1 秒让人看清再走，滚到底停 1.5 秒再回来
 // 必须用线性路径：ease_in_out 每帧起步速度都是 0，动画一被打断重开就变成走走停停
 static const uint32_t kScrollMsPerPx = 32; // 实机调出来的速度，眼睛跟得上
+
+// 身体/投影几何跟着角色走：大肥鱼的下巴在屏 y=100，其余五个角色都在 127，
+// 全局宏 EMOJI_BODY_* 只能对准一个人，对不准的那几个人脖子会盖到嘴上。
+static inline int BodyOx() { return emoji_pack_geom()->body_ox; }
+static inline int BodyOy() { return emoji_pack_geom()->body_oy; }
+static inline int BodyW() { return emoji_pack_geom()->body_w; }
+static inline int BodyH() { return emoji_pack_geom()->body_h; }
+static inline int ShadowW() { return emoji_pack_geom()->shadow_w; }
+static inline int ShadowH() { return emoji_pack_geom()->shadow_h; }
+static inline int TotalH() { return emoji_pack_geom()->total_h; }
 
 // HUD 起点：小人图形到 EMOJI_TOTAL_H=210，content 只有 216。脸画到 y≈93、脖子 93~130，
 // 身体 130~210。3 行 = 72px 是屏上信息量的最优解，起点定 140 正好给出 72px，
@@ -161,16 +173,16 @@ void LcdDisplay::ApplyAvatarY()
         lv_obj_set_y(emotion_image_, float_y_);
     }
     if (arms_image_ != nullptr) {
-        lv_obj_set_y(arms_image_, EMOJI_BODY_OY + float_y_);
+        lv_obj_set_y(arms_image_, BodyOy() + float_y_);
     }
     if (body_image_ != nullptr) {
-        lv_obj_set_y(body_image_, EMOJI_BODY_OY + float_y_);
+        lv_obj_set_y(body_image_, BodyOy() + float_y_);
     }
     if (body_hair_image_ != nullptr) {
-        lv_obj_set_y(body_hair_image_, EMOJI_BODY_OY + float_y_);
+        lv_obj_set_y(body_hair_image_, BodyOy() + float_y_);
     }
     if (body_hair_shade_image_ != nullptr) {
-        lv_obj_set_y(body_hair_shade_image_, EMOJI_BODY_OY + float_y_);
+        lv_obj_set_y(body_hair_shade_image_, BodyOy() + float_y_);
     }
     // 投影必须跟呼吸走：不跟着动，小人一浮就和自己的影子离婚
     if (shadow_image_ != nullptr) {
@@ -1128,10 +1140,15 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(emotion_label_, FONT_AWESOME_AI_CHIP);
     lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
 
+    // 像素在 assets 分区里，dsc 的 data 要等挂载后才有值。必须赶在任何
+    // lv_image_set_src 之前填好，否则第一帧拿到的是空指针（白框或花屏）
+    emoji_pack_ensure();
+
+
     // 投影：整只小人的模糊剪影垫在最底层。脸长到 162 几平顶满屏之后，
     // 没它小人就是一张贴在科技底上的纸——投影是「浮出屏幕」最便宜的纵深线索
     shadow_image_ = lv_image_create(content_);
-    lv_obj_set_size(shadow_image_, EMOJI_SHADOW_W, EMOJI_SHADOW_H);
+    lv_obj_set_size(shadow_image_, ShadowW(), ShadowH());
     lv_obj_set_style_pad_all(shadow_image_, 0, 0);
     lv_obj_set_style_image_recolor(shadow_image_, lv_color_black(), 0);
     lv_obj_set_style_image_recolor_opa(shadow_image_, LV_OPA_COVER, 0);
@@ -1140,12 +1157,12 @@ void LcdDisplay::SetupUI() {
     // 叠放顺序按创建顺序来：投影 → 手臂 → 身体 → 脸。手臂必须垫在最底下，
     // 臂根才会被躯干盖住，摆到任何角度肩膀处都不会裂出一条缝
     arms_image_ = lv_image_create(content_);
-    lv_obj_set_size(arms_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_size(arms_image_, BodyW(), BodyH());
     lv_obj_set_style_pad_all(arms_image_, 0, 0);
     lv_image_set_src(arms_image_, kArmFrames[0]);
 
     body_image_ = lv_image_create(content_);
-    lv_obj_set_size(body_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_size(body_image_, BodyW(), BodyH());
     lv_obj_set_style_pad_all(body_image_, 0, 0);
     lv_image_set_src(body_image_, &emoji_body);
 
@@ -1153,7 +1170,7 @@ void LcdDisplay::SetupUI() {
     // 放在这里创建 = 压在 body 之上、被后面的 emotion_image_ 盖住，
     // 重叠区（BODY_OY ~ EMOJI_H）依旧以脸为准
     body_hair_image_ = lv_image_create(content_);
-    lv_obj_set_size(body_hair_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_size(body_hair_image_, BodyW(), BodyH());
     lv_obj_set_style_pad_all(body_hair_image_, 0, 0);
     lv_obj_set_style_image_recolor_opa(body_hair_image_, LV_OPA_COVER, 0);
     lv_obj_set_style_image_recolor(body_hair_image_, lv_color_hex(hair_color_), 0);
@@ -1161,7 +1178,7 @@ void LcdDisplay::SetupUI() {
     lv_obj_add_flag(body_hair_image_, LV_OBJ_FLAG_HIDDEN);
 
     body_hair_shade_image_ = lv_image_create(content_);
-    lv_obj_set_size(body_hair_shade_image_, EMOJI_BODY_W, EMOJI_BODY_H);
+    lv_obj_set_size(body_hair_shade_image_, BodyW(), BodyH());
     lv_obj_set_style_pad_all(body_hair_shade_image_, 0, 0);
     lv_obj_set_style_image_recolor_opa(body_hair_shade_image_, LV_OPA_COVER, 0);
     lv_obj_set_style_image_recolor(body_hair_shade_image_, lv_color_hex(hair_color_), 0);
@@ -1334,7 +1351,7 @@ void LcdDisplay::SetupUI() {
 
     // 布局预算打一次：「文字为什么只能显示这么点」这条直接给答案，省得下次再反推
     ESP_LOGI(TAG, "HUD layout: %dx%d, content %d, char 0~%d, hud top %d, weather %d, chat avail %d",
-             (int)LV_HOR_RES, (int)LV_VER_RES, (int)lv_obj_get_content_height(content_), EMOJI_TOTAL_H,
+             (int)LV_HOR_RES, (int)LV_VER_RES, (int)lv_obj_get_content_height(content_), TotalH(),
              kHudTop, (int)wx_line_h, (int)lv_obj_get_content_height(content_) - kHudTop - kHudGap * 2);
 
     /* Status bar */
@@ -1468,7 +1485,7 @@ void LcdDisplay::LayoutContentBlocks() {
     }
     // 身体和手臂共用同一个 ex，只加一个相对偏移：屏幕宽度变了也不会错位
     if (arms_image_ != nullptr) {
-        lv_obj_set_pos(arms_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+        lv_obj_set_pos(arms_image_, ex + BodyOx(), BodyOy());
         // 不在这儿起摆臂动画了：待机的手是静的，轻摆由 BlinkTick 按 7~13s 的
         // 不规则间隔偶发放一次。这里只管把它停在自然垂的那一帧
         if (arm_wave_ms_ == 0) {
@@ -1477,13 +1494,13 @@ void LcdDisplay::LayoutContentBlocks() {
         }
     }
     if (body_image_ != nullptr) {
-        lv_obj_set_pos(body_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+        lv_obj_set_pos(body_image_, ex + BodyOx(), BodyOy());
     }
     if (body_hair_image_ != nullptr) {
-        lv_obj_set_pos(body_hair_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+        lv_obj_set_pos(body_hair_image_, ex + BodyOx(), BodyOy());
     }
     if (body_hair_shade_image_ != nullptr) {
-        lv_obj_set_pos(body_hair_shade_image_, ex + EMOJI_BODY_OX, EMOJI_BODY_OY);
+        lv_obj_set_pos(body_hair_shade_image_, ex + BodyOx(), BodyOy());
     }
     if (emotion_label_ != nullptr) {
         lv_obj_align(emotion_label_, LV_ALIGN_TOP_MID, 0, 0);
@@ -1712,9 +1729,15 @@ void LcdDisplay::SetWeatherText(const char* text) {
 
 void LcdDisplay::SetEmotion(const char* emotion) {
     DisplayLockGuard lock(this);
+    ApplyEmotionAssets(emotion);
+}
+
+void LcdDisplay::ApplyEmotionAssets(const char* emotion) {
     if (emotion_image_ == nullptr) {
         return;
     }
+    // 记下这一张：换角色时 bind 只重填 dsc 指针，要靠它把新角色的同一张表情重贴回来
+    snprintf(cur_emotion_, sizeof(cur_emotion_), "%s", emotion == nullptr ? "neutral" : emotion);
     // 中性 / 倾听都不算情绪：待机时允许状态机把它们换成倾听脸。
     // 其它表情是情绪事件给的，要一直留到下一句，不能被待机顺手抹平
     mood_active_ = !(emotion == nullptr || strcmp(emotion, "neutral") == 0 ||
@@ -1806,6 +1829,77 @@ void LcdDisplay::SetEmotion(const char* emotion) {
              (int)lv_obj_get_x(emotion_image_), (int)lv_obj_get_y(emotion_image_),
              (int)lv_obj_get_content_width(content_));
 }
+
+bool LcdDisplay::SetCharacter(const char* key) {
+    if (key == nullptr || key[0] == '\0') {
+        return false;
+    }
+    if (!emoji_pack_bind(key)) {
+        return false;
+    }
+    DisplayLockGuard lock(this);
+    // bind 是原地改写每张 dsc 的 data，LVGL 手里还是同一批指针，不会自己标脏重绘。
+    // 所以每条 set_src 都得重走一遍：既让对象指向新像素，也顺手把这块标脏
+    if (shadow_image_ != nullptr) lv_image_set_src(shadow_image_, &emoji_shadow);
+    if (arms_image_ != nullptr) lv_image_set_src(arms_image_, kArmFrames[0]);
+    if (body_image_ != nullptr) lv_image_set_src(body_image_, &emoji_body);
+    if (body_hair_image_ != nullptr) lv_image_set_src(body_hair_image_, &emoji_body_hair);
+    if (body_hair_shade_image_ != nullptr) {
+        lv_image_set_src(body_hair_shade_image_, &emoji_body_hair_shade);
+    }
+    if (emotion_image_ != nullptr) lv_image_set_src(emotion_image_, &emoji_neutral);
+    // 脸/嘴/眨眼/头发四层由这里一次换到新角色，并且保持换之前那张表情
+    ApplyEmotionAssets(cur_emotion_);
+    ApplyPatchGeom();
+    ApplyHairTint();
+    ESP_LOGI(TAG, "换角色 -> %s（表情重放 %s）", emoji_pack_current(), cur_emotion_);
+    return true;
+}
+
+// 眨眼/视线/嘴三块贴片的几何跟着角色换。各角色眼位不同（眨眼贴片 x 起点 32~56、
+// 宽 54~78，视线贴片 x 起点 38~60），不重设就会贴在旧角色的眼位上——
+// 表现出来就是「一眨眼糊在脸中间」「眼神歪到腮上」。
+void LcdDisplay::ApplyPatchGeom() {
+    const emoji_geom_t* g = emoji_pack_geom();
+    if (blink_image_ != nullptr) {
+        lv_obj_set_size(blink_image_, g->blink_w, g->blink_h);
+        lv_obj_set_pos(blink_image_, g->blink_ox, g->blink_oy);
+    }
+    if (blink_hair_image_ != nullptr) {
+        lv_obj_set_size(blink_hair_image_, g->blink_w, g->blink_h);
+    }
+    if (gaze_image_ != nullptr) {
+        lv_obj_set_pos(gaze_image_, g->gaze_ox, g->gaze_oy);
+    }
+    if (mouth_image_ != nullptr) {
+        lv_obj_set_size(mouth_image_, g->mouth_w, g->mouth_h);
+        lv_obj_set_pos(mouth_image_, g->mouth_ox, g->mouth_oy);
+    }
+}
+
+int LcdDisplay::GetCharacters(std::string* out, int max) {
+    if (out == nullptr || max <= 0) {
+        return 0;
+    }
+    constexpr int kMaxCasts = 12;
+    char buf[16 * kMaxCasts];
+    int n = emoji_pack_casts(buf, kMaxCasts);
+    if (n <= 0) {
+        return 0;
+    }
+    if (n > max) {
+        n = max;
+    }
+    for (int i = 0; i < n; i++) {
+        out[i].assign(buf + i * 16, strnlen(buf + i * 16, 16));
+    }
+    return n;
+}
+
+const char* LcdDisplay::GetCharacter() {
+    return emoji_pack_current();
+}
+
 
 void LcdDisplay::ApplyHairTint() {
     bool on = hair_color_ != 0;
@@ -2357,7 +2451,10 @@ void LcdDisplay::StartBlink(int32_t depth)
     blink_depth_ = depth;
     lv_obj_set_user_data(blink_image_, this);
     lv_image_set_src(blink_image_, blink_img_);
-    lv_obj_set_pos(blink_image_, BLINK_OX, BLINK_OY);
+    // 尺寸跟着角色走：眨眼贴片宽 54~78 不等，锁死成大肥鱼的 60 会裁掉两边
+    const emoji_geom_t* bg = emoji_pack_geom();
+    lv_obj_set_size(blink_image_, bg->blink_w, bg->blink_h);
+    lv_obj_set_pos(blink_image_, bg->blink_ox, bg->blink_oy);
     lv_obj_set_height(blink_image_, 0);
     RaiseHairLayers();
     blink_active_ = true;
@@ -2409,7 +2506,8 @@ void LcdDisplay::BlinkTick() {
                 mouth_open_ = !mouth_open_;
             }
             if (mouth_open_) {
-                lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
+                const emoji_geom_t* gm = emoji_pack_geom();
+                lv_obj_set_pos(mouth_image_, gm->mouth_ox, gm->mouth_oy);
                 lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
                 RaiseHairLayers();
             } else {
@@ -2505,7 +2603,9 @@ void LcdDisplay::BlinkTick() {
             static bool blink_logged = false;
             if (!blink_logged) {
                 blink_logged = true;
-                ESP_LOGI(TAG, "Blink started: src=%p pos=%d,%d", (void*)blink_img_, BLINK_OX, BLINK_OY);
+                const emoji_geom_t* blog = emoji_pack_geom();
+                ESP_LOGI(TAG, "Blink started: src=%p pos=%d,%d", (void*)blink_img_, (int)blog->blink_ox,
+                         (int)blog->blink_oy);
             }
         }
     }
@@ -2549,7 +2649,8 @@ void LcdDisplay::ListenAnimTick()
                 gaze_idx_ = (int8_t)idx;
                 gaze_hold_ = kGazeHoldMinTicks + esp_random() % kGazeHoldSpanTicks;
                 lv_image_set_src(gaze_image_, kGazeFrames[idx]);
-                lv_obj_set_pos(gaze_image_, GAZE_OX, GAZE_OY);
+                const emoji_geom_t* gg = emoji_pack_geom();
+                lv_obj_set_pos(gaze_image_, gg->gaze_ox, gg->gaze_oy);
                 if (!blink_active_) {
                     lv_obj_clear_flag(gaze_image_, LV_OBJ_FLAG_HIDDEN);
                     gaze_blink_hide_ = false;
@@ -2559,8 +2660,8 @@ void LcdDisplay::ListenAnimTick()
                 static int gaze_logged = 0;
                 if (gaze_logged < 3) {
                     ++gaze_logged;
-                    ESP_LOGI(TAG, "Listen gaze: frame %d %dx%d at %d,%d", idx, (int)GAZE_W,
-                             (int)GAZE_H, (int)GAZE_OX, (int)GAZE_OY);
+                    ESP_LOGI(TAG, "Listen gaze: frame %d %dx%d at %d,%d", idx, (int)gg->gaze_w,
+                             (int)gg->gaze_h, (int)gg->gaze_ox, (int)gg->gaze_oy);
                 }
             }
         } else {
@@ -2578,15 +2679,16 @@ void LcdDisplay::ListenAnimTick()
         } else if (listen_mouth_wait_ == 0) {
             listen_mouth_wait_ = kListenMouthMinTicks + esp_random() % kListenMouthSpanTicks;
         } else if (--listen_mouth_wait_ == 0) {
-            lv_obj_set_pos(mouth_image_, MOUTH_OX, MOUTH_OY);
+            const emoji_geom_t* gm = emoji_pack_geom();
+            lv_obj_set_pos(mouth_image_, gm->mouth_ox, gm->mouth_oy);
             lv_obj_clear_flag(mouth_image_, LV_OBJ_FLAG_HIDDEN);
             RaiseHairLayers();
             listen_mouth_hold_ = kListenMouthHoldMin + esp_random() % kListenMouthHoldSpan;
             static int mouth_logged = 0;
             if (mouth_logged < 2) {
                 ++mouth_logged;
-                ESP_LOGI(TAG, "Listen nod-mouth: patched %dx%d at %d,%d", (int)MOUTH_W,
-                         (int)MOUTH_H, (int)MOUTH_OX, (int)MOUTH_OY);
+                ESP_LOGI(TAG, "Listen nod-mouth: patched %dx%d at %d,%d", (int)gm->mouth_w,
+                         (int)gm->mouth_h, (int)gm->mouth_ox, (int)gm->mouth_oy);
             }
         }
     }

@@ -138,6 +138,13 @@ protected:
     void ListenAnimTick();
     void ClearListenAnim();
     void LayoutContentBlocks();
+    // 当前这张脸的格式名。换角色时 bind 只原地重填 dsc 指针、不重绘，
+    // 得靠这个名字把新角色的同一张表情重新贴上去
+    char cur_emotion_[24] = "neutral";
+    // SetEmotion 的无锁版本：换角色要在同一把锁里连底图/身体一起重设
+    void ApplyEmotionAssets(const char* emotion);
+    // 贴片几何（眨眼/视线/嘴）随角色重设，无锁，调用方已持锁
+    void ApplyPatchGeom();
 
     DisplayFonts fonts_;
     ThemeColors current_theme_;
@@ -217,6 +224,9 @@ public:
     void ApplySceneTint(uint32_t rgb, int strength);
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetHairColor(uint32_t rgb) override;
+    virtual bool SetCharacter(const char* key) override;
+    virtual int GetCharacters(std::string* out, int max) override;
+    virtual const char* GetCharacter() override;
     virtual void SetAccentColor(uint32_t rgb, int strength = -1) override;
     virtual void SetBackgroundColor(uint32_t rgb) override;
     virtual void SetIcon(const char* icon) override;

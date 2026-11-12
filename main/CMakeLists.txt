@@ -20,6 +20,8 @@ set(SOURCES "alarm.cc"
             "display/bg_schedule.cc"
             "display/bg_assets.c"
             "display/emoji_assets.c"
+            "display/emoji_pack.c"
+            "display/emoji_geom.c"
             "display/oled_display.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
@@ -371,3 +373,31 @@ spiffs_create_partition_assets(
     IMPORT_INC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}
 )
 endif()
+
+# 角色像素打进 assets 分区：构建时生成 assets.bin，并登记进 idf.py flash 的烧录清单。
+# 早先靠手动跑 tools/mk_assets_bin.py，一旦忘记补烧这一块，屏上就没有像素。
+idf_build_get_property(python PYTHON)
+set(EMOJI_SLOT_DIR "${CMAKE_SOURCE_DIR}/_emoji_out")
+set(EMOJI_ASSETS_BIN "${CMAKE_BINARY_DIR}/assets.bin")
+
+set(EMOJI_SLOTS "")
+foreach(cast_name base hoop painter phone apple book)
+    if(cast_name STREQUAL "base")
+        list(APPEND EMOJI_SLOTS "${EMOJI_SLOT_DIR}/_base/_pack/_base.slot")
+    else()
+        list(APPEND EMOJI_SLOTS "${EMOJI_SLOT_DIR}/${cast_name}/_pack/${cast_name}.slot")
+    endif()
+endforeach()
+
+add_custom_command(
+    OUTPUT "${EMOJI_ASSETS_BIN}"
+    COMMAND ${python} "${CMAKE_SOURCE_DIR}/tools/mk_assets_bin.py" "${EMOJI_ASSETS_BIN}"
+    DEPENDS ${EMOJI_SLOTS}
+            "${CMAKE_SOURCE_DIR}/tools/mk_assets_bin.py"
+            "${CMAKE_SOURCE_DIR}/tools/_pack_assets.py"
+    COMMENT "Packing emoji slots -> assets.bin"
+    VERBATIM)
+
+add_custom_target(emoji_assets_bin ALL DEPENDS "${EMOJI_ASSETS_BIN}")
+esptool_py_flash_to_partition(flash "assets" "${EMOJI_ASSETS_BIN}")
+add_dependencies(flash emoji_assets_bin)
