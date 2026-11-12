@@ -46,15 +46,43 @@ def main() -> int:
     digest = hashlib.sha256(open(build_bin, "rb").read()).hexdigest()[:8]
 
     tag = "multi-cast-v%s" % version
+
     manifest = {"firmware": {"version": version,
                              "url": "%s/%s/%s" % (RELEASE_BASE, tag, name),
                              "force": 0}}
     io.open(MANIFEST, "w", encoding="utf-8", newline="\n").write(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    fixed = refresh_sums(version, name)
     print("版本 %s -> %s (sha256[:8]=%s, %d 字节)" % (version, dst, digest, os.path.getsize(dst)))
     print("清单 %s（设备只从 %s 分支拉它）" % (MANIFEST, BRANCH))
-    print("发布资产名 %s（release tag %s）" % (name, tag))
+    print("发布资产名 %s（release tag %s，SHA256SUMS 已%s）"
+          % (name, tag, "校正" if fixed else "无对应行可校正"))
     return 0
+
+
+def refresh_sums(version, name):
+    """把 app-ota 那份 sha256 校正进 SHA256SUMS。
+
+    这一步不能省：mk_cast_bins 写 SHA256SUMS 的时候 app-ota 还是上一版的，
+    本脚本随后才重新生成它，于是清单里那行校验值是旧的——对着 SHA 核验会永远失败。
+    全值就地重算：清单里其余行都是 64 位，混进一个 8 位短 hash 会让 sha256sum -c 判格式错。
+    """
+    path = os.path.join(OUT_DIR, "SHA256SUMS-%s.txt" % version)
+    if not os.path.exists(path):
+        return False
+    full = hashlib.sha256(open(os.path.join(OUT_DIR, name), "rb").read()).hexdigest()
+    lines = io.open(path, encoding="utf-8").read().splitlines()
+    out, hit = [], False
+    for ln in lines:
+        if ln.endswith("  " + name):
+            out.append("%s  %s" % (full, name))
+            hit = True
+        else:
+            out.append(ln)
+    if not hit:
+        out.append("%s  %s" % (full, name))
+    io.open(path, "w", encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
+    return hit
 
 
 if __name__ == "__main__":

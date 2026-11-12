@@ -1008,7 +1008,8 @@ def _clip_el(d, cx, cy, rx, ry, clip, fill):
         d.line([(xa, y), (xb, y)], fill=fill)
 
 
-def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0, scale=1.0):
+def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0, scale=1.0,
+        hl=1.0, full_iris=False):
     pair = _eye_pair(cx)
     # 左右眼由调用点写死的 88/152 判定：cx 下一行就被掰成角色眼位，
     # 拿掰完的值跟 EYE_CX 比，角色左眼坐标落在 88 右边时睫毛会朝内长
@@ -1042,8 +1043,15 @@ def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0, sca
         # 而大眼 Q 版的辨识点恰好是那个立起来的竖瞳。
         # 横向留 0.20 是 look 的平移余量（最大 ±6 逻辑 ≈ 0.36rx），再满就露白角。
         # 比例本身可调：男性角色虹膜不顶满眼白，读起来才是「看人」不是「睁圆眼」。
-        ixr = rx * FACE["iris_w"]
-        iyr = ry2 * FACE["iris_h"]
+        if full_iris:
+            # 眼皮压低后眼白变扁，再按 iris_w=0.78 缩虹膜，横向就露出两条宽眼白，
+            # 屏上读成「白眼球 + 中间一根竖瞳」。原画那双眼是虹膜横着顶满、上下被
+            # 眼睑裁出来，所以这里横向给到超出，多出来的由 clip 裁掉。
+            ixr = rx * 1.08
+            iyr = ry2 * 1.06
+        else:
+            ixr = rx * FACE["iris_w"]
+            iyr = ry2 * FACE["iris_h"]
         icx, icy = cx + look[0], cy2 + look[1]
         # 眼白椭圆就是虹膜的裁剪框：虹膜/瞳孔/高光一律裁在里面。
         # 只靠缩小虹膜留余量治不住 look——抬头 11 逻辑就把整块虹膜顶到眼白外面。
@@ -1064,7 +1072,9 @@ def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0, sca
             el(d, ((icx + 0.6) * S, (icy - 9.3) * S, (icx + 7.5) * S, (icy - 1.9) * S), fill=(255, 118, 148, 255))
             poly(d, [((icx - 7.5) * S, (icy - 4.3) * S), ((icx + 7.5) * S, (icy - 4.3) * S),
                      (icx * S, (icy + 9.3) * S), (icx * S, (icy - 4.3) * S)], (255, 118, 148, 255))
-        hf = FACE["highlight"]
+        # hl 只给 diff 管线的 code 眼用：那支画在原画眼上方，原画的眼睛几乎不反光
+        # （深色虹膜、上睑压低），照搬大肥鱼那两个白点就是贴在脸上的玻璃珠。
+        hf = FACE["highlight"] * hl
         _clip_el(d, (icx - ixr * 0.38 * hf) * S, (icy - iyr * 0.42 * hf) * S,
                  ixr * 0.26 * hf * S, iyr * 0.26 * hf * S, clip, (255, 255, 255, 250))
         _clip_el(d, (icx + ixr * 0.36 * hf) * S, (icy + iyr * 0.50 * hf) * S,
@@ -2127,19 +2137,24 @@ def diff_eye_state(out, ckey, skey, kind, ctx, side):
     if kind.startswith("code"):
         # 原画那双眼是眯着的，情绪强的表情光靠眼睑线动不起来。抹掉原画眼，用 build()
         # 同一套 eye() 画回来：EYE_CX/rx/ry 两边同源，落点和原画眼重叠，不会跳位。
-        # lid 分级是「表情强度」：全睁 1.0 = 惊，0.9 = 惊喜/自信，0.78 = 怒目半睁。
-        # 一律给 1.0 的话，五个角色十张脸全是瞪圆眼珠，比原画那双眼生硬得多。
-        lid = {"code": 1.0, "code_soft": 0.90, "code_half": 0.78}.get(kind, 1.0)
+        # lid 分级是「表情强度」，但上限不再是全睁：原画那双眼是上睑压低、虹膜深色，
+        # 画成 1.0 的圆眼白就是屏上一块贴纸（book/apple 眼径本身是归一的 1.9 倍，尤其明显）。
+        # 现在最高只给 0.86，眼睛竖向露出的高度跟着原画走，情绪靠嘴型和符号担。
+        lid = {"code": 0.86, "code_soft": 0.74, "code_half": 0.64}.get(kind, 0.86)
         # cut=0 才是「整只眼都抹掉」：cut>0 走的是「只抹上面那截、下半瞳孔留着」那支，
         # 下半径会被砍到 0.87 倍，原画眼的下半圈留在那儿，画上新眼就是一圈灰环（book/apple 最明显）
-        _erase_eye_on(out, ckey, skey, 0.0, ex=1.06, flat=True)
+        # ex 给 1.0：抹的椭圆和随后画的眼白椭圆完全重合，抹痕正好被新眼盖住。
+        # flat=False 同理：矢量眼比原画眼矮（lid 压了上睑），上方必然露出一条抹痕，
+        # 平涂那块皮肤比周围亮一档，放大看是一条白带；逐行从两侧取真肤色才接得上。
+        _erase_eye_on(out, ckey, skey, 0.0, ex=1.0, flat=False)
         _, _, srx, _ = _CAST[skey]
         nrm = _CAST[ckey][2]
         # 原画眼半径 × HEAD_K 才是它落在画布上的真实大小；归一眼径只是「五个角色统一」的产物。
         # 抹与画必须同一档尺度：抹 1.25 倍而画 1.0 倍，就是在眼周留一圈磨平的皮肤
         # （屏上读成「眼睛浮在一块白补丁上」）；反过来画大了则变成「贴纸大眼」。
-        scale = (srx * HEAD_K / nrm) * 1.06 if nrm > 0 else 1.06
-        eye(ImageDraw.Draw(out), 88 if side > 0 else 152, _CAST[ckey][1], lid=lid, scale=scale)
+        scale = (srx * HEAD_K / nrm) * 1.0 if nrm > 0 else 1.0
+        eye(ImageDraw.Draw(out), 88 if side > 0 else 152, _CAST[ckey][1], lid=lid,
+            scale=scale, hl=0.55, full_iris=True)
         return
     dy_in, dy_out, bulge, cut = DIFF_LIDS[kind]
     _erase_eye_on(out, ckey, skey, cut)
