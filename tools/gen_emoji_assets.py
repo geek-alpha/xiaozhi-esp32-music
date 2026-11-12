@@ -399,7 +399,7 @@ _CAST = None
 # False = 抠原画五官做差分。抠图路线在 162px 输出上表现很差：原画眼球在立绘里
 # 只有二十来像素，缩到屏上虹膜糊成一坨蓝斑、睫毛和高光全糊没。代码五官自带
 # 眼白/高光/睫毛，同尺寸下是有神的大眼。需要对比时把这里改回 False 即可。
-CAST_CODE_FACE = True
+CAST_CODE_FACE = False
 
 # 五官风格参数：大肥鱼是女性角色，圆眼、虹膜顶满、外眼角带翘睫毛、腮红重；
 # 另外五个是男性角色，照搬那套五官等于「女孩子换了个头发」，用户原话是「眼神
@@ -479,7 +479,10 @@ def apply_cast(cfg):
         return
 
     c = cfg["colors"]
-    BASE_PNG = cfg["head_src"]
+    # 底板用原立绘，不用 *_base.png：那张是「五官填平版」，抹过的地方会留下淡眼影，
+    # open/keep 这类本该等于原图的表情就会露出两道灰影子（星野、墨言最明显）。
+    # 现在只在真要换姿势时才局部抹（_erase_eye_on / _erase_mouth_on），没碰的像素就是原画。
+    BASE_PNG = cfg["head_src"].replace("_base.png", ".png")
     HEAD_CROP = cfg["head_crop"]
     # head_k 优先：它决定「整个头在画布上多大」，不是算出来的
     HEAD_K = cfg.get("head_k") or (240.0 / float(HEAD_CROP[2] - HEAD_CROP[0]))
@@ -1005,7 +1008,7 @@ def _clip_el(d, cx, cy, rx, ry, clip, fill):
         d.line([(xa, y), (xb, y)], fill=fill)
 
 
-def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0):
+def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0, scale=1.0):
     pair = _eye_pair(cx)
     # 左右眼由调用点写死的 88/152 判定：cx 下一行就被掰成角色眼位，
     # 拿掰完的值跟 EYE_CX 比，角色左眼坐标落在 88 右边时睫毛会朝内长
@@ -1018,7 +1021,8 @@ def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0):
         # 角色模式：左右眼各用自己实测的半径。3/4 侧脸近大远小，
         # 两只给同一个 rx 会把远侧眼画成超出脸缘的大眼。
         # ry_mul 是性别风格：男性角色压窄眼高，眼睛才不会圆成少女眼
-        cy, rx, ry = pair[1], pair[2] * big, pair[3] * big * FACE["ry_mul"]
+        # scale 只给 diff 管线的 code 眼用：那边画在原画眼上方，必须跟原画尺度而不是跟归一尺度，否则小一圈、露出抹眼后的白斑
+        cy, rx, ry = pair[1], pair[2] * big * scale, pair[3] * big * FACE["ry_mul"] * scale
     else:
         cy = EYE_CY
         # 20 是「眼宽占脸宽 0.34」算出来的，跟参考图一致；再大就贴到鬁发上了
@@ -1076,7 +1080,7 @@ def eye(d, cx, cy, rx=23, ry=16, lid=1.0, look=(0, 0), heart=False, big=1.0):
                  ((cx + sgn * rx * 0.66) * S, (cy2 - ry2 * 0.94) * S)], LINE)
 
 
-def _skin_fill_ellipse(img, cx, cy, rw, rh_up, rh_dn=None):
+def _skin_fill_ellipse(img, cx, cy, rw, rh_up, rh_dn=None, flat=False):
     """把一块椭圆抹成皮肤。坐标一律画布像素（已乘 S）。
 
     填色从这块区域外圈一圈的亮像素里取中位——那就是它周围真正的皮肤色。
@@ -1106,9 +1110,10 @@ def _skin_fill_ellipse(img, cx, cy, rw, rh_up, rh_dn=None):
             if p[3] > 200 and min(p[0], p[1], p[2]) >= 190:
                 vals.append(p)
     if vals:
-        # 取偏亮的一档：环带里混着原画眼窝的阴影，取中位会把整块填成灰印
+        # 取中位：0.75 分位是为了躲眼窝阴影，但立绘上环带里大半是亮部，取高分位
+        # 抹出来的一整块比脸还白，屏上就是「眼睛浮在白补丁上」
         vals.sort(key=lambda q: q[0] + q[1] + q[2])
-        base = vals[min(len(vals) - 1, int(len(vals) * 0.75))]
+        base = vals[min(len(vals) - 1, int(len(vals) * 0.5))]
 
     def pick(xs, step, y):
         x = xs
@@ -1135,8 +1140,10 @@ def _skin_fill_ellipse(img, cx, cy, rw, rh_up, rh_dn=None):
         rx2 = min(x1, int(round(cx + half)))
         if lx >= rx2:
             continue
-        pl = pick(lx, -1, y)
-        pr = pick(rx2, 1, y)
+        pl = pr = base
+        if not flat:
+            pl = pick(lx, -1, y)
+            pr = pick(rx2, 1, y)
         if pl is None and pr is None:
             if base is None:
                 continue
@@ -1155,43 +1162,58 @@ def _skin_fill_ellipse(img, cx, cy, rw, rh_up, rh_dn=None):
     return done
 
 
-def _erase_cast_eyes(head):
-    """把参考立绘自带的眼睛从头部底图上抹掉。
+def _erase_eye_on(out, ckey, skey, cut=0.0, ex=1.25, flat=False):
+    """在输出画布上抹掉一只原画眼（cut>0 时只抹上面那截，下半瞳孔留着）。
 
-    矢量五官画在底板之上，但「闭眼」时矢量眼不画，原立绘的眼睛就会露出来——
-    眨眼贴片里那些黑点、灰块就是它。抹一遍存进缓存，21 张脸共用同一份。
+    坐标系是输出画布（已乘 S），不是头部图内部——底板现在保留原画五官，
+    只在闭眼/半闭这类真的要改眼睛的表情上局部抹，抹完留下的那块才看不见。
+
+    半径取「归一 rx」与「原画 rx×HEAD_K」的较大者再放 25%：眼距归一让两只眼
+    各挪了几个逻辑像素，单用哪边的半径都会剩一圈没抹到的灰。
     """
-    if _CAST is None:
+    cx, cy, rxn, ryn = _CAST[ckey]
+    _, _, rsx, rsy = _CAST[skey]
+    rw = max(rxn, rsx * HEAD_K) * ex
+    rh = max(ryn, rsy * HEAD_K) * ex
+    px, py = cx * S, cy * S
+    box = (max(0, int(px - rw * S)), max(0, int(py - rh * S)),
+           min(out.width, int(px + rw * S)), min(out.height, int(py + rh * S)))
+    before = out.crop(box).copy()
+    dn = (cut - 0.25) if cut > 0.0 else 1.12
+    # flat 只给 code 眼用：逐行从两端取色在立绘上会两头都采到高光，抹出来一整块比脸白。
+    # 宁可平一点——反正上面马上要盖一只完整的矢量眼
+    _skin_fill_ellipse(out, px, py, rw * S, rh * S, max(0.02, dn) * rh * S, flat=flat)
+    # 抹完把头发还回去：五张立绘里刘海都压到眼上沿，平白抹白一块就是在脸中间
+    # 刷了一道墙。逐色判一次再映射回来，hair 判据是标量 lambda 不能直接喂数组。
+    pred = _CAST.get("hair")
+    if pred is None:
         return
-    hx, hy = HEAD_OX * S, HEAD_OY * S
-    # 必须按原画眼位抹：eye_l/eye_r 是「眼距归一 + 尺寸归一」之后的矢量眼位，
-    # 和立绘里原画眼睛差了四五个逻辑像素（3/4 侧脸的远侧眼尤其明显），
-    # 用归一位去抹，远侧眼的右上角会留一块没抹到的灰。
-    for sx, sy, srx, sry in (_CAST["src_eye_l"], _CAST["src_eye_r"]):
-        cx = (sx - HEAD_CROP[0]) * HEAD_K + HEAD_OX
-        cy = (sy - HEAD_CROP[1]) * HEAD_K + HEAD_OY
-        rx = srx * HEAD_K
-        ry = sry * HEAD_K
-        _skin_fill_ellipse(head, cx * S - hx, cy * S - hy,
-                           rx * S * 1.15, ry * S * 1.15, ry * S * 1.22)
+    a = np.array(before).astype(np.int32)
+    flat = a[..., :3].reshape(-1, 3)
+    uniq, inv = np.unique(flat, axis=0, return_inverse=True)
+    ok = np.array([bool(pred(int(c[0]), int(c[1]), int(c[2]))) for c in uniq])
+    hair = ok[inv].reshape(a.shape[:2]) & (a[..., 3] > 160)
+    if not hair.any():
+        return
+    dst = out.crop(box)
+    dst.paste(before, (0, 0), Image.fromarray((hair * 255).astype(np.uint8), "L"))
+    out.paste(dst, (box[0], box[1]))
 
 
-def _erase_cast_mouth(head):
-    """把参考立绘自带的嘴也从头部底图上抹掉。
+def _erase_mouth_on(out, src_c=None):
+    """在输出画布上抹掉原画嘴（换嘴型前先粉掉，否则两个嘴叠着）。
 
-    矢量嘴的落点由 CHIN_Y_TARGET/MOUTH_DY 定，离原画的嘴差好几个逻辑像素；
-    不抹的话屏上是「两个嘴叠着」——一块洗不掉的淡粉印子，表情一变就更明显
-    （换成 sad 的嘴，底图上那个笑还在）。
+    src_c = 原画嘴的真实中心（由嘴贴片的墨迹重心反算）。配置里的 src_mouth 是手填的，
+    和原画差十几像素时这个椭圆就盖不住旧嘴，屏上留下半个嘴印子。
     """
-    if _CAST is None:
-        return
-    hx, hy = HEAD_OX * S, HEAD_OY * S
     sx, sy, hw = _CAST["src_mouth"]
+    if src_c is not None:
+        sx, sy = src_c
     cx = (sx - HEAD_CROP[0]) * HEAD_K + HEAD_OX
     cy = (sy - HEAD_CROP[1]) * HEAD_K + HEAD_OY
-    rw = hw * 1.35 * HEAD_K
-    _skin_fill_ellipse(head, cx * S - hx, cy * S - hy,
-                       rw * S, hw * 0.75 * HEAD_K * S, hw * 0.95 * HEAD_K * S)
+    rw = hw * 1.45 * HEAD_K
+    _skin_fill_ellipse(out, cx * S, cy * S, rw * S,
+                       hw * 0.85 * HEAD_K * S, hw * 1.05 * HEAD_K * S)
 
 
 def closed_eye(d, cx, cy, kind="happy"):
@@ -1584,8 +1606,9 @@ def head_image():
         h = int(round(im.height * HEAD_K * S))
         _HEAD_CACHE["img"] = im.resize((w, h), Image.LANCZOS)
         _HEAD_CACHE["size"] = (w, h)
-        _erase_cast_eyes(_HEAD_CACHE["img"])
-        _erase_cast_mouth(_HEAD_CACHE["img"])
+        # 底板保留原画五官：抹了再贴回去的那一版，屏上是「一块比周围亮的皮肤
+        # 补丁 + 放大 1.35 倍的眼」，跟原图差得远。现在 open/keep 根本不碰原画，
+        # 只有真要换姿势的眼睛/嘴才在局部抹（见 _erase_eye_on / _erase_mouth_on）。
     return _HEAD_CACHE["img"]
 
 
@@ -1960,10 +1983,6 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #   情绪      = 眼睛姿态 + 嘴型 + 一个符号（怒气纹/汗滴/爱心/Zzz），不画眉毛：
 #               这几张立绘的眉毛本来被头发压着，硬画就是在头发上浮两条线
 DIFF_EYE_EX, DIFF_EYE_EY = 1.26, 1.38      # 抠眼外扩：要含上眼睑粗线和睫毛尖
-# 眼贴片整体放大：原画是「小眼睛可爱风」，眼宽只占脸宽 27%，162 屏上眼睛
-# 只剩 16px——这个尺寸下任何嘴型/眼皮差异都读不出来。Q 版表情本来就是靠眼睛
-# 发力，1.35 倍是从「还是原画那张睑」到「一眼读得出情绪」的拐点。
-DIFF_EYE_ZOOM = 1.35
 DIFF_MOUTH_EX, DIFF_MOUTH_EY = 1.30, 1.55
 DIFF_INK_GAP = 26        # 与皮肤色差超过它才算「墨」
 DIFF_LASH = (58, 40, 46, 255)
@@ -1991,19 +2010,19 @@ CAST_STATES = {
     "laughing": ("closed", "big", ""),
     "funny": ("closed", "big", "tongue"),
     "sad": ("sad", "keep", "sad"),
-    "angry": ("angry", "closed", "angry"),
+    "angry": ("code_half", "closed", "angry"),
     "crying": ("sad", "o", "tear"),
     "loving": ("open", "keep", "love"),
     "embarrassed": ("open", "keep", "shy"),
-    "surprised": ("open", "o", ""),
-    "shocked": ("open", "o", "sad"),
+    "surprised": ("code", "o", ""),
+    "shocked": ("code", "o", "sad"),
     "thinking": ("half", "keep", "ask"),
-    "winking": (("closed", "open"), "keep", ""),
+    "winking": (("closed", "code"), "keep", ""),
     "cool": ("open", "keep", "shade"),
     "relaxed": ("half2", "keep", ""),
     "delicious": ("half3", "big", ""),
     "kissy": ("open", "o", ""),
-    "confident": ("open", "keep", "smirk"),
+    "confident": ("code_soft", "keep", "smirk"),
     "sleepy": ("sleepy", "keep", "sleep"),
     "silly": ("closed", "big", "tongue"),
     "confused": ("open", "keep", "ask"),
@@ -2018,28 +2037,12 @@ def _diff_alpha(w, h, soft=1.4):
     return m.filter(ImageFilter.GaussianBlur(soft))
 
 
-def diff_eye_sprites():
-    """左右眼贴片（4x 画布尺度）→ [(img, cx, cy)]，左眼在前。
-
-    素材取自 _cast_src()：它已经把立绘的白底抠成透明，直接读原 png 会拿到
-    和底板不一致的像素（phone 那张立绘背景是纯白）。
-    """
-    if "eyes" in _DIFF_CACHE:
-        return _DIFF_CACHE["eyes"]
-    head = _cast_src()
-    k = HEAD_K * S * DIFF_EYE_ZOOM
-    out = []
-    for skey, ckey in (("src_eye_l", "eye_l"), ("src_eye_r", "eye_r")):
-        sx, sy, srx, sry = _CAST[skey]
-        ex, ey = srx * DIFF_EYE_EX, sry * DIFF_EYE_EY
-        sp = head.crop((int(sx - ex), int(sy - ey), int(sx + ex), int(sy + ey)))
-        w = max(4, int(round(sp.width * k)))
-        h = max(4, int(round(sp.height * k)))
-        sp = sp.resize((w, h), Image.LANCZOS)
-        sp.putalpha(_diff_alpha(w, h))
-        out.append((sp, _CAST[ckey][0] * S, _CAST[ckey][1] * S))
-    _DIFF_CACHE["eyes"] = out
-    return out
+def _ink_centroid(ink, w, h):
+    """墨迹重心；没墨迹就退回贴片中心。"""
+    if ink is not None and ink.any():
+        ys, xs = np.nonzero(ink)
+        return float(xs.mean()), float(ys.mean())
+    return w / 2.0, h / 2.0
 
 
 def diff_mouth_sprite():
@@ -2053,12 +2056,19 @@ def diff_mouth_sprite():
     head = _cast_src()
     mx, my, mhw = _CAST["src_mouth"]
     ex, ey = mhw * DIFF_MOUTH_EX, mhw * 0.62 * DIFF_MOUTH_EY
-    sp = head.crop((int(mx - ex), int(my - ey), int(mx + ex), int(my + ey)))
+    box = (int(mx - ex), int(my - ey), int(mx + ex), int(my + ey))
+    sp0 = head.crop(box)
+    ink0 = _diff_ink(sp0, tuple(_CAST["colors"]["skin"])[:3])
+    if ink0.any():
+        sx, sy = _ink_centroid(ink0, sp0.width, sp0.height)
+        src_c = (box[0] + sx, box[1] + sy)
+    else:
+        src_c = (mx, my)
     tw = max(6, int(round(_CAST["mouth"][2] * DIFF_MOUTH_EX * S)))
-    th = max(4, int(round(tw * sp.height / float(sp.width))))
-    sp = sp.resize((tw, th), Image.LANCZOS)
+    th = max(4, int(round(tw * sp0.height / float(sp0.width))))
+    sp = sp0.resize((tw, th), Image.LANCZOS)
     sp.putalpha(_diff_alpha(tw, th))
-    res = (sp, _CAST["mouth"][0] * S, _CAST["mouth"][1] * S)
+    res = (sp, _CAST["mouth"][0] * S, _CAST["mouth"][1] * S, src_c)
     _DIFF_CACHE["mouth"] = res
     return res
 
@@ -2080,7 +2090,7 @@ def _diff_mask(keep, blur=1.0):
 
 
 def diff_ctx(canvas):
-    """两眼之间那块皮肤的中位色 + 眼贴片半径（4x 画布像素）。"""
+    """两眼之间那块皮肤的中位色 + 眼半径（4x 画布像素，按原画眼尺度）。"""
     cx = (_CAST["eye_l"][0] + _CAST["eye_r"][0]) / 2.0 * S
     cy = ((_CAST["eye_l"][1] + _CAST["eye_r"][1]) / 2.0 + 13) * S
     box = (int(cx - 5 * S), int(cy - 3 * S), int(cx + 5 * S), int(cy + 3 * S))
@@ -2092,106 +2102,13 @@ def diff_ctx(canvas):
     return {"skin": skin,
             "bangs": bool(_CAST.get("bangs", False)),
             "hair_pred": _CAST.get("hair"),
-            "rx": _CAST["src_eye_l"][2] * DIFF_EYE_EX * HEAD_K * S * DIFF_EYE_ZOOM,
-            "ry": _CAST["src_eye_l"][3] * DIFF_EYE_EY * HEAD_K * S * DIFF_EYE_ZOOM}
+            "rx": _CAST["src_eye_l"][2] * DIFF_EYE_EX * HEAD_K * S,
+            "ry": _CAST["src_eye_l"][3] * DIFF_EYE_EY * HEAD_K * S}
 
 def _diff_ink(sp, skin):
     a = np.array(sp).astype(np.float32)
     return (_diff_dist(a[..., :3], skin) > DIFF_INK_GAP) & (a[..., 3] > 200)
 
-
-def _diff_edge_hair(a, pred):
-    """从贴片四边往里灌，只保留「和边缘连通」的头发像素。
-
-    只有刘海真的垂到眼睛上的角色才需要：压在眼上的刘海一定是从画面外伸进来的
-    （连通边缘），而睫毛、下眼睑这些同样偏深的笔画封闭在眼眶里，不会被选中。
-    """
-    if pred is None:
-        return None
-    h, w = a.shape[:2]
-    # 各角色的 hair 判据是标量 lambda（里面用了 and），不能直接喂数组；
-    # 贴片里的颜色种类很少，逐种判一次再映射回来
-    flat = a[..., :3].reshape(-1, 3).astype(np.int32)
-    uniq, inv = np.unique(flat, axis=0, return_inverse=True)
-    ok = np.array([bool(pred(int(c[0]), int(c[1]), int(c[2]))) for c in uniq])
-    hairish = ok[inv].reshape(h, w) & (a[..., 3] > 160)
-    seen = np.zeros((h, w), bool)
-    stack = []
-    for x in range(w):
-        for y in (0, h - 1):
-            if hairish[y, x] and not seen[y, x]:
-                seen[y, x] = True
-                stack.append((y, x))
-    for y in range(h):
-        for x in (0, w - 1):
-            if hairish[y, x] and not seen[y, x]:
-                seen[y, x] = True
-                stack.append((y, x))
-    while stack:
-        y, x = stack.pop()
-        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w and hairish[ny, nx] and not seen[ny, nx]:
-                seen[ny, nx] = True
-                stack.append((ny, nx))
-    return seen
-
-
-def diff_eye_masks(sp, ctx, cut=0.0):
-    """返回 (填充掩膜, 画线掩膜)。
-
-    填充只抹「眼墨膨胀一圈」：按整个椭圆抹，在腮红过渡弱的脸上会留一块横贯的
-    浅色补丁；抹太宽又会在刘海上开洞。画线用整个贴片椭圆减刘海，线才连续。
-    cut>0 时只抹上半截，下半截原瞳孔留着——这就是半闭眼，比整抹后画一条线生动。
-    """
-    w, h = sp.size
-    ell = np.array(_diff_alpha(w, h, 1.0)).astype(np.float32) / 255.0
-    edge = _diff_edge_hair(np.array(sp).astype(np.float32),
-                           ctx["hair_pred"] if ctx["bangs"] else None)
-    keep = ell.copy()
-    if edge is not None:
-        keep[edge] = 0.0
-    # 不内缩：这几张立绘的眼睛都有一圈深色轮廓，内缩会把轮廓留在外面，
-    # 屏幕上就是「原轮廓 + 新上睑线」两条线
-    ink = _diff_mask(_diff_ink(sp, ctx["skin"]), 0).filter(ImageFilter.MaxFilter(7))
-    fill = keep * (np.array(ink).astype(np.float32) / 255.0) if ctx["bangs"] else keep
-    if cut > 0.0:
-        yy = np.arange(h, dtype=np.float32)[:, None] / max(1.0, h - 1.0)
-        vm = np.clip((0.5 + cut * 0.5 - yy) / 0.05 + 0.5, 0.0, 1.0)
-        fill = fill * vm
-    return _diff_mask(fill, 0.7), _diff_mask(keep, 0.7)
-
-
-def _diff_fill_rows(img, mask, skin):
-    """按行取掩膜外一圈皮肤的中位色往里填。
-
-    平涂一个肤色会在腮红、下颌阴影上留一块浅色补丁；按行取色能保住垂直方向的
-    明暗。取样圈里没有皮肤色（被刘海或脸外占着）时沿用上一行的颜色。
-    """
-    a = np.array(img).astype(np.float32)
-    mk = np.array(mask)
-    h, w = mk.shape
-    skin = np.asarray(skin, np.float32)
-    cols = {}
-    for y in range(h):
-        xs = np.nonzero(mk[y] > 127)[0]
-        if not len(xs):
-            continue
-        x0, x1 = int(xs[0]), int(xs[-1])
-        ring = []
-        for x in list(range(max(0, x0 - 5), max(0, x0 - 1))) + \
-                 list(range(min(w - 1, x1 + 2), min(w - 1, x1 + 6))):
-            c = a[y, x]
-            if c[3] > 200 and _diff_dist(c[None, :3], skin)[0] < 46:
-                ring.append(c[:3])
-        cols[y] = np.median(np.array(ring), axis=0) if ring else None
-    last = skin
-    for y in sorted(cols):
-        last = cols[y] if cols[y] is not None else last
-        xs = np.nonzero(mk[y] > 127)[0]
-        a[y, int(xs[0]):int(xs[-1]) + 1, :3] = last
-        a[y, int(xs[0]):int(xs[-1]) + 1, 3] = 255
-    return Image.fromarray(a.clip(0, 255).astype(np.uint8), "RGBA")
 
 
 def _diff_bez(p0, p1, p2, n=30):
@@ -2203,39 +2120,55 @@ def _diff_bez(p0, p1, p2, n=30):
 
 
 
-def diff_eye_state(out, sp, cx, cy, kind, ctx, side):
-    w, h = sp.size
-    pos = (int(round(cx - w / 2.0)), int(round(cy - h / 2.0)))
+def diff_eye_state(out, ckey, skey, kind, ctx, side):
+    """一只眼的表情姿态。open 直接返回：底板就是原画，什么都不做才最像原图。"""
     if kind == "open":
-        out.alpha_composite(sp, pos)
+        return
+    if kind.startswith("code"):
+        # 原画那双眼是眯着的，情绪强的表情光靠眼睑线动不起来。抹掉原画眼，用 build()
+        # 同一套 eye() 画回来：EYE_CX/rx/ry 两边同源，落点和原画眼重叠，不会跳位。
+        # lid 分级是「表情强度」：全睁 1.0 = 惊，0.9 = 惊喜/自信，0.78 = 怒目半睁。
+        # 一律给 1.0 的话，五个角色十张脸全是瞪圆眼珠，比原画那双眼生硬得多。
+        lid = {"code": 1.0, "code_soft": 0.90, "code_half": 0.78}.get(kind, 1.0)
+        # cut=0 才是「整只眼都抹掉」：cut>0 走的是「只抹上面那截、下半瞳孔留着」那支，
+        # 下半径会被砍到 0.87 倍，原画眼的下半圈留在那儿，画上新眼就是一圈灰环（book/apple 最明显）
+        _erase_eye_on(out, ckey, skey, 0.0, ex=1.06, flat=True)
+        _, _, srx, _ = _CAST[skey]
+        nrm = _CAST[ckey][2]
+        # 原画眼半径 × HEAD_K 才是它落在画布上的真实大小；归一眼径只是「五个角色统一」的产物。
+        # 抹与画必须同一档尺度：抹 1.25 倍而画 1.0 倍，就是在眼周留一圈磨平的皮肤
+        # （屏上读成「眼睛浮在一块白补丁上」）；反过来画大了则变成「贴纸大眼」。
+        scale = (srx * HEAD_K / nrm) * 1.06 if nrm > 0 else 1.06
+        eye(ImageDraw.Draw(out), 88 if side > 0 else 152, _CAST[ckey][1], lid=lid, scale=scale)
         return
     dy_in, dy_out, bulge, cut = DIFF_LIDS[kind]
-    fill, keep = diff_eye_masks(sp, ctx, cut)
-    box = (pos[0], pos[1], pos[0] + w, pos[1] + h)
-    filled = _diff_fill_rows(out.crop(box), fill, ctx["skin"])
-    filled.putalpha(fill)
-    out.alpha_composite(filled, pos)
+    _erase_eye_on(out, ckey, skey, cut)
 
+    cx, cy = _CAST[ckey][0] * S, _CAST[ckey][1] * S
     half = ctx["rx"] * 0.72
     x_in, x_out = cx + side * half, cx - side * half
     y_in, y_out = cy + ctx["ry"] * dy_in, cy + ctx["ry"] * dy_out
-    mid = (x_in + x_out) / 2.0
-    pts = _diff_bez((x_out, y_out), (mid, cy - ctx["ry"] * bulge), (x_in, y_in))
-    # 线画在独立图层上再按掩膜裁：直接画在画布上会盖到刘海上
-    lid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ImageDraw.Draw(lid).line([(x - pos[0], y - pos[1]) for x, y in pts], fill=DIFF_LASH,
+    pts = _diff_bez((x_out, y_out), ((x_in + x_out) / 2.0, cy - ctx["ry"] * bulge),
+                    (x_in, y_in))
+    ImageDraw.Draw(out).line(pts, fill=DIFF_LASH,
                              width=max(2, int(round(ctx["ry"] * 0.17))), joint="curve")
-    lid.putalpha(Image.composite(keep, Image.new("L", (w, h), 0), lid.split()[3]))
-    out.alpha_composite(lid, pos)
 
 
 def diff_mouth_state(out, mouth, kind, ctx):
-    sp, cx, cy = mouth
+    # keep 也要搬：原画的嘴不在统一位置上（星野偏左 9 逻辑、墨言低 27 逻辑），
+    # 留着原嘴不动，五个角色并排就是「有的嘴贴下颚、有的嘴歪一边」。
+    # 搬的是原画那张嘴本身（同样的形状和颜色），只改落点。
+    sp, cx, cy, src_c = mouth
+    _erase_mouth_on(out, src_c)
     w, h = sp.size
     ink = _diff_ink(sp, ctx["skin"])
+    # 贴片墨迹重心对准目标点，而不是贴片矩形中心：裁框是围绕手填的 src_mouth 切的，
+    # 嘴在框里偏几个像素，按框中心贴就等于把这份偏差原样搬到脸上。
+    ix, iy = _ink_centroid(ink, w, h)
+    ox, oy = int(round(cx - ix)), int(round(cy - iy))
     wipe = Image.new("RGBA", (w, h), tuple(ctx["skin"]) + (255,))
     wipe.putalpha(_diff_mask(ink, 1.0))
-    out.alpha_composite(wipe, (int(round(cx - w / 2.0)), int(round(cy - h / 2.0))))
+    out.alpha_composite(wipe, (ox, oy))
     if kind == "closed":
         return
     lay = sp.copy()
@@ -2246,8 +2179,9 @@ def diff_mouth_state(out, mouth, kind, ctx):
     elif kind == "o":
         nw, nh = int(w * 0.86), int(h * 1.75)
     lay = lay.resize((max(2, nw), max(2, nh)), Image.LANCZOS)
-    out.alpha_composite(lay, (int(round(cx - lay.width / 2.0)),
-                              int(round(cy - lay.height / 2.0))))
+    # 放大也以墨迹重心为锚，否则「笑」的嘴会一边变大一边往下沉
+    kx, ky = lay.width / float(w), lay.height / float(h)
+    out.alpha_composite(lay, (int(round(cx - ix * kx)), int(round(cy - iy * ky))))
 
 
 def _diff_zshape(d, x, y, s, col, lw):
@@ -2344,12 +2278,12 @@ def cast_face(name, eye=None, mouth=None, extra=None):
         ex = extra
     img = diff_base()
     ctx = diff_ctx(img)
-    for side, (sp, cx, cy) in zip((1, -1), diff_eye_sprites()):
+    for side, ckey, skey in ((1, "eye_l", "src_eye_l"), (-1, "eye_r", "src_eye_r")):
         if isinstance(ek, tuple):
             kind = ek[0] if side == 1 else ek[1]
         else:
             kind = ek
-        diff_eye_state(img, sp, cx, cy, kind, ctx, side)
+        diff_eye_state(img, ckey, skey, kind, ctx, side)
     diff_mouth_state(img, diff_mouth_sprite(), mk, ctx)
     diff_symbol(img, ex, ctx)
     return img.resize((SZ, SZ), Image.LANCZOS)
@@ -3016,7 +2950,7 @@ def _cli_cast():
     返回角色 key（None = 内置大肥鱼）。产物目录必须分开，否则跑一个角色就把
     固件里大肥鱼那套 emoji_assets.c 覆盖掉，下次编译具就静静变成了别人。
     """
-    global _OUT_C_DIR, _PACK
+    global _OUT_C_DIR, _PACK, CAST_CODE_FACE
     import sys
     key = None
     argv = sys.argv[1:]
@@ -3026,15 +2960,23 @@ def _cli_cast():
             key = argv[i + 1]
         elif a.startswith("--cast="):
             key = a.split("=", 1)[1]
+        elif a == "--code-face" and i + 1 < len(argv):
+            CAST_CODE_FACE = argv[i + 1].lower() not in ("0", "false", "no")
+        elif a.startswith("--code-face="):
+            CAST_CODE_FACE = a.split("=", 1)[1].lower() not in ("0", "false", "no")
+    # 两条管线的产物必须分目录：同 key 同路径会互相覆盖，A/B 变成「谁后跑谁」。
+    # pack 例外——slot 是 mk_assets_bin.py 按 <key>/_pack/<key>.slot 固定路径取货的，
+    # 加后缀它会去空目录里找，报「没有 slot」而不是报错，静默出旧尺寸的 assets。
+    suffix = "_orig" if (not CAST_CODE_FACE and not _PACK) else ""
     if not key:
-        out = os.path.join(HERE, "_emoji_out", "_base")
+        out = os.path.join(HERE, "_emoji_out", "_base" + suffix)
         if _PACK:
             # pack 时大肥鱼也不碰固件里的 emoji_assets.c，产物全走 _emoji_out
             _OUT_C_DIR = out
         return None, out
     import cast_config
     apply_cast(cast_config.get(key))
-    out = os.path.join(HERE, "_emoji_out", key)
+    out = os.path.join(HERE, "_emoji_out", key + suffix)
     _OUT_C_DIR = out
     return key, out
 
