@@ -22,6 +22,7 @@ def project_version():
 
 
 VERSION = project_version()
+TAG = "multi-cast-v%s" % VERSION
 
 CASTS = os.path.join(ROOT, "ota", "casts")
 SUMS = os.path.join(CASTS, "SHA256SUMS-%s.txt" % VERSION)
@@ -111,3 +112,7 @@ def main():
         return 1
     print("RESULT OK")
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
