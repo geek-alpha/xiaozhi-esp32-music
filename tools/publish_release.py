@@ -105,6 +105,37 @@ def release_body(version):
     ])
 
 
+def git_out(*args):
+    p = subprocess.run(["git"] + list(args), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        raise SystemExit("git %s 失败: %s" % (" ".join(args), (p.stderr or "").strip()[:300]))
+    return p.stdout.strip()
+
+
+def resolve_target(tok, tag):
+    """release 的 target_commitish：tag 已存在就跟 tag 实际指向的提交，否则用当前分支 HEAD。
+
+    不传时 GitHub 拿仓库 default branch（main）建 tag，在 multi-cast 分支上发布会把
+    tag 打到 main 的提交上，清单和固件对不上。
+    """
+    branch = git_out("rev-parse", "--abbrev-ref", "HEAD")
+    head = git_out("rev-parse", "HEAD")
+    status, ref = http("GET", "%s/repos/%s/git/ref/tags/%s" % (API, REPO, tag), tok, timeout=60)
+    if status == 200 and ref:
+        sha = ref["object"]["sha"]
+        if ref["object"].get("type") == "tag":
+            st2, obj = http("GET", "%s/repos/%s/git/tags/%s" % (API, REPO, sha), tok, timeout=60)
+            if st2 == 200 and obj:
+                sha = obj["object"]["sha"]
+        if sha != head:
+            print("注意：远端 tag %s 指向 %s，当前分支 %s HEAD 是 %s，release 跟随 tag"
+                  % (tag, sha[:8], branch, head[:8]))
+        return sha
+    print("远端无 tag %s，将在分支 %s 的 HEAD %s 上创建" % (tag, branch, head[:8]))
+    return head
+
+
 def ensure_release(tok, version, body):
     tag = "v%s" % version
     status, rel = http("GET", "%s/repos/%s/releases/tags/%s" % (API, REPO, tag), tok, timeout=60)
@@ -118,6 +149,7 @@ def ensure_release(tok, version, body):
         return rel
     status, rel = http("POST", "%s/repos/%s/releases" % (API, REPO), tok,
                        {"tag_name": tag, "name": tag, "body": body,
+                        "target_commitish": resolve_target(tok, tag),
                         "draft": False, "prerelease": False})
     if status not in (200, 201):
         raise SystemExit("建 release 失败 HTTP %s: %s" % (status, rel))
