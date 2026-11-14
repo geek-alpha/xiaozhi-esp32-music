@@ -20,7 +20,13 @@ if not exist sdkconfig (
     idf.py set-target esp32s3 || exit /b 1
 )
 
-echo [2/2] Build
+rem sdkconfig is gitignored and shared across branches, so the OTA manifest URL
+rem must be rewritten for the current branch or a single-role firmware OTA-upgrades
+rem itself into the multi-role build
+echo [2/3] Sync OTA manifest for current branch
+python tools\sync_ota_url.py || exit /b 1
+
+echo [3/3] Build
 idf.py build || exit /b 1
 
 if "%~1"=="" (

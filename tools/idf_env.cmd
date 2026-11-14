@@ -1,5 +1,5 @@
 @echo off
-rem 直接构造 ESP-IDF 5.4 环境（export.bat 在本机探测 python 失败，绕开它）
+rem Build the ESP-IDF 5.4 env directly: export.bat fails to detect python on this machine
 set IDF_PATH=C:\Espressif\frameworks\esp-idf-v5.4
 set IDF_PYTHON_ENV_PATH=C:\Espressif\python_env\idf5.4_py3.13_env
 set IDF_TOOLS_PATH=C:\Espressif
