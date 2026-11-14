@@ -688,6 +688,38 @@ McpServer::McpServer() {
              return std::string("{\"success\": true, \"now\": \"") + text + "\"}";
          });
 
+     // 省电模式总开关：用户说“别自动关机了”“一直开着”关掉，说“省点电”“到点关机”打开。
+     // 落 NVS，重启后仍然有效——所以改之前先想清楚这是不是用户真想要的长期状态
+     AddTool("self.system.set_power_save",
+         "改设备的省电/自动关机行为，设置永久保存（重启也有效）。\n"
+         "  `enabled` 传 true = 进入省电模式：闲置 60 秒熄屏，闲置 5 分钟自动断电关机；\n"
+         "           传 false = 只要通着电就一直开着，不熄屏也不自动关机。\n"
+         "用户说“别自动关机”“一直开着别睡”时传 false；说“省电模式”“到点关机”“不看的时候关掉”时传 true。\n"
+         "返回 success 表示已经生效并存好了，照 note 里的说法告诉用户。",
+         PropertyList({
+             Property("enabled", kPropertyTypeBoolean, false)
+         }),
+         [](const PropertyList& properties) -> ReturnValue {
+             bool enabled = properties["enabled"].value<bool>();
+             if (!Board::GetInstance().SetPowerSaveEnabled(enabled)) {
+                 return std::string("{\"success\": false, \"message\": \"这台设备的固件没有省电开关，改不了\"}");
+             }
+             if (enabled) {
+                 return std::string("{\"success\": true, \"power_save\": true, \"note\": \"已设为省电模式：闲置 60 秒熄屏，5 分钟自动关机\"}");
+             }
+             return std::string("{\"success\": true, \"power_save\": false, \"note\": \"已设为常开：只要通着电就不会自动关机，也不会熄屏\"}");
+         });
+
+     AddTool("self.system.get_power_save",
+         "读设备现在是省电模式还是常开。用户问“你会不会自己关机”“现在是省电模式吗”时用它，别自己猜。",
+         PropertyList(),
+         [](const PropertyList&) -> ReturnValue {
+             if (Board::GetInstance().GetPowerSaveEnabled()) {
+                 return std::string("{\"success\": true, \"power_save\": true, \"note\": \"省电模式：闲置 60 秒熄屏，5 分钟自动关机\"}");
+             }
+             return std::string("{\"success\": true, \"power_save\": false, \"note\": \"常开：通着电就一直开着，不自动关机\"}");
+         });
+
      // Restore the original tools list to the end of the tools list
      tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());
  }

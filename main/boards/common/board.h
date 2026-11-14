@@ -53,6 +53,10 @@ public:
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetJson();
     virtual void SetPowerSaveMode(bool enabled) = 0;
+    // 省电模式总开关：true = 闲置到点熄屏并自动断电，false = 只要通电就一直开着。
+    // 实现要落 NVS 才能跨重启有效；返回 false 表示这块板没有电源管理，改不了
+    virtual bool SetPowerSaveEnabled(bool enabled) { (void)enabled; return false; }
+    virtual bool GetPowerSaveEnabled() { return false; }
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
 };

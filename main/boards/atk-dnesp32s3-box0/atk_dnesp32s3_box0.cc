@@ -9,6 +9,7 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "settings.h"
 
 #include "i2c_device.h"
 #include <esp_log.h>
@@ -38,6 +39,8 @@ private:
     WakeStatus wake_status_ = kDeviceAwakened;
     XiaozhiStatus XiaozhiStatus_ = kDevice_Exit_Distributionnetwork;
     esp_timer_handle_t wake_timer_handle_;
+    // 省电模式开关（NVS power/save_mode）：false = 只要通电就一直开着，不熄屏也不到点断电
+    bool power_save_enabled_ = false;
     esp_lcd_panel_io_handle_t panel_io = nullptr;
     esp_lcd_panel_handle_t panel = nullptr;
 
@@ -126,15 +129,15 @@ private:
     void InitializePowerManager() {
         power_manager_ = new PowerManager(CHRG_PIN);
         power_manager_->OnChargingStatusChanged([this](bool is_charging) {
-            if (is_charging) {
-                power_save_timer_->SetEnabled(false);
-            } else {
-                power_save_timer_->SetEnabled(true);
-            }
+            // 充电中永不省电；拔了电仍然受总开关管
+            power_save_timer_->SetEnabled(!is_charging && power_save_enabled_);
         });
     }
 
     void InitializePowerSaveTimer() {
+        // 先读开关再建 timer：出厂默认 0，插着电就一直开着
+        Settings power_settings("power");
+        power_save_enabled_ = power_settings.GetInt("save_mode", 0) != 0;
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
             power_sleep_ = kDeviceNeutralSleep;
@@ -154,6 +157,10 @@ private:
             }
         });
         power_save_timer_->OnShutdownRequest([this]() {
+            // 关掉开关那一秒 ticking 可能已经在回调里排队了：这层兜底才真正保证不断电
+            if (!power_save_enabled_) {
+                return;
+            }
             if (power_status_ == kDeviceBatterySupply) {
                 esp_timer_stop(power_manager_->timer_handle_);
                 gpio_set_level(CHG_CTRL_PIN, 0);
@@ -163,7 +170,7 @@ private:
             }
         });
 
-        power_save_timer_->SetEnabled(true);
+        power_save_timer_->SetEnabled(power_save_enabled_);
     }
 
     // Initialize I2C peripheral
@@ -379,7 +386,7 @@ public:
         charging = power_manager_->IsCharging();
         discharging = power_manager_->IsDischarging();
         if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
+            power_save_timer_->SetEnabled(discharging && power_save_enabled_);
             last_discharging = discharging;
         }
         level = power_manager_->GetBatteryLevel();
@@ -391,6 +398,24 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveMode(enabled);
+    }
+
+    virtual bool SetPowerSaveEnabled(bool enabled) override {
+        power_save_enabled_ = enabled;
+        {
+            Settings settings("power", true);
+            settings.SetInt("save_mode", enabled ? 1 : 0);
+        }
+        if (power_save_timer_ != nullptr) {
+            bool charging = power_manager_ != nullptr && power_manager_->IsCharging();
+            power_save_timer_->SetEnabled(enabled && !charging);
+        }
+        ESP_LOGI(TAG, "Power save %s (saved to NVS)", enabled ? "on" : "off");
+        return true;
+    }
+
+    virtual bool GetPowerSaveEnabled() override {
+        return power_save_enabled_;
     }
 };
 
