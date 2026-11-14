@@ -6,27 +6,27 @@
 
 #define EMOJI_W 162
 #define EMOJI_H 162
-#define MOUTH_W 26
-#define MOUTH_H 20
-#define MOUTH_OX 68
-#define MOUTH_OY 96
-#define BLINK_W 58
-#define BLINK_H 28
-#define BLINK_OX 52
-#define BLINK_OY 76
+#define MOUTH_W 18
+#define MOUTH_H 14
+#define MOUTH_OX 57
+#define MOUTH_OY 86
+#define BLINK_W 60
+#define BLINK_H 24
+#define BLINK_OX 34
+#define BLINK_OY 68
 #define EMOJI_BODY_W 162
 #define EMOJI_BODY_H 81
 #define EMOJI_BODY_OX 0
-#define EMOJI_BODY_OY 123
-#define EMOJI_TOTAL_H 204
+#define EMOJI_BODY_OY 100
+#define EMOJI_TOTAL_H 181
 #define EMOJI_SHADOW_W 162
-#define EMOJI_SHADOW_H 204
+#define EMOJI_SHADOW_H 181
 #define EMOJI_ARM_FRAMES 3
 #define GAZE_COUNT 3
-#define GAZE_W 54
-#define GAZE_H 22
-#define GAZE_OX 54
-#define GAZE_OY 78
+#define GAZE_W 56
+#define GAZE_H 18
+#define GAZE_OX 38
+#define GAZE_OY 70
 
 typedef struct {
     const char * name;
@@ -47,6 +47,7 @@ extern lv_image_dsc_t emoji_arm_0;
 extern lv_image_dsc_t emoji_arm_1;
 extern lv_image_dsc_t emoji_arm_2;
 extern lv_image_dsc_t emoji_neutral;
+extern lv_image_dsc_t emoji_pad_0;
 extern lv_image_dsc_t emoji_patch_listening;
 extern lv_image_dsc_t emoji_patch_happy;
 extern lv_image_dsc_t emoji_patch_laughing;
@@ -78,7 +79,11 @@ extern lv_image_dsc_t emoji_happy_mouth;
 extern lv_image_dsc_t emoji_happy_blink;
 extern lv_image_dsc_t emoji_happy_blink_hair;
 extern lv_image_dsc_t emoji_laughing_mouth;
+extern lv_image_dsc_t emoji_pad_1;
+extern lv_image_dsc_t emoji_pad_2;
 extern lv_image_dsc_t emoji_funny_mouth;
+extern lv_image_dsc_t emoji_pad_3;
+extern lv_image_dsc_t emoji_pad_4;
 extern lv_image_dsc_t emoji_sad_mouth;
 extern lv_image_dsc_t emoji_sad_blink;
 extern lv_image_dsc_t emoji_sad_blink_hair;
@@ -107,7 +112,11 @@ extern lv_image_dsc_t emoji_winking_mouth;
 extern lv_image_dsc_t emoji_winking_blink;
 extern lv_image_dsc_t emoji_winking_blink_hair;
 extern lv_image_dsc_t emoji_cool_mouth;
+extern lv_image_dsc_t emoji_pad_5;
+extern lv_image_dsc_t emoji_pad_6;
 extern lv_image_dsc_t emoji_relaxed_mouth;
+extern lv_image_dsc_t emoji_pad_7;
+extern lv_image_dsc_t emoji_pad_8;
 extern lv_image_dsc_t emoji_delicious_mouth;
 extern lv_image_dsc_t emoji_delicious_blink;
 extern lv_image_dsc_t emoji_delicious_blink_hair;
@@ -118,6 +127,8 @@ extern lv_image_dsc_t emoji_confident_mouth;
 extern lv_image_dsc_t emoji_confident_blink;
 extern lv_image_dsc_t emoji_confident_blink_hair;
 extern lv_image_dsc_t emoji_sleepy_mouth;
+extern lv_image_dsc_t emoji_pad_9;
+extern lv_image_dsc_t emoji_pad_10;
 extern lv_image_dsc_t emoji_silly_mouth;
 extern lv_image_dsc_t emoji_silly_blink;
 extern lv_image_dsc_t emoji_silly_blink_hair;
@@ -150,15 +161,12 @@ extern lv_image_dsc_t emoji_hair_shade;
 extern lv_image_dsc_t emoji_gaze_0;
 extern lv_image_dsc_t emoji_gaze_1;
 extern lv_image_dsc_t emoji_gaze_2;
-extern lv_image_dsc_t emoji_pad_0;
-extern lv_image_dsc_t emoji_pad_1;
-extern lv_image_dsc_t emoji_pad_2;
-extern lv_image_dsc_t emoji_pad_3;
-extern lv_image_dsc_t emoji_pad_4;
-extern lv_image_dsc_t emoji_pad_5;
-extern lv_image_dsc_t emoji_pad_6;
-extern lv_image_dsc_t emoji_pad_7;
-extern lv_image_dsc_t emoji_pad_8;
+extern lv_image_dsc_t emoji_pad_11;
+extern lv_image_dsc_t emoji_pad_12;
+extern lv_image_dsc_t emoji_pad_13;
+extern lv_image_dsc_t emoji_pad_14;
+extern lv_image_dsc_t emoji_pad_15;
+extern lv_image_dsc_t emoji_pad_16;
 
 extern lv_image_dsc_t *const emoji_dsc_slots[];
 extern const int emoji_dsc_count;

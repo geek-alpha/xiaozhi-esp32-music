@@ -59,7 +59,7 @@ TARGET_HEAD_W = 165.0
 
 def _mk(name, title, src, size, head_crop, eye_l, eye_r, mouth, colors,
         hair, blush=None, hair_loose=None, brow=True, bangs=False, face=None,
-        head_w_src=None):
+        head_w_src=None, chin=None):
     """eye_*: (cx, cy, rx, ry) 原图象素；mouth: (cx, cy, half_w) 原图象素。
 
     head_w_src：原图「眼行不透明段」的头宽（连头发）。缩放比按它定，不按 head_crop
@@ -112,7 +112,14 @@ def _mk(name, title, src, size, head_crop, eye_l, eye_r, mouth, colors,
     # 横向钉在眼睛中轴上：原画的嘴不一定在两眼中心正下方（星野偏左 9 逻辑、灼偏右 7.7），
     # 脸本身是微侧，但五个角色摆在同一块屏上，那份偏移读起来就是「嘴歪」。
     # 眼距已经归一，这一刀和眼距、眼径、头宽同一套逻辑：骨架对齐，差异留给发型和瞳色。
-    mo = (eye_mid_x, EYE_Y_TARGET + MOUTH_DY, MOUTH_W_TARGET)
+    mo_y = EYE_Y_TARGET + MOUTH_DY
+    # 脸短的角色不能沿用固定 20 偏移：灼（phone）的下巴只到 154 逻辑，嘴定在 152
+    # 正好骑在下巴线上，屏上读成「嘴被下巴切掉一半」。上限改成「眼→下巴」的 45%，
+    # 脸长的角色（painter 186.7 / book 182.2）取 min 后还是原来的 20，不受影响。
+    # chin 是实测值（162 尺度下沿脸中轴扫肤色段的下缘 ÷ 0.675），不是估的
+    if chin:
+        mo_y = EYE_Y_TARGET + min(MOUTH_DY, (chin - EYE_Y_TARGET) * 0.45)
+    mo = (eye_mid_x, mo_y, MOUTH_W_TARGET)
     bb = None
     if blush:
         (bc1, bc2, by0, by1) = blush
@@ -204,6 +211,7 @@ CASTS = {
         bangs=True,   # 紫苑的卷发真的垂到左眼上沿，闭眼时要保住那块头发
         face=_FACE_MALE,
         head_w_src=371,
+        chin=186.7,
     ),
     # ---- 奶白发 + 亮蓝瞳，白卫衣，呼啦圈 ----
     "hoop": _mk(
@@ -217,6 +225,7 @@ CASTS = {
         brow=False,   # 齐眉长鬁发盖到眼下，原画没露眉毛
         face=_FACE_MALE,
         head_w_src=329,
+        chin=165.9,
     ),
     # ---- 银白发 + 红瞳，黑红渐变衫，拿手机 ----
     "phone": _mk(
@@ -229,6 +238,7 @@ CASTS = {
         blush=(112, 312, 288, 324),
         face=_FACE_MALE,
         head_w_src=395,
+        chin=154.1,
     ),
     # ---- 棕发 + 蓝紫瞳，白衬衫 + 斜挎带 + 苹果包 ----
     "apple": _mk(
@@ -241,6 +251,7 @@ CASTS = {
         blush=(96, 306, 282, 316),
         face=_FACE_MALE,
         head_w_src=338,
+        chin=173.3,
     ),
     # ---- 黑发 + 绿瞳，灰西装马甲，抱蓝本子 ----
     "book": _mk(
@@ -254,6 +265,7 @@ CASTS = {
         brow=False,   # 同上：黑发盖到眼下
         face=_FACE_MALE,
         head_w_src=355,
+        chin=182.2,
     ),
 }
 

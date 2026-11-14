@@ -9,6 +9,7 @@ lv_image_dsc_t emoji_arm_0;
 lv_image_dsc_t emoji_arm_1;
 lv_image_dsc_t emoji_arm_2;
 lv_image_dsc_t emoji_neutral;
+lv_image_dsc_t emoji_pad_0;
 lv_image_dsc_t emoji_patch_listening;
 lv_image_dsc_t emoji_patch_happy;
 lv_image_dsc_t emoji_patch_laughing;
@@ -40,7 +41,11 @@ lv_image_dsc_t emoji_happy_mouth;
 lv_image_dsc_t emoji_happy_blink;
 lv_image_dsc_t emoji_happy_blink_hair;
 lv_image_dsc_t emoji_laughing_mouth;
+lv_image_dsc_t emoji_pad_1;
+lv_image_dsc_t emoji_pad_2;
 lv_image_dsc_t emoji_funny_mouth;
+lv_image_dsc_t emoji_pad_3;
+lv_image_dsc_t emoji_pad_4;
 lv_image_dsc_t emoji_sad_mouth;
 lv_image_dsc_t emoji_sad_blink;
 lv_image_dsc_t emoji_sad_blink_hair;
@@ -69,7 +74,11 @@ lv_image_dsc_t emoji_winking_mouth;
 lv_image_dsc_t emoji_winking_blink;
 lv_image_dsc_t emoji_winking_blink_hair;
 lv_image_dsc_t emoji_cool_mouth;
+lv_image_dsc_t emoji_pad_5;
+lv_image_dsc_t emoji_pad_6;
 lv_image_dsc_t emoji_relaxed_mouth;
+lv_image_dsc_t emoji_pad_7;
+lv_image_dsc_t emoji_pad_8;
 lv_image_dsc_t emoji_delicious_mouth;
 lv_image_dsc_t emoji_delicious_blink;
 lv_image_dsc_t emoji_delicious_blink_hair;
@@ -80,6 +89,8 @@ lv_image_dsc_t emoji_confident_mouth;
 lv_image_dsc_t emoji_confident_blink;
 lv_image_dsc_t emoji_confident_blink_hair;
 lv_image_dsc_t emoji_sleepy_mouth;
+lv_image_dsc_t emoji_pad_9;
+lv_image_dsc_t emoji_pad_10;
 lv_image_dsc_t emoji_silly_mouth;
 lv_image_dsc_t emoji_silly_blink;
 lv_image_dsc_t emoji_silly_blink_hair;
@@ -112,15 +123,12 @@ lv_image_dsc_t emoji_hair_shade;
 lv_image_dsc_t emoji_gaze_0;
 lv_image_dsc_t emoji_gaze_1;
 lv_image_dsc_t emoji_gaze_2;
-lv_image_dsc_t emoji_pad_0;
-lv_image_dsc_t emoji_pad_1;
-lv_image_dsc_t emoji_pad_2;
-lv_image_dsc_t emoji_pad_3;
-lv_image_dsc_t emoji_pad_4;
-lv_image_dsc_t emoji_pad_5;
-lv_image_dsc_t emoji_pad_6;
-lv_image_dsc_t emoji_pad_7;
-lv_image_dsc_t emoji_pad_8;
+lv_image_dsc_t emoji_pad_11;
+lv_image_dsc_t emoji_pad_12;
+lv_image_dsc_t emoji_pad_13;
+lv_image_dsc_t emoji_pad_14;
+lv_image_dsc_t emoji_pad_15;
+lv_image_dsc_t emoji_pad_16;
 
 lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_shadow,
@@ -131,6 +139,7 @@ lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_arm_1,
     &emoji_arm_2,
     &emoji_neutral,
+    &emoji_pad_0,
     &emoji_patch_listening,
     &emoji_patch_happy,
     &emoji_patch_laughing,
@@ -162,7 +171,11 @@ lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_happy_blink,
     &emoji_happy_blink_hair,
     &emoji_laughing_mouth,
+    &emoji_pad_1,
+    &emoji_pad_2,
     &emoji_funny_mouth,
+    &emoji_pad_3,
+    &emoji_pad_4,
     &emoji_sad_mouth,
     &emoji_sad_blink,
     &emoji_sad_blink_hair,
@@ -191,7 +204,11 @@ lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_winking_blink,
     &emoji_winking_blink_hair,
     &emoji_cool_mouth,
+    &emoji_pad_5,
+    &emoji_pad_6,
     &emoji_relaxed_mouth,
+    &emoji_pad_7,
+    &emoji_pad_8,
     &emoji_delicious_mouth,
     &emoji_delicious_blink,
     &emoji_delicious_blink_hair,
@@ -202,6 +219,8 @@ lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_confident_blink,
     &emoji_confident_blink_hair,
     &emoji_sleepy_mouth,
+    &emoji_pad_9,
+    &emoji_pad_10,
     &emoji_silly_mouth,
     &emoji_silly_blink,
     &emoji_silly_blink_hair,
@@ -234,15 +253,12 @@ lv_image_dsc_t *const emoji_dsc_slots[] = {
     &emoji_gaze_0,
     &emoji_gaze_1,
     &emoji_gaze_2,
-    &emoji_pad_0,
-    &emoji_pad_1,
-    &emoji_pad_2,
-    &emoji_pad_3,
-    &emoji_pad_4,
-    &emoji_pad_5,
-    &emoji_pad_6,
-    &emoji_pad_7,
-    &emoji_pad_8,
+    &emoji_pad_11,
+    &emoji_pad_12,
+    &emoji_pad_13,
+    &emoji_pad_14,
+    &emoji_pad_15,
+    &emoji_pad_16,
 };
 const int emoji_dsc_count = sizeof(emoji_dsc_slots) / sizeof(emoji_dsc_slots[0]);
 

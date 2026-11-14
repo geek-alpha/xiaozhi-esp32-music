@@ -1144,6 +1144,23 @@ void LcdDisplay::SetupUI() {
     // lv_image_set_src 之前填好，否则第一帧拿到的是空指针（白框或花屏）
     emoji_pack_ensure();
 
+    // 换过的角色要跨重启留住。ensure() 只会绑 base，不在这里回绑的话，用户换完
+    // 一重启就退回默认脸。NVS 里存的是 key，assets 分区里没有它（刷了单角色固件、
+    // 或分区内容换过）就删掉这条记录，免得每次启动都白试一次
+    {
+        std::string saved_cast;
+        {
+            Settings settings("display", false);
+            saved_cast = settings.GetString("cast");
+        }
+        if (!saved_cast.empty() && saved_cast != (emoji_pack_current() ? emoji_pack_current() : "")) {
+            if (!emoji_pack_bind(saved_cast.c_str())) {
+                Settings settings("display", true);
+                settings.EraseKey("cast");
+            }
+        }
+    }
+
 
     // 投影：整只小人的模糊剪影垫在最底层。脸长到 162 几平顶满屏之后，
     // 没它小人就是一张贴在科技底上的纸——投影是「浮出屏幕」最便宜的纵深线索
@@ -1852,6 +1869,11 @@ bool LcdDisplay::SetCharacter(const char* key) {
     ApplyEmotionAssets(cur_emotion_);
     ApplyPatchGeom();
     ApplyHairTint();
+    // 存下来才扛得住重启：这条是用户选的，比 assets 里的分区顺序优先
+    {
+        Settings settings("display", true);
+        settings.SetString("cast", key);
+    }
     ESP_LOGI(TAG, "换角色 -> %s（表情重放 %s）", emoji_pack_current(), cur_emotion_);
     return true;
 }
@@ -2395,10 +2417,12 @@ void LcdDisplay::start(){
 }
 
 // 眼睑位置 = 闭眼贴片的可见高度：贴片从顶部往下长，就是把眼睑压下来；
-// 收回去时从底部往回收，眼睛自上而下睁开。0 = 全睁，BLINK_H = 全闭。
-static int32_t BlinkLidHeight(int32_t t, int32_t depth)
+// 收回去时从底部往回收，眼睛自上而下睁开。0 = 全睁，full_h = 全闭。
+// full_h 必须传当前角色自己的 blink_h：全局 BLINK_H 只等于最后 pack 的那张贴片
+// （apple 28），其余角色是 22~26，多出来的行会跑出图像底部。
+static int32_t BlinkLidHeight(int32_t t, int32_t depth, int32_t full_h)
 {
-    const int32_t full = ((int32_t)BLINK_H * depth + 50) / 100;
+    const int32_t full = (full_h * depth + 50) / 100;
     if (t <= 0) {
         return 0;
     }
@@ -2425,9 +2449,16 @@ void LcdDisplay::BlinkAnimExec(void* var, int32_t v)
     if (self == nullptr) {
         return;
     }
-    const int32_t h = BlinkLidHeight(v, self->blink_depth_);
+    const emoji_geom_t* bg = emoji_pack_geom();
+    const int32_t h = BlinkLidHeight(v, self->blink_depth_, bg->blink_h);
     if (lv_obj_get_height(img) != h) {
         lv_obj_set_height(img, h);
+    }
+    // 闭眼时的刘海遮罩要跟着眼睑一起收：它是 blink_image_ 的子对象、父层不裁剪它，
+    // 只矮父层的话落睑到一半那块头发就已经盖在还睁着的地方，屏上是一块暗影
+    lv_obj_t* hair = self->blink_hair_image_;
+    if (hair != nullptr && lv_obj_get_height(hair) != h) {
+        lv_obj_set_height(hair, h);
     }
     if (h > 0) {
         if (lv_obj_has_flag(img, LV_OBJ_FLAG_HIDDEN)) {

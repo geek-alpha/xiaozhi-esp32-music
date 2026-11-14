@@ -508,15 +508,19 @@ def apply_cast(cfg):
     TONGUE = c["tongue"]
     BLUSH = c["blush"]
     OUTLINE = c.get("outline", OUTLINE)
-    mcx, mcy, mw = cfg["mouth"]
+    mcx, mcy, _mw_target = cfg["mouth"]
     # _m() 把旧基准（脸中心 x=120 / 嘴线 y=156）线性映射到真实嘴位。
-    # mw = smile 嘴的目标逻辑宽（smile 跨 108..132 = 24 旧基准单位）
     MOUTH_C = (mcx, mcy)
-    MOUTH_S = mw / 24.0
-    # 嘴框跟着嘴宽派生：最宽的是 grin（105..135 = 30 单位 = 1.25×mw）、
-    # 最高的是 o（151..167 = 16 单位）。半宽不够就会把嘴角和描边裁掉，
-    # 屏上表现为“笑的时候嘴缺一个角”。
-    MOUTH_BOX = (mcx - 0.75 * mw, mcy - 0.55 * mw, mcx + 0.75 * mw, mcy + 0.62 * mw)
+    # 嘴的尺度一律取大肥鱼那一档，不再按角色归一。
+    # 老口径 MOUTH_S = mw/24 在 mw=25.2 时是 1.05，正好是 base(0.52) 的两倍：
+    # 同一个屏上五个角色四张血盆大口，而大肥鱼看着正常——嘴的大小不该是角色差异。
+    MOUTH_S = _DEFAULT_MOUTH_S
+    # 嘴框照抄 base 的相对尺寸（围绕嘴心平移），贴片因此也是 18x14：
+    # 框跟着 mw 放大会把下巴/领口带进口型贴片，说话时整块下巴跟着跳
+    MOUTH_BOX = (_DEFAULT_MOUTH_BOX[0] - _DEFAULT_MOUTH_C[0] + mcx,
+                 _DEFAULT_MOUTH_BOX[1] - _DEFAULT_MOUTH_C[1] + mcy,
+                 _DEFAULT_MOUTH_BOX[2] - _DEFAULT_MOUTH_C[0] + mcx,
+                 _DEFAULT_MOUTH_BOX[3] - _DEFAULT_MOUTH_C[1] + mcy)
     # 这四个是 MOUTH_BOX 的派生量，模块加载时按大肥鱼的框算过一次。
     # 不跟着重算的话，每个角色都套大肥鱼的嘴框——灼的嘴就贴到腮上去了
     MOUTH_W = sc(MOUTH_BOX[2] - MOUTH_BOX[0])
@@ -1215,15 +1219,25 @@ def _erase_mouth_on(out, src_c=None):
 
     src_c = 原画嘴的真实中心（由嘴贴片的墨迹重心反算）。配置里的 src_mouth 是手填的，
     和原画差十几像素时这个椭圆就盖不住旧嘴，屏上留下半个嘴印子。
+    两个中心都抹一遍：反算偏了有手填值兵底，手填偏了有反算值补上。
     """
+    def wipe(mx, my, k, rh_up, rh_dn):
+        cx = (mx - HEAD_CROP[0]) * HEAD_K + HEAD_OX
+        cy = (my - HEAD_CROP[1]) * HEAD_K + HEAD_OY
+        rw = hw * k * HEAD_K
+        _skin_fill_ellipse(out, cx * S, cy * S, rw * S,
+                           hw * rh_up * HEAD_K * S, hw * rh_dn * HEAD_K * S)
+
     sx, sy, hw = _CAST["src_mouth"]
+    wipe(sx, sy, 1.20, 1.00, 0.95)
     if src_c is not None:
-        sx, sy = src_c
-    cx = (sx - HEAD_CROP[0]) * HEAD_K + HEAD_OX
-    cy = (sy - HEAD_CROP[1]) * HEAD_K + HEAD_OY
-    rw = hw * 1.45 * HEAD_K
-    _skin_fill_ellipse(out, cx * S, cy * S, rw * S,
-                       hw * 0.85 * HEAD_K * S, hw * 1.05 * HEAD_K * S)
+        wipe(src_c[0], src_c[1], 1.60, 1.30, 1.20)
+        # 下唇下面那道阴影线在主椭圆的下半径外：只靠一个椭圆要么抹不到它，
+        # 要么把上半径拉到能盖住它、把鼻底和人中也洗白。单独补一小块更干净
+        cx = (src_c[0] - HEAD_CROP[0]) * HEAD_K + HEAD_OX
+        cy = (src_c[1] - HEAD_CROP[1]) * HEAD_K + HEAD_OY
+        _skin_fill_ellipse(out, cx * S, (cy + hw * 1.35 * HEAD_K) * S, hw * 1.52 * HEAD_K * S,
+                           hw * 0.75 * HEAD_K * S, hw * 0.85 * HEAD_K * S)
 
 
 def closed_eye(d, cx, cy, kind="happy"):
@@ -2014,28 +2028,28 @@ for _k in list(DIFF_LIDS):
 # 差分画法表达不了爱心眼/瞳孔偏移，这类降级成闭眼+符号；宁可少一个效果，
 # 也不要程序凭空画一颗爱心瞳孔——那正是上一版丑的来源。
 CAST_STATES = {
-    "neutral": ("open", "keep", ""),
-    "listening": ("open", "keep", ""),
-    "happy": ("open", "big", ""),
-    "laughing": ("closed", "big", ""),
-    "funny": ("closed", "big", "tongue"),
-    "sad": ("sad", "keep", "sad"),
-    "angry": ("code_half", "closed", "angry"),
+    "neutral": ("open", "smile", ""),
+    "listening": ("open", "attentive", ""),
+    "happy": ("open", "grin", ""),
+    "laughing": ("closed", "grin", ""),
+    "funny": ("closed", "grin", "tongue"),
+    "sad": ("sad", "sad", "sad"),
+    "angry": ("code_half", "flat", "angry"),
     "crying": ("sad", "o", "tear"),
-    "loving": ("open", "keep", "love"),
-    "embarrassed": ("open", "keep", "shy"),
+    "loving": ("open", "smile", "love"),
+    "embarrassed": ("open", "smile", "shy"),
     "surprised": ("code", "o", ""),
     "shocked": ("code", "o", "sad"),
-    "thinking": ("half", "keep", "ask"),
-    "winking": (("closed", "code"), "keep", ""),
-    "cool": ("open", "keep", "shade"),
-    "relaxed": ("half2", "keep", ""),
-    "delicious": ("half3", "big", ""),
+    "thinking": ("half", "wavy", "ask"),
+    "winking": (("closed", "code"), "smile", ""),
+    "cool": ("open", "flat", "shade"),
+    "relaxed": ("half2", "smile", ""),
+    "delicious": ("half3", "grin", ""),
     "kissy": ("open", "o", ""),
-    "confident": ("code_soft", "keep", "smirk"),
-    "sleepy": ("sleepy", "keep", "sleep"),
-    "silly": ("closed", "big", "tongue"),
-    "confused": ("open", "keep", "ask"),
+    "confident": ("code_soft", "smile", "smirk"),
+    "sleepy": ("sleepy", "attentive", "sleep"),
+    "silly": ("closed", "grin", "tongue"),
+    "confused": ("open", "o", "ask"),
 }
 
 _DIFF_CACHE = {}
@@ -2278,17 +2292,17 @@ def diff_symbol(out, kind, ctx):
                width=max(2, lw))
 
 
-def cast_face(name, eye=None, mouth=None, extra=None):
+def cast_face(name, eye=None, mk=None, extra=None):
     """角色模式的整脸，返回 240 图（与 build() 出口同尺寸）。
 
     22 个表情全部落到「眼睛姿态 + 嘴型 + 符号」这三维上，画法一套，
     区别只是参数——这样每个新表情的边际成本是一个表项，不是一段绘图代码。
     """
-    ek, mk, ex = CAST_STATES.get(name, CAST_STATES["neutral"])
+    ek, mouth_kind, ex = CAST_STATES.get(name, CAST_STATES["neutral"])
     if eye is not None:
         ek = eye
-    if mouth is not None:
-        mk = mouth
+    if mk is not None:
+        mouth_kind = mk
     if extra is not None:
         ex = extra
     img = diff_base()
@@ -2299,7 +2313,11 @@ def cast_face(name, eye=None, mouth=None, extra=None):
         else:
             kind = ek
         diff_eye_state(img, ckey, skey, kind, ctx, side)
-    diff_mouth_state(img, diff_mouth_sprite(), mk, ctx)
+    # 嘴跟大肥鱼同一套矢量画法。原画那张嘴在立绘里只有 3px 宽，抠下来放大
+    # 1.5/1.95 倍（非等比）就是屏上那团粉色糊块——「嘴又大又变形」就是这一步。
+    # 现在先抹掉原嘴，再用 mouth() 画，五个角色只差颜色和落点。
+    _erase_mouth_on(img, diff_mouth_sprite()[3])
+    mouth(ImageDraw.Draw(img), mouth_kind)
     diff_symbol(img, ex, ctx)
     return img.resize((SZ, SZ), Image.LANCZOS)
 
@@ -2333,7 +2351,7 @@ def mouth_patch(fn):
     if _CAST is not None and not CAST_CODE_FACE:
         # 口型贴片：同一条 cast_face 管线换个嘴型再裁嘴框，底色和脸同源，
         # 不像单独画一张嘴贴上去会露一圈色差
-        img = cast_face(_emoji_name_of(fn), eye="open", mouth="big")
+        img = cast_face(_emoji_name_of(fn), eye="open", mk="open")
         return img.crop(MOUTH_BOX).resize((MOUTH_W, MOUTH_H), Image.LANCZOS)
     global TALK_MODE
     TALK_MODE = True
@@ -2829,7 +2847,10 @@ def export_c(items, patches, mouths, blinks, bbox, hair, blink_hair, body_img, a
 # 差分表情下 patch/blink 数量会因角色而异（有的表情恰巧和底图一样，face_bbox 跳过它），
 # 所以不猜最大值，统一跳到这个上限：改这个常量必须重跑 --pack 并拷骨架，
 # 否则固件骨架和 slot 对不上，屏上就是一张图也不出来。
-DSC_CAP = 120
+DSC_CAP = 128
+
+# gaze 帧数也固定成槽位：某角色少一帧不能让后面的贴片整体前移
+GAZE_SLOTS = 3
 
 
 def _write_pack(out, items, patches, mouths, blinks, bbox, hair, blink_hair,
@@ -2849,6 +2870,18 @@ def _write_pack(out, items, patches, mouths, blinks, bbox, hair, blink_hair,
         dscs.append(sym)
         return len(dscs) - 1
 
+    # 占位贴片：缺项就顶住那个下标，不让后面的贴片整体前移。
+    # 固件按骨架符号顺序填 emoji_dsc_slots[]，face 表里的下标又直接当骨架下标用，
+    # 所以「某角色少一张嘴」跳过不填 → 后面每项前移一位，屏上是「头发遮罩画成彩色块」
+    # 这类来路不明的黑斑，而固件日志一切正常
+    pad_data = to_rgb565a8(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+    pad_n = [0]
+
+    def add_pad():
+        i = pad_n[0]
+        pad_n[0] += 1
+        return add("emoji_pad_%d" % i, 1, 1, 1, pad_data)
+
     add("emoji_shadow", 0, shadow.size[0], shadow.size[1], to_a8(shadow))
     add("emoji_body", 1, BODY_W, BODY_H, to_rgb565a8(body_img))
     add("emoji_body_hair", 0, BODY_W, BODY_H, to_a8(body_hair))
@@ -2857,23 +2890,35 @@ def _write_pack(out, items, patches, mouths, blinks, bbox, hair, blink_hair,
         add("emoji_arm_%d" % i, 1, BODY_W, BODY_H, to_rgb565a8(im))
     add("emoji_" + BASE_NAME, 1, OUT, OUT, to_rgb565a8(items[BASE_NAME]))
     pidx = {}
-    for name, (pimg, _box) in patches.items():
-        pidx[name] = add("emoji_patch_" + name, 1, pimg.size[0], pimg.size[1], to_rgb565a8(pimg))
+    for name in names:
+        if name in patches:
+            pimg, _box = patches[name]
+            pidx[name] = add("emoji_patch_" + name, 1, pimg.size[0], pimg.size[1], to_rgb565a8(pimg))
+        else:
+            add_pad()
     midx, bidx, bhidx = {}, {}, {}
     base_bh = to_a8(blink_hair[BASE_NAME]) if BASE_NAME in blink_hair else None
     for name in names:
         if name in mouths:
             midx[name] = add("emoji_%s_mouth" % name, 1, MOUTH_W, MOUTH_H, to_rgb565a8(mouths[name]))
+        else:
+            add_pad()
         if name in blinks:
             bidx[name] = add("emoji_%s_blink" % name, 1, bw, bh, to_rgb565a8(blinks[name]))
             bhidx[name] = add("emoji_%s_blink_hair" % name, 0, bw, bh, base_bh)
+        else:
+            add_pad()
+            add_pad()
     hidx = {}
     base_hair = to_a8(hair[BASE_NAME])
     for name in names:
         hidx[name] = add("emoji_%s_hair" % name, 0, OUT, OUT, base_hair)
     add("emoji_hair_shade", 0, OUT, OUT, to_a8(shade_img))
-    for i, im in enumerate(gazes):
-        add("emoji_gaze_%d" % i, 1, gw, gh, to_rgb565a8(im))
+    for i in range(GAZE_SLOTS):
+        if i < len(gazes):
+            add("emoji_gaze_%d" % i, 1, gw, gh, to_rgb565a8(gazes[i]))
+        else:
+            add_pad()
 
     faces = []
     for name in names:
@@ -2890,13 +2935,10 @@ def _write_pack(out, items, patches, mouths, blinks, bbox, hair, blink_hair,
     if len(dscs) > target:
         raise SystemExit("角色 %s 有 %d 个 dsc，超过 DSC_CAP=%d：把 DSC_CAP 加大并重跑全量"
                          % (os.path.basename(out), len(dscs), target))
-    pad_data = to_rgb565a8(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
-    i = 0
     while len(dscs) < target:
-        add("emoji_pad_%d" % i, 1, 1, 1, pad_data)
-        i += 1
-    if i:
-        print("pad %d 个占位 dsc -> %d" % (i, target))
+        add_pad()
+    if pad_n[0]:
+        print("pad %d 个占位 dsc -> %d" % (pad_n[0], target))
 
     payload = PK.slot_payload(blobs, faces)
     pkdir = os.path.join(out, "_pack")
