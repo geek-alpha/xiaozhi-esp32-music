@@ -6,6 +6,7 @@
 #include "button.h"
 #include "config.h"
 #include "power_save_timer.h"
+#include "settings.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
@@ -32,6 +33,8 @@ private:
     SpiLcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+    // 省电模式总开关（NVS power/save_mode）：false = 只要通着电就不熄屏、不自动断电
+    bool power_save_enabled_ = false;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     // 按下即停的那一下，松手后仍会补发一个 click；用它吃掉，别让同一次按键再走一遍状态切换
@@ -40,11 +43,8 @@ private:
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
         power_manager_->OnChargingStatusChanged([this](bool is_charging) {
-            if (is_charging) {
-                power_save_timer_->SetEnabled(false);
-            } else {
-                power_save_timer_->SetEnabled(true);
-            }
+            // 充电中永不省电；拔了电仍然受总开关管
+            power_save_timer_->SetEnabled(!is_charging && power_save_enabled_);
         });
     }
 
@@ -52,6 +52,11 @@ private:
         rtc_gpio_init(GPIO_NUM_21);
         rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_OUTPUT_ONLY);
         rtc_gpio_set_level(GPIO_NUM_21, 1);
+
+        // 先读开关再建 timer：出厂默认 0，插着电就一直开着
+        Settings power_settings("power");
+        power_save_enabled_ = power_settings.GetInt("save_mode", 0) != 0;
+        ESP_LOGI(TAG, "Power save from NVS: %s", power_save_enabled_ ? "on" : "off");
 
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
@@ -63,6 +68,10 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() {
+            // 关掉开关那一刻可能已经有 ticking 在排队：这层兜底才真正保证不深睡断电
+            if (!power_save_enabled_) {
+                return;
+            }
             ESP_LOGI(TAG, "Shutting down");
             rtc_gpio_set_level(GPIO_NUM_21, 0);
             // 启用保持功能，确保睡眠期间电平不变
@@ -70,7 +79,7 @@ private:
             esp_lcd_panel_disp_on_off(panel_, false); //关闭显示
             esp_deep_sleep_start();
         });
-        power_save_timer_->SetEnabled(true);
+        power_save_timer_->SetEnabled(power_save_enabled_);
     }
 
     void InitializeSpi() {
@@ -231,7 +240,7 @@ public:
         charging = power_manager_->IsCharging();
         discharging = power_manager_->IsDischarging();
         if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
+            power_save_timer_->SetEnabled(discharging && power_save_enabled_);
             last_discharging = discharging;
         }
         level = power_manager_->GetBatteryLevel();
@@ -243,6 +252,24 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveMode(enabled);
+    }
+
+    virtual bool SetPowerSaveEnabled(bool enabled) override {
+        power_save_enabled_ = enabled;
+        {
+            Settings settings("power", true);
+            settings.SetInt("save_mode", enabled ? 1 : 0);
+        }
+        if (power_save_timer_ != nullptr) {
+            bool charging = power_manager_ != nullptr && power_manager_->IsCharging();
+            power_save_timer_->SetEnabled(enabled && !charging);
+        }
+        ESP_LOGI(TAG, "Power save %s (saved to NVS)", enabled ? "on" : "off");
+        return true;
+    }
+
+    virtual bool GetPowerSaveEnabled() override {
+        return power_save_enabled_;
     }
 };
 

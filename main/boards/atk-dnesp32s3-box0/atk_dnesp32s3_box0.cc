@@ -138,6 +138,7 @@ private:
         // 先读开关再建 timer：出厂默认 0，插着电就一直开着
         Settings power_settings("power");
         power_save_enabled_ = power_settings.GetInt("save_mode", 0) != 0;
+        ESP_LOGI(TAG, "Power save from NVS: %s", power_save_enabled_ ? "on" : "off");
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
             power_sleep_ = kDeviceNeutralSleep;
